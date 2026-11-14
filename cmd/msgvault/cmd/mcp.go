@@ -36,6 +36,7 @@ var mcpNoSQLiteScanner bool
 var mcpHTTPAddr string
 var mcpHTTPAllowInsecure bool
 var mcpHTTPAllowWrites bool
+var mcpConfirmSensitiveDrafts bool
 var mcpAllowProfileWrites bool
 var mcpAllowIdentityDecisions bool
 var mcpAllowIdentityScoring bool
@@ -45,6 +46,7 @@ var mcpAllowKataWrites bool
 var mcpAllowCalendarWrites bool
 var serveMCPStdioWithOptions = mcpserver.ServeWithOptions
 var mcpAllowSourceWrites bool
+var mcpAllowLoopWrites bool
 var serveMCPHTTPWithOptions = mcpserver.ServeHTTPWithOptions
 
 var mcpCmd = &cobra.Command{
@@ -53,7 +55,7 @@ var mcpCmd = &cobra.Command{
 	Long: `Start an MCP (Model Context Protocol) server over stdio.
 
 This allows Claude Desktop (or any MCP client) to query your archive
-using tools like search_metadata, search_message_bodies, search_document_attachments, semantic_search_messages, get_message, list_messages, list_thread, export_eml, get_stats,
+using tools like search_metadata, search_message_bodies, search_media, semantic_search_messages, get_message, list_messages, list_thread, export_eml, get_stats,
 aggregate, get_person_agenda, list_saved_views, run_saved_view, stage_deletion,
 draft_reply, draft_compose, draft_forward, draft_get, draft_edit, draft_delete,
 draft_recover, and draft_send_as.
@@ -84,7 +86,7 @@ Add to Claude Desktop config:
 		if err != nil {
 			return usageErr(cmd, err)
 		}
-		st, info, err := OpenHTTPStore(cmd.Context())
+		st, info, err := openMCPHTTPStore(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("open daemon: %w", err)
 		}
@@ -116,22 +118,9 @@ Add to Claude Desktop config:
 		} else {
 			opts = daemonMCPServeOptions(ctx, st, state)
 		}
-		opts.AllowProfileWrites = mcpAllowProfileWrites
-		opts.AllowIdentityDecisions = mcpAllowIdentityDecisions
-		opts.AllowIdentityScoring = mcpAllowIdentityScoring
-		opts.AllowPersonMerges = mcpAllowPersonMerges
-		opts.AllowCardDAVWrites = mcpAllowCardDAVWrites
-		opts.AllowKataWrites = mcpAllowKataWrites
-		opts.AllowCalendarWrites = mcpAllowCalendarWrites
-		if mcpAllowProfileWrites {
-			opts.OperationWriteFamilies = append(opts.OperationWriteFamilies, mcpserver.OperationFamilyRecords)
-		}
-		if mcpAllowSourceWrites {
-			opts.OperationWriteFamilies = append(opts.OperationWriteFamilies, mcpserver.OperationFamilySources)
-		}
-		// Set up the live mail client factory for draft/label operations.
-		// If neither Gmail OAuth nor an IMAP account is available, the
-		// write tools are simply not exposed.
+		applyMCPWriteFlags(cmd, "", &opts)
+		// Live mail and Google Docs clients are available only for the local
+		// daemon mode. Delegated agents use the daemon-backed operation surface.
 		if !isAgentMode(state) {
 			opts.GmailFactory = buildMailFactory(ctx, st)
 			opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
@@ -201,7 +190,7 @@ const identityScoringMinAPISchemaVersion = "3.0.0"
 const draftsMinAPISchemaVersion = "3.0.0"
 
 // delegatedMCPServeOptions offers only the tools an agent grant can use.
-// Draft tools are the floor, so an older daemon fails instead of serving an empty msgvault.
+// Source inventory is required to select tools within the grant.
 func delegatedMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcpserver.ServeOptions, error) {
 	health, err := st.Health(ctx)
 	if err != nil {
@@ -211,23 +200,21 @@ func delegatedMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcp
 	if health != nil && health.APISchemaVersion != nil {
 		schemaVersion = *health.APISchemaVersion
 	}
-	if !daemonclient.APISchemaVersionAtLeast(schemaVersion, draftsMinAPISchemaVersion) {
-		return mcpserver.ServeOptions{}, fmt.Errorf("MCP draft tools require daemon API schema %s or newer (daemon reports %q); upgrade the daemon", draftsMinAPISchemaVersion, schemaVersion)
+	if !daemonclient.APISchemaVersionAtLeast(schemaVersion, daemonclient.AgentReadMinAPISchemaVersion) {
+		return mcpserver.ServeOptions{}, fmt.Errorf("delegated MCP requires daemon API schema %s or newer (daemon reports %q); upgrade the daemon", daemonclient.AgentReadMinAPISchemaVersion, schemaVersion)
+	}
+	grant, err := st.AgentTokenSelf(ctx)
+	if err != nil {
+		return mcpserver.ServeOptions{}, fmt.Errorf("read agent grant: %w", err)
+	}
+	families := &mcpserver.ArchiveFamilies{}
+	for _, source := range grant.Sources {
+		addMCPSourceFamilies(families, source.Type)
 	}
 	opts := mcpserver.ServeOptions{
 		Drafts: daemonMCPDraftRunner{client: st}, DraftCommands: mcpDraftCommands(true), DelegatedOnly: true,
-	}
-	if daemonclient.APISchemaVersionAtLeast(schemaVersion, daemonclient.AgentReadMinAPISchemaVersion) {
-		grant, err := st.AgentTokenSelf(ctx)
-		if err != nil {
-			return mcpserver.ServeOptions{}, fmt.Errorf("read agent grant: %w", err)
-		}
-		opts.Engine = daemonclient.NewEngineAdapter(st)
-		opts.AttachmentReader = st
-		opts.GrantPermissions = grant.Permissions
-	}
-	if daemonclient.APISchemaVersionAtLeast(schemaVersion, calendarControlMinAPISchemaVersion) {
-		opts.Calendar = st
+		Engine: daemonclient.NewEngineAdapter(st), AttachmentReader: st,
+		Calendar: st, GrantPermissions: grant.Permissions, Families: families,
 	}
 	return opts, nil
 }
@@ -237,6 +224,9 @@ const messageTagsMinAPISchemaVersion = "3.15.0"
 
 // personAgendaMinAPISchemaVersion adds live task-backed person agendas.
 const personAgendaMinAPISchemaVersion = "2.30.0"
+
+// personTierMinAPISchemaVersion adds read-only person tier previews.
+const personTierMinAPISchemaVersion = "3.33.0"
 
 const contactRoutesMinAPISchemaVersion = "3.20.0"
 
@@ -274,10 +264,10 @@ func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client, state *
 	}
 	engine := daemonclient.NewEngineAdapter(st)
 	opts := mcpserver.ServeOptions{
+		DiscoverFamilies:   func(ctx context.Context) *mcpserver.ArchiveFamilies { return discoverMCPFamilies(ctx, st, log) },
 		Engine:             engine,
 		AttachmentReader:   st,
 		ManifestSaver:      daemonMCPManifestSaver{client: st},
-		DocumentSearcher:   st,
 		MediaSearcher:      st,
 		PersonFileSearcher: daemonMCPPersonFileSearcher{client: st},
 		Drafts:             daemonMCPDraftRunner{client: st},
@@ -300,18 +290,17 @@ func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client, state *
 	if health != nil && health.APISchemaVersion != nil {
 		schemaVersion = *health.APISchemaVersion
 	}
-	if capabilityErr == nil && health != nil && health.Vector != nil &&
-		daemonclient.APISchemaVersionAtLeast(schemaVersion, vectorLaneHealthMinAPISchemaVersion) {
-		if health.Vector.TextEnabled != nil && *health.Vector.TextEnabled {
-			opts.HybridSearcher = daemonMCPHybridSearcher{client: st}
-			opts.SimilarSearcher = daemonMCPSimilarSearcher{client: st}
-		}
-		if health.Vector.VisualEnabled != nil && *health.Vector.VisualEnabled &&
-			daemonclient.APISchemaVersionAtLeast(schemaVersion, visualSearchMinAPISchemaVersion) {
-			opts.VisualSearcher = daemonMCPVisualSearcher{client: st}
-		}
+	// Turn on can enable text search after this server starts.
+	activatable := mcpRequestPropertiesPresent(capabilities, "enableLocalEmbeddings")
+	lanes := capabilityErr == nil && health != nil && health.Vector != nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, vectorLaneHealthMinAPISchemaVersion)
+	if activatable || lanes && health.Vector.TextEnabled != nil && *health.Vector.TextEnabled {
+		opts.HybridSearcher = daemonMCPHybridSearcher{client: st}
+		opts.SimilarSearcher = daemonMCPSimilarSearcher{client: st}
 	}
-	if capabilityErr == nil && health != nil && health.Vector != nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, embeddingsStatusMinAPISchemaVersion) {
+	if lanes && health.Vector.VisualEnabled != nil && *health.Vector.VisualEnabled && daemonclient.APISchemaVersionAtLeast(schemaVersion, visualSearchMinAPISchemaVersion) {
+		opts.VisualSearcher = daemonMCPVisualSearcher{client: st}
+	}
+	if activatable || capabilityErr == nil && health != nil && health.Vector != nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, embeddingsStatusMinAPISchemaVersion) {
 		opts.EmbeddingStatus = st
 	}
 	if capabilityErr != nil {
@@ -349,6 +338,9 @@ func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client, state *
 	}
 	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, personAgendaMinAPISchemaVersion) {
 		opts.PersonAgendaBackend = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, personTierMinAPISchemaVersion) {
+		opts.PersonTierBackend = st
 	}
 	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, kataIssuesMinAPISchemaVersion) {
 		opts.Kata = st
@@ -539,18 +531,7 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 	}, nil
 }
 
-// buildMailFactory returns a MailClientFactory that creates authenticated
-// live mail clients for the MCP draft/label write tools. Gmail accounts use
-// Google OAuth tokens; IMAP accounts (including Microsoft 365 delegated and
-// app-only sources) build an IMAP/SMTP client from the source's sync_config.
-// Returns nil — disabling the write tools — only when Google OAuth is not
-// configured AND no IMAP account exists in the archive.
-//
-// The stdio/HTTP mcp command talks to the daemon over a *daemonclient.Client
-// rather than a direct *store.Store, so account/OAuth-app/sync_config lookups
-// are resolved through the daemon's CLI accounts API. Credentials themselves
-// (OAuth tokens, IMAP passwords, Microsoft refresh tokens or certificates)
-// live locally (cfg.TokensDir() or configured paths) and are read directly.
+// buildMailFactory creates authenticated live clients for the MCP mail tools.
 func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.MailClientFactory {
 	state := invocationFromContext(ctx)
 	if state == nil || state.cfg == nil {
@@ -558,11 +539,10 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 	}
 	cfg, logger := state.cfg, state.logger
 	oauthConfigured := cfg.OAuth.HasAnyConfig()
-
 	hasIMAP := false
 	if accounts, _, err := st.GetCLIAccounts(ctx); err == nil {
-		for _, a := range accounts {
-			if a.Type == sourceTypeIMAP {
+		for _, account := range accounts {
+			if account.Type == sourceTypeIMAP {
 				hasIMAP = true
 				break
 			}
@@ -570,16 +550,11 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 	} else {
 		fmt.Fprintf(os.Stderr, "Note: could not list accounts to detect IMAP sources: %v\n", err)
 	}
-
 	if !oauthConfigured && !hasIMAP {
-		// Neither auth path is available — write tools will be disabled.
-		fmt.Fprintf(os.Stderr, "Note: OAuth not configured and no IMAP accounts, draft tools disabled\n")
+		fmt.Fprintln(os.Stderr, "Note: OAuth not configured and no IMAP accounts, draft tools disabled")
 		return nil
 	}
-
 	return func(ctx context.Context, email string) (client gmail.LiveAPI, err error) {
-		// IMAP accounts are identified by an imaps:// URL; their sender is the
-		// login address from the source config.
 		sender := email
 		defer func() {
 			if err != nil || client == nil {
@@ -596,7 +571,6 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 			}
 		}()
 		ctx = withInvocation(ctx, state)
-		// Look up the account's source type and OAuth app binding via the daemon.
 		accounts, _, err := st.GetCLIAccounts(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("lookup account %s: %w", email, err)
@@ -611,41 +585,31 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 		if account == nil {
 			return nil, fmt.Errorf("account %s not found in database", email)
 		}
-
 		switch account.Type {
 		case sourceTypeIMAP:
 			if imapCfg, cfgErr := imaplib.ConfigFromJSON(account.SyncConfig); cfgErr == nil && imapCfg.Username != "" {
 				sender = imapCfg.Username
 			}
 			return buildIMAPAPIClient(ctx, account.Email, account.SyncConfig)
-
 		case sourceTypeGmail, "":
 			oauthMgr, err := loadOAuthManager(ctx, state, account.OAuthApp)
 			if err != nil {
 				return nil, fmt.Errorf("create OAuth manager: %w", err)
 			}
-
 			tokenSource, err := oauthMgr.TokenSource(ctx, email)
 			if err != nil {
 				return nil, fmt.Errorf("get token for %s: %w (run 'msgvault add-account %s' first)", email, err, email)
 			}
-
 			rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
-			gmailClient := gmail.NewClient(tokenSource,
-				gmail.WithLogger(logger),
-				gmail.WithRateLimiter(rateLimiter),
-			)
-
+			gmailClient := gmail.NewClient(tokenSource, gmail.WithLogger(logger), gmail.WithRateLimiter(rateLimiter))
 			return gmail.NewLiveClient(gmailClient), nil
-
 		default:
 			return nil, fmt.Errorf("account %s has source type %q, which does not support draft/label operations", email, account.Type)
 		}
 	}
 }
 
-// buildGoogleDocsFactory returns a GoogleDocsClientFactory for configured
-// Drive folder sources. It returns nil when no Google Docs sources are enabled.
+// buildGoogleDocsFactory creates a client for enabled Drive folder sources.
 func buildGoogleDocsFactory(ctx context.Context) mcpserver.GoogleDocsClientFactory {
 	state := invocationFromContext(ctx)
 	if state == nil || state.cfg == nil {
@@ -656,7 +620,6 @@ func buildGoogleDocsFactory(ctx context.Context) mcpserver.GoogleDocsClientFacto
 	if len(sources) == 0 {
 		return nil
 	}
-
 	return func(ctx context.Context) (googledocs.Client, error) {
 		ctx = withInvocation(ctx, state)
 		services := make([]googledocs.SourceServices, 0, len(sources))
@@ -673,8 +636,7 @@ func buildGoogleDocsFactory(ctx context.Context) mcpserver.GoogleDocsClientFacto
 				return nil, fmt.Errorf("create OAuth manager for google-docs source %q: %w", src.Name, err)
 			}
 			if !googleDocsDriveTokenReady(ctx, mgr, src.GoogleAccount) {
-				return nil, fmt.Errorf("no Google Docs OAuth token with Drive/Docs scopes for %s; run 'msgvault add-google-docs-drive %s --folder-id %s --google-account %s' on a machine with browser auth first",
-					src.GoogleAccount, src.Name, src.FolderID, src.GoogleAccount)
+				return nil, fmt.Errorf("no Google Docs OAuth token with Drive/Docs scopes for %s; run 'msgvault add-google-docs-drive %s --folder-id %s --google-account %s' on a machine with browser auth first", src.GoogleAccount, src.Name, src.FolderID, src.GoogleAccount)
 			}
 			ts, err := mgr.TokenSource(ctx, src.GoogleAccount)
 			if err != nil {
@@ -688,11 +650,7 @@ func buildGoogleDocsFactory(ctx context.Context) mcpserver.GoogleDocsClientFacto
 			if err != nil {
 				return nil, fmt.Errorf("create Docs service for google-docs source %q: %w", src.Name, err)
 			}
-			services = append(services, googledocs.SourceServices{
-				Source: src,
-				Drive:  driveService,
-				Docs:   docsService,
-			})
+			services = append(services, googledocs.SourceServices{Source: src, Drive: driveService, Docs: docsService})
 		}
 		return googledocs.NewClient(services)
 	}
@@ -720,24 +678,7 @@ func init() {
 			"deletion manifests, Saved View management, managed draft writes, and profile writes separately enabled with "+
 			"--allow-profile-writes, identity decisions, identity scoring, person merges, CardDAV writes, calendar writes, source writes, and Kata issue writes enabled "+
 			"with their separate opt-ins; enable it only for trusted, authenticated clients.")
-	mcpCmd.Flags().BoolVar(&mcpAllowProfileWrites, "allow-profile-writes", false,
-		"Expose person promotion, display-name editing, and private Notes writes. Model tool calls "+
-			"can persist profile data, so enable this only for sessions where the user "+
-			"has explicitly authorized profile writes.")
-	mcpCmd.Flags().BoolVar(&mcpAllowIdentityDecisions, "allow-identity-decisions", false,
-		"Expose identity match accept/reject tools. Each call requires MCP client confirmation; the client must obtain user approval.")
-	mcpCmd.Flags().BoolVar(&mcpAllowIdentityScoring, "allow-identity-scoring", false,
-		"Expose manual identity scoring that sends evidence to the fixed Jev provider. Each call requires MCP client confirmation; the client must obtain user approval.")
-	mcpCmd.Flags().BoolVar(&mcpAllowPersonMerges, "allow-person-merges", false,
-		"Expose local person merge tools. Each call requires MCP client confirmation; the client must obtain user approval.")
-	mcpCmd.Flags().BoolVar(&mcpAllowKataWrites, "allow-kata-writes", false,
-		"Expose Kata issue creation and evidence linking tools. Archive text is untrusted input; enable only when the user explicitly authorizes Kata issue writes.")
-	mcpCmd.Flags().BoolVar(&mcpAllowCardDAVWrites, "allow-carddav-writes", false,
-		"Expose CardDAV publication and sync tools. Each call requires MCP client confirmation; the client must obtain user approval.")
-	mcpCmd.Flags().BoolVar(&mcpAllowCalendarWrites, "allow-calendar-writes", false,
-		"Expose calendar event mutation tools. Calendar event text is untrusted input; enable only when the user explicitly authorizes calendar writes.")
-	mcpCmd.Flags().BoolVar(&mcpAllowSourceWrites, "allow-source-writes", false,
-		"Expose source synchronization and source policy writes. Each operation requires client confirmation; HTTP also requires --http-allow-writes.")
+	addMCPWriteFlags(mcpCmd, "")
 	_ = mcpCmd.Flags().MarkDeprecated("force-sql", "deprecated in 0.17.0; set [analytics].engine = \"sql\" in config.toml")
 	_ = mcpCmd.Flags().MarkDeprecated("no-sqlite-scanner", "deprecated in 0.17.0; cache engine selection is daemon-managed; use [analytics].engine = \"sql\" for live SQL")
 	_ = mcpCmd.Flags().MarkHidden("force-sql")
@@ -808,4 +749,56 @@ func isLoopbackHost(host string) bool {
 		return ip.IsLoopback()
 	}
 	return false
+}
+
+func addMCPWriteFlags(cmd *cobra.Command, prefix string) {
+	flags := cmd.Flags()
+	bind := func(standalone *bool) *bool {
+		if prefix == "" {
+			return standalone
+		}
+		return new(bool)
+	}
+	flags.BoolVar(bind(&mcpConfirmSensitiveDrafts), prefix+"confirm-sensitive-drafts", false,
+		"Require MCP client confirmation before creating or editing drafts with likely sensitive content.")
+	flags.BoolVar(bind(&mcpAllowProfileWrites), prefix+"allow-profile-writes", false,
+		"Expose person promotion, display-name editing, and private Notes writes. Model tool calls "+
+			"can persist profile data, so enable this only for sessions where the user "+
+			"has explicitly authorized profile writes.")
+	flags.BoolVar(bind(&mcpAllowIdentityDecisions), prefix+"allow-identity-decisions", false,
+		"Expose identity match accept/reject tools. Each call requires MCP client confirmation; the client must obtain user approval.")
+	flags.BoolVar(bind(&mcpAllowIdentityScoring), prefix+"allow-identity-scoring", false,
+		"Expose manual identity scoring that sends evidence to the fixed Jev provider. Each call requires MCP client confirmation; the client must obtain user approval.")
+	flags.BoolVar(bind(&mcpAllowPersonMerges), prefix+"allow-person-merges", false,
+		"Expose local person merge tools. Each call requires MCP client confirmation; the client must obtain user approval.")
+	flags.BoolVar(bind(&mcpAllowKataWrites), prefix+"allow-kata-writes", false,
+		"Expose Kata issue creation and evidence linking tools. Archive text is untrusted input; enable only when the user explicitly authorizes Kata issue writes.")
+	flags.BoolVar(bind(&mcpAllowCardDAVWrites), prefix+"allow-carddav-writes", false,
+		"Expose CardDAV publication and sync tools. Each call requires MCP client confirmation; the client must obtain user approval.")
+	flags.BoolVar(bind(&mcpAllowCalendarWrites), prefix+"allow-calendar-writes", false,
+		"Expose calendar event mutation tools. Calendar event text is untrusted input; enable only when the user explicitly authorizes calendar writes.")
+	flags.BoolVar(bind(&mcpAllowLoopWrites), prefix+"allow-loop-writes", false,
+		"Allow approved open-loop done, snooze, and reopen decisions")
+	flags.BoolVar(bind(&mcpAllowSourceWrites), prefix+"allow-source-writes", false,
+		"Expose source synchronization and source policy writes. Each operation requires client confirmation; HTTP also requires the general write opt-in.")
+}
+
+func applyMCPWriteFlags(cmd *cobra.Command, prefix string, opts *mcpserver.ServeOptions) {
+	opts.ConfirmSensitiveDrafts, _ = cmd.Flags().GetBool(prefix + "confirm-sensitive-drafts")
+	opts.AllowProfileWrites, _ = cmd.Flags().GetBool(prefix + "allow-profile-writes")
+	opts.AllowIdentityDecisions, _ = cmd.Flags().GetBool(prefix + "allow-identity-decisions")
+	opts.AllowIdentityScoring, _ = cmd.Flags().GetBool(prefix + "allow-identity-scoring")
+	opts.AllowPersonMerges, _ = cmd.Flags().GetBool(prefix + "allow-person-merges")
+	opts.AllowKataWrites, _ = cmd.Flags().GetBool(prefix + "allow-kata-writes")
+	opts.AllowCardDAVWrites, _ = cmd.Flags().GetBool(prefix + "allow-carddav-writes")
+	opts.AllowCalendarWrites, _ = cmd.Flags().GetBool(prefix + "allow-calendar-writes")
+	if opts.AllowProfileWrites {
+		opts.OperationWriteFamilies = append(opts.OperationWriteFamilies, mcpserver.OperationFamilyRecords)
+	}
+	if enabled, _ := cmd.Flags().GetBool(prefix + "allow-loop-writes"); enabled {
+		opts.OperationWriteFamilies = append(opts.OperationWriteFamilies, mcpserver.OperationFamilyLoops)
+	}
+	if enabled, _ := cmd.Flags().GetBool(prefix + "allow-source-writes"); enabled {
+		opts.OperationWriteFamilies = append(opts.OperationWriteFamilies, mcpserver.OperationFamilySources)
+	}
 }

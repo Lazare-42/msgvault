@@ -7,7 +7,10 @@ import (
 
 	"charm.land/lipgloss/v2"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/textutil"
+	"go.kenn.io/msgvault/internal/update"
+	"go.kenn.io/msgvault/internal/vector/embed"
 )
 
 type tuiStyles struct {
@@ -191,7 +194,9 @@ func (m Model) buildTitleBar() string {
 	// Update notification (right-aligned on title bar)
 	var updateNotice string
 	if m.updateAvailable != "" {
-		if m.updateIsDevBuild {
+		if upgrade := update.UpgradeCommand(m.distribution); upgrade != "" {
+			updateNotice = fmt.Sprintf("update: %s — %s", m.updateAvailable, upgrade)
+		} else if m.updateIsDevBuild {
 			updateNotice = fmt.Sprintf("latest: %s — msgvault update --force", m.updateAvailable)
 		} else {
 			updateNotice = fmt.Sprintf("update: %s — msgvault update", m.updateAvailable)
@@ -319,7 +324,11 @@ func (m Model) aggregateTableView() string {
 		sb.WriteString("\n")
 		sb.WriteString(m.styles.separator.Render(strings.Repeat("\u2500", m.width)))
 		sb.WriteString("\n")
-		sb.WriteString(m.styles.normalRow.Render(padRight("   No data", m.width)))
+		emptyText := "   No data"
+		if m.accountsLoaded && len(m.accounts) == 0 {
+			emptyText = "   No mail yet. Run `msgvault setup` to see how to add a source."
+		}
+		sb.WriteString(m.styles.normalRow.Render(padRight(emptyText, m.width)))
 		sb.WriteString("\n")
 		// 1 "No data" + (pageSize-2) blanks = pageSize-1 data rows,
 		// then +1 info line = pageSize body rows total.
@@ -462,6 +471,11 @@ func (m Model) aggregateTableView() string {
 		infoContent = fmt.Sprintf(" Search: %q", m.searchQuery)
 	} else if m.loading && m.analyticsNotice != "" {
 		infoContent = " " + m.analyticsNotice
+	}
+	if !m.inlineSearchActive && m.searchMode != searchModeSemantic {
+		if warnings := search.LiteralORWarnings(m.searchQuery); len(warnings) > 0 {
+			infoContent = " " + warnings[0]
+		}
 	}
 	sb.WriteString(m.renderInfoLine(infoContent, m.isLoading()))
 
@@ -671,6 +685,14 @@ func (m Model) messageListView() string {
 			infoContent += " [Semantic: active messages only]"
 		}
 	}
+	if !m.inlineSearchActive && m.searchMode != searchModeSemantic {
+		if warnings := search.LiteralORWarnings(m.searchQuery); len(warnings) > 0 {
+			infoContent = " " + warnings[0]
+			if m.searchTotalCount >= 0 {
+				infoContent += fmt.Sprintf(" (%d results)", m.searchTotalCount)
+			}
+		}
+	}
 	sb.WriteString(m.renderInfoLine(infoContent, m.isLoading()))
 
 	// Overlay modal if active
@@ -754,7 +776,7 @@ func (m Model) buildDetailLines() []string {
 	lines = append(lines, "", strings.Repeat("─", sepWidth), "")
 
 	// Body - wrap lines to fit width
-	body := msg.BodyText
+	body := embed.BodyTextForEmbedding(msg.BodyText, msg.BodyHTML)
 	if body == "" {
 		body = "(No text content)"
 	}

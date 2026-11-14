@@ -62,6 +62,9 @@ components:
           type: boolean
         queued:
           type: boolean
+        queued_at:
+          format: date-time
+          type: string
         running:
           type: boolean
         schedule:
@@ -590,6 +593,31 @@ components:
         - score
         - rank
       type: object
+    Attendee:
+      properties:
+        display_name:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        email:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        is_self:
+          type: boolean
+        role:
+          type: string
+        rsvp:
+          type: string
+      required:
+        - email
+        - display_name
+        - role
+        - rsvp
+        - is_self
+      type: object
     AttributeChoice:
       additionalProperties: false
       properties:
@@ -1044,6 +1072,8 @@ components:
           type: string
         has_attachments:
           type: boolean
+        hidden_text_present:
+          type: boolean
         id:
           format: int64
           type: integer
@@ -1054,6 +1084,8 @@ components:
         match_snippet:
           type: string
         message_type:
+          type: string
+        rfc822_message_id:
           type: string
         sent_at:
           format: date-time
@@ -1079,6 +1111,7 @@ components:
         web_url:
           type: string
       required:
+        - hidden_text_present
         - id
         - source_message_id
         - conversation_id
@@ -1293,6 +1326,76 @@ components:
       required:
         - start
       type: object
+    CalendarOccurrence:
+      properties:
+        all_day:
+          type: boolean
+        attendees:
+          items:
+            $ref: "#/components/schemas/Attendee"
+          type: array
+        deleted_from_source:
+          type: boolean
+        end:
+          format: date-time
+          type: string
+        end_date:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        message_id:
+          format: int64
+          type: integer
+        series_message_id:
+          format: int64
+          type: integer
+        source_id:
+          format: int64
+          type: integer
+        start:
+          format: date-time
+          type: string
+        start_date:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        status:
+          type: string
+        subject:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+      required:
+        - message_id
+        - series_message_id
+        - source_id
+        - subject
+        - start
+        - end
+        - all_day
+        - start_date
+        - end_date
+        - status
+        - deleted_from_source
+        - attendees
+      type: object
+    CalendarOccurrencePage:
+      properties:
+        occurrences:
+          items:
+            $ref: "#/components/schemas/CalendarOccurrence"
+          type: array
+        unexpandable:
+          items:
+            $ref: "#/components/schemas/CalendarUnexpandable"
+          type: array
+      required:
+        - occurrences
+        - unexpandable
+      type: object
     CalendarPlannedWrite:
       properties:
         action:
@@ -1310,6 +1413,62 @@ components:
       required:
         - action
         - calendar_id
+      type: object
+    CalendarProjection:
+      properties:
+        all_day:
+          nullable: true
+          type: boolean
+          x-go-type: "*bool"
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        end:
+          nullable: true
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        ical_uid:
+          nullable: true
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        sequence:
+          format: int64
+          nullable: true
+          type: integer
+          x-go-type: "*int64"
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        start:
+          nullable: true
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        status:
+          nullable: true
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        time_zone:
+          nullable: true
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+      required:
+        - status
+        - sequence
+        - start
+        - end
+        - all_day
+        - time_zone
+        - ical_uid
       type: object
     CalendarRequest:
       additionalProperties: false
@@ -1454,6 +1613,17 @@ components:
         - dry_run
         - plan
         - writes
+      type: object
+    CalendarUnexpandable:
+      properties:
+        message_id:
+          format: int64
+          type: integer
+        reason:
+          type: string
+      required:
+        - message_id
+        - reason
       type: object
     CalendarWriteReceipt:
       properties:
@@ -2131,6 +2301,9 @@ components:
         next_scheduled_at:
           format: date-time
           type: string
+        queued_at:
+          format: date-time
+          type: string
         repair_reason:
           enum:
             - account_missing
@@ -2145,6 +2318,8 @@ components:
           type: string
         scheduled:
           type: boolean
+        scheduler_running:
+          type: boolean
       required:
         - configured
         - available
@@ -2152,6 +2327,7 @@ components:
         - enabled
         - scheduled
         - schedule
+        - scheduler_running
       type: object
     CardDAVSyncRequest:
       additionalProperties: false
@@ -2345,6 +2521,8 @@ components:
       properties:
         alias:
           nullable: true
+          type: string
+        auth_method:
           type: string
         display_name:
           type: string
@@ -2651,6 +2829,8 @@ components:
           type: string
         body_text:
           type: string
+        calendar:
+          $ref: "#/components/schemas/CalendarProjection"
         cc:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
@@ -2667,6 +2847,8 @@ components:
             $ref: "#/components/schemas/CliMessageAddress"
           type: array
         has_attachments:
+          type: boolean
+        hidden_text_present:
           type: boolean
         id:
           format: int64
@@ -2686,6 +2868,8 @@ components:
           type: integer
         rfc822_message_id:
           type: string
+        sender_auth:
+          $ref: "#/components/schemas/SenderAuthVerdict"
         sent_at:
           format: date-time
           type: string
@@ -2716,6 +2900,7 @@ components:
         - deleted_at
         - size_estimate
         - has_attachments
+        - hidden_text_present
         - from
         - to
         - cc
@@ -2756,6 +2941,12 @@ components:
       type: object
     CliSearchResponse:
       properties:
+        has_more:
+          type: boolean
+        hints:
+          items:
+            $ref: "#/components/schemas/SearchHint"
+          type: array
         hybrid_available:
           type: boolean
         index_built:
@@ -3067,6 +3258,17 @@ components:
       required:
         - state
         - evidence
+      type: object
+    ConversationParticipant:
+      properties:
+        display:
+          type: string
+        participant_id:
+          format: int64
+          type: integer
+      required:
+        - participant_id
+        - display
       type: object
     ConversationResponse:
       properties:
@@ -3469,6 +3671,10 @@ components:
         total_count:
           format: int64
           type: integer
+        warnings:
+          items:
+            type: string
+          type: array
       required:
         - query
         - messages
@@ -3512,6 +3718,8 @@ components:
       type: object
     DeletionManifestSummary:
       properties:
+        account:
+          type: string
         created_at:
           format: date-time
           type: string
@@ -3741,6 +3949,31 @@ components:
       required:
         - status
       type: object
+    DocbankAttachmentProcessingSummary:
+      properties:
+        extracted:
+          format: int64
+          type: integer
+        outcomes:
+          additionalProperties:
+            format: int64
+            type: integer
+          type: object
+        profile:
+          type: string
+        requested:
+          format: int64
+          type: integer
+        waiting:
+          format: int64
+          type: integer
+      required:
+        - profile
+        - waiting
+        - requested
+        - extracted
+        - outcomes
+      type: object
     DocbankAttachmentRef:
       properties:
         blob_hash:
@@ -3767,6 +4000,10 @@ components:
           $ref: "#/components/schemas/DocbankAttachmentSummary"
         folder:
           type: string
+        last_error:
+          type: string
+        processing:
+          $ref: "#/components/schemas/DocbankAttachmentProcessingSummary"
         state:
           enum:
             - running
@@ -3842,151 +4079,6 @@ components:
         - start_rune
         - end_rune
       type: object
-    DocumentFailureDiagnostic:
-      properties:
-        canonical_blob_hash:
-          type: string
-        detail:
-          type: string
-        reason_code:
-          type: string
-        state:
-          type: string
-      required:
-        - canonical_blob_hash
-        - reason_code
-        - state
-      type: object
-    DocumentIndexRebuildStatus:
-      properties:
-        remaining_owners:
-          format: int64
-          type: integer
-        snapshot_owners:
-          format: int64
-          type: integer
-      required:
-        - snapshot_owners
-        - remaining_owners
-      type: object
-    DocumentIndexStatus:
-      properties:
-        average_provider_latency_millis:
-          format: double
-          type: number
-        eligible_bytes:
-          format: int64
-          type: integer
-        eligible_occurrences:
-          format: int64
-          type: integer
-        eligible_owners:
-          format: int64
-          type: integer
-        exact_consent:
-          type: boolean
-        extraction_attempts:
-          format: int64
-          type: integer
-        failed_attempts:
-          format: int64
-          type: integer
-        failures:
-          items:
-            $ref: "#/components/schemas/DocumentFailureDiagnostic"
-          type: array
-        failures_exhausted:
-          type: boolean
-        ineligible_role_occurrences:
-          format: int64
-          type: integer
-        missing_owners:
-          format: int64
-          type: integer
-        missing_provider_byte_reports:
-          format: int64
-          type: integer
-        processed_provider_units:
-          format: int64
-          type: integer
-        profile_enabled:
-          type: boolean
-        profile_exists:
-          type: boolean
-        provider_latency_millis:
-          format: int64
-          type: integer
-        provider_requests:
-          format: int64
-          type: integer
-        provider_retries:
-          format: int64
-          type: integer
-        ready_owners:
-          format: int64
-          type: integer
-        reported_provider_bytes:
-          format: int64
-          type: integer
-        retry_owners:
-          format: int64
-          type: integer
-        staging_owners:
-          format: int64
-          type: integer
-        stored_plaintext_chunks:
-          format: int64
-          type: integer
-        successful_attempts:
-          format: int64
-          type: integer
-        terminal_owners:
-          format: int64
-          type: integer
-        unknown_role_occurrences:
-          format: int64
-          type: integer
-        verified_upload_bytes:
-          format: int64
-          type: integer
-      required:
-        - failures
-        - failures_exhausted
-        - profile_exists
-        - profile_enabled
-        - exact_consent
-        - extraction_attempts
-        - successful_attempts
-        - failed_attempts
-        - provider_requests
-        - provider_retries
-        - provider_latency_millis
-        - average_provider_latency_millis
-        - verified_upload_bytes
-        - processed_provider_units
-        - reported_provider_bytes
-        - missing_provider_byte_reports
-        - eligible_occurrences
-        - eligible_owners
-        - eligible_bytes
-        - unknown_role_occurrences
-        - ineligible_role_occurrences
-        - ready_owners
-        - staging_owners
-        - retry_owners
-        - terminal_owners
-        - missing_owners
-        - stored_plaintext_chunks
-      type: object
-    DocumentIndexStatusResponse:
-      properties:
-        active_rebuild:
-          $ref: "#/components/schemas/DocumentIndexRebuildStatus"
-        status:
-          $ref: "#/components/schemas/DocumentIndexStatus"
-      required:
-        - status
-      type: object
     DocumentReference:
       additionalProperties: false
       properties:
@@ -4014,397 +4106,6 @@ components:
         - chunk_checksum
         - start_rune
         - end_rune
-      type: object
-    DocumentSearchResponse:
-      properties:
-        effective_mode:
-          type: string
-        next_cursor:
-          type: string
-        results:
-          items:
-            $ref: "#/components/schemas/DocumentSearchResult"
-          type: array
-        revision:
-          format: int64
-          type: integer
-        truncated:
-          type: boolean
-        vector_generation_fingerprint:
-          type: string
-        vector_generation_id:
-          format: int64
-          type: integer
-      required:
-        - results
-        - revision
-      type: object
-    DocumentSearchResult:
-      properties:
-        attachment_id:
-          format: int64
-          type: integer
-        canonical_blob_hash:
-          type: string
-        chunk_key:
-          type: string
-        chunk_ordinal:
-          format: int64
-          type: integer
-        containing_title:
-          type: string
-        conversation_id:
-          format: int64
-          type: integer
-        excerpt:
-          type: string
-        excerpt_start_rune:
-          format: int64
-          type: integer
-        extraction_id:
-          type: string
-        filename:
-          type: string
-        first_unit_index:
-          format: int64
-          type: integer
-        fusion_score:
-          format: double
-          type: number
-        heading_path:
-          items:
-            type: string
-          type: array
-        highlight_end:
-          format: int64
-          type: integer
-        highlight_start:
-          format: int64
-          type: integer
-        last_unit_index:
-          format: int64
-          type: integer
-        lexical_rank:
-          format: int64
-          type: integer
-        matched_signals:
-          items:
-            type: string
-          type: array
-        message_id:
-          format: int64
-          type: integer
-        mime_type:
-          type: string
-        model:
-          type: string
-        occurred_at:
-          format: date-time
-          type: string
-        occurrence_key:
-          type: string
-        other_live_copies:
-          format: int64
-          type: integer
-        person_provenance:
-          $ref: "#/components/schemas/Provenance"
-        profile_id:
-          type: string
-        provider:
-          type: string
-        rank:
-          format: int64
-          type: integer
-        semantic_rank:
-          format: int64
-          type: integer
-        semantic_score:
-          format: double
-          type: number
-        source_id:
-          format: int64
-          type: integer
-        source_message_id:
-          type: string
-        source_part_key:
-          type: string
-        truncated:
-          type: boolean
-        vector_dimension:
-          format: int64
-          type: integer
-        vector_embedding_profile:
-          type: string
-        vector_generation_fingerprint:
-          type: string
-        vector_generation_id:
-          format: int64
-          type: integer
-        vector_model:
-          type: string
-        vector_token:
-          type: string
-      required:
-        - attachment_id
-        - message_id
-        - conversation_id
-        - source_id
-        - occurrence_key
-        - canonical_blob_hash
-        - other_live_copies
-        - chunk_key
-        - chunk_ordinal
-        - first_unit_index
-        - last_unit_index
-        - excerpt
-        - excerpt_start_rune
-        - highlight_start
-        - highlight_end
-        - profile_id
-        - extraction_id
-        - provider
-        - model
-        - matched_signals
-        - truncated
-        - rank
-      type: object
-    DocumentVectorConsent:
-      properties:
-        consented_at:
-          format: date-time
-          type: string
-        dimension:
-          format: int64
-          type: integer
-        egress_fingerprint:
-          type: string
-        embedding_profile:
-          type: string
-        fingerprint:
-          type: string
-        model:
-          type: string
-        purpose:
-          type: string
-        target_extraction_profile_id:
-          type: string
-      required:
-        - consented_at
-        - egress_fingerprint
-        - purpose
-        - fingerprint
-        - target_extraction_profile_id
-        - embedding_profile
-        - model
-        - dimension
-      type: object
-    DocumentVectorCoverage:
-      properties:
-        ready:
-          format: int64
-          type: integer
-        required:
-          format: int64
-          type: integer
-      required:
-        - required
-        - ready
-      type: object
-    DocumentVectorFailureDiagnostic:
-      properties:
-        attempt_count:
-          format: int64
-          type: integer
-        error_code:
-          type: string
-        next_retry_at:
-          format: date-time
-          type: string
-        terminal:
-          type: boolean
-        token:
-          type: string
-      required:
-        - token
-        - attempt_count
-        - terminal
-        - error_code
-      type: object
-    DocumentVectorGeneration:
-      properties:
-        activated_at:
-          format: date-time
-          type: string
-        created_at:
-          format: date-time
-          type: string
-        dimension:
-          format: int64
-          type: integer
-        embedding_profile:
-          type: string
-        fingerprint:
-          type: string
-        id:
-          format: int64
-          type: integer
-        model:
-          type: string
-        retired_at:
-          format: date-time
-          type: string
-        state:
-          type: string
-        target_extraction_profile_id:
-          type: string
-      required:
-        - id
-        - state
-        - created_at
-        - fingerprint
-        - target_extraction_profile_id
-        - embedding_profile
-        - model
-        - dimension
-      type: object
-    DocumentVectorGenerationSpec:
-      properties:
-        dimension:
-          format: int64
-          type: integer
-        embedding_profile:
-          type: string
-        fingerprint:
-          type: string
-        model:
-          type: string
-        target_extraction_profile_id:
-          type: string
-      required:
-        - fingerprint
-        - target_extraction_profile_id
-        - embedding_profile
-        - model
-        - dimension
-      type: object
-    DocumentVectorGenerationStatus:
-      properties:
-        blocked:
-          type: boolean
-        cleanup_pending:
-          format: int64
-          type: integer
-        failure_after_generation_id:
-          format: int64
-          type: integer
-        failure_after_token:
-          type: string
-        failures:
-          items:
-            $ref: "#/components/schemas/DocumentVectorFailureDiagnostic"
-          type: array
-        failures_exhausted:
-          type: boolean
-        generation_id:
-          format: int64
-          type: integer
-        pending:
-          format: int64
-          type: integer
-        ready_live:
-          format: int64
-          type: integer
-        retryable:
-          format: int64
-          type: integer
-        stale_obsolete:
-          format: int64
-          type: integer
-        state:
-          type: string
-        terminal:
-          format: int64
-          type: integer
-      required:
-        - generation_id
-        - state
-        - blocked
-        - pending
-        - retryable
-        - terminal
-        - ready_live
-        - stale_obsolete
-        - cleanup_pending
-        - failures
-        - failures_exhausted
-      type: object
-    DocumentVectorOperationsResponse:
-      properties:
-        configured:
-          type: boolean
-        enabled:
-          type: boolean
-        scheduled_registration_requires_restart:
-          type: boolean
-        status:
-          $ref: "#/components/schemas/DocumentVectorOperationsStatus"
-      required:
-        - enabled
-        - configured
-      type: object
-    DocumentVectorOperationsStatus:
-      properties:
-        active:
-          $ref: "#/components/schemas/DocumentVectorGeneration"
-        building:
-          $ref: "#/components/schemas/DocumentVectorGeneration"
-        configured_document_egress_fingerprint:
-          type: string
-        configured_query_egress_fingerprint:
-          type: string
-        configured_spec:
-          $ref: "#/components/schemas/DocumentVectorGenerationSpec"
-        coverage:
-          $ref: "#/components/schemas/DocumentVectorCoverage"
-        document_consent:
-          $ref: "#/components/schemas/DocumentVectorConsent"
-        query_consent:
-          $ref: "#/components/schemas/DocumentVectorConsent"
-        selected:
-          $ref: "#/components/schemas/DocumentVectorGenerationStatus"
-        usage:
-          $ref: "#/components/schemas/DocumentVectorProviderUsage"
-      required:
-        - configured_spec
-        - configured_document_egress_fingerprint
-        - configured_query_egress_fingerprint
-        - usage
-      type: object
-    DocumentVectorProviderUsage:
-      properties:
-        fingerprint:
-          type: string
-        provider_calls:
-          format: int64
-          type: integer
-        provider_chunks:
-          format: int64
-          type: integer
-        provider_documents:
-          format: int64
-          type: integer
-        provider_input_chars:
-          format: int64
-          type: integer
-        updated_at:
-          format: date-time
-          type: string
-      required:
-        - fingerprint
-        - provider_calls
-        - provider_documents
-        - provider_chunks
-        - provider_input_chars
       type: object
     DomainContextSummaryHTTPResponse:
       properties:
@@ -5033,6 +4734,8 @@ components:
           type: array
         preview:
           type: string
+        sender_label:
+          type: string
         source_id:
           format: int64
           type: integer
@@ -5272,6 +4975,7 @@ components:
             - participant
             - domain
             - message_type
+            - kind
             - mailing_list
             - after
             - before
@@ -5284,6 +4988,7 @@ components:
             - ExploreFilterDimensionParticipant
             - ExploreFilterDimensionDomain
             - ExploreFilterDimensionMessageType
+            - ExploreFilterDimensionKind
             - ExploreFilterDimensionMailingList
             - ExploreFilterDimensionAfter
             - ExploreFilterDimensionBefore
@@ -5299,6 +5004,31 @@ components:
         - dimension
         - values
       type: object
+    ExploreGroupActivity:
+      properties:
+        bucket:
+          type: string
+        count:
+          format: int64
+          type: integer
+      required:
+        - bucket
+        - count
+      type: object
+    ExploreGroupCoParticipant:
+      properties:
+        count:
+          format: int64
+          type: integer
+        key:
+          type: string
+        label:
+          type: string
+      required:
+        - key
+        - label
+        - count
+      type: object
     ExploreGroupDimension:
       enum:
         - source
@@ -5309,6 +5039,7 @@ components:
         - kind
         - year
         - month
+        - day
       type: string
       x-enum-names:
         - ExploreGroupDimensionSource
@@ -5319,6 +5050,25 @@ components:
         - ExploreGroupDimensionKind
         - ExploreGroupDimensionYear
         - ExploreGroupDimensionMonth
+        - ExploreGroupDimensionDay
+    ExploreGroupOverview:
+      properties:
+        activity:
+          items:
+            $ref: "#/components/schemas/ExploreGroupActivity"
+          type: array
+        co_participants:
+          items:
+            $ref: "#/components/schemas/ExploreGroupCoParticipant"
+          type: array
+        first_at:
+          format: date-time
+          type: string
+      required:
+        - first_at
+        - activity
+        - co_participants
+      type: object
     ExploreGroupRow:
       properties:
         count:
@@ -5334,6 +5084,23 @@ components:
         latest_at:
           format: date-time
           type: string
+        level:
+          enum:
+            - NONE
+            - FIRST_QUARTILE
+            - SECOND_QUARTILE
+            - THIRD_QUARTILE
+            - FOURTH_QUARTILE
+          type: string
+          x-enum-names:
+            - ExploreGroupRowLevelNone
+            - ExploreGroupRowLevelFirstQuartile
+            - ExploreGroupRowLevelSecondQuartile
+            - ExploreGroupRowLevelThirdQuartile
+            - ExploreGroupRowLevelFourthQuartile
+        total_items:
+          format: int64
+          type: integer
       required:
         - key
         - label
@@ -5380,6 +5147,7 @@ components:
         group_key:
           type: string
         grouping:
+          description: Day counts individual messages; other dimensions count entries, with chats collapsed into conversations
           items:
             $ref: "#/components/schemas/ExploreGroupDimension"
           maxItems: 1
@@ -5412,11 +5180,17 @@ components:
             - ExploreGroupsHTTPRequestSearchModeFullText
             - ExploreGroupsHTTPRequestSearchModeSemantic
             - ExploreGroupsHTTPRequestSearchModeHybrid
+        sent_only:
+          description: Count sent messages only, excluding drafts and unsent items
+          type: boolean
         sort:
           items:
             $ref: "#/components/schemas/ExploreGroupSort"
           maxItems: 1
           type: array
+        timezone:
+          description: IANA timezone for day, month, and year grouping; defaults to UTC
+          type: string
       required:
         - grouping
       type: object
@@ -5428,6 +5202,8 @@ components:
           type: string
         next_cursor:
           type: string
+        overview:
+          $ref: "#/components/schemas/ExploreGroupOverview"
         rows:
           items:
             $ref: "#/components/schemas/ExploreGroupRow"
@@ -5439,6 +5215,10 @@ components:
         total_count:
           format: int64
           type: integer
+        warnings:
+          items:
+            type: string
+          type: array
       required:
         - rows
         - total_count
@@ -5515,6 +5295,10 @@ components:
         total_count:
           format: int64
           type: integer
+        warnings:
+          items:
+            type: string
+          type: array
       required:
         - rows
         - cache_revision
@@ -5756,6 +5540,7 @@ components:
         content_hash:
           type: string
         content_state:
+          description: File details check whether content can be opened; read or integrity errors can still occur.
           enum:
             - metadata_only
             - url_only
@@ -5869,13 +5654,21 @@ components:
         containing_title:
           type: string
         content_available:
+          description: Null means availability has not been checked.
+          nullable: true
           type: boolean
+          x-go-type: "*bool"
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
         content_state:
+          description: List availability is based on metadata; file details check whether storage can be opened.
           enum:
             - metadata_only
             - url_only
             - missing_blob
             - local_content
+            - unverified
           type: string
         conversation_id:
           format: int64
@@ -5916,6 +5709,8 @@ components:
           type: array
         search_explain:
           $ref: "#/components/schemas/FileSearchExplain"
+        sender_label:
+          type: string
         size_bytes:
           format: int64
           type: integer
@@ -6026,19 +5821,28 @@ components:
     FileSuggestionRow:
       properties:
         content_available:
+          description: Null means availability has not been checked.
+          nullable: true
           type: boolean
+          x-go-type: "*bool"
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
         content_state:
+          description: Suggestion availability is based on metadata; file details check whether storage can be opened.
           enum:
             - metadata_only
             - url_only
             - missing_blob
             - local_content
+            - unverified
           type: string
           x-enum-names:
             - FileSuggestionRowContentStateMetadataOnly
             - FileSuggestionRowContentStateUrlOnly
             - FileSuggestionRowContentStateMissingBlob
             - FileSuggestionRowContentStateLocalContent
+            - FileSuggestionRowContentStateUnverified
         conversation_id:
           format: int64
           type: integer
@@ -6452,6 +6256,9 @@ components:
           items:
             type: string
           type: array
+        matched_count:
+          format: int64
+          type: integer
         search_mode:
           type: string
         search_query:
@@ -6531,6 +6338,8 @@ components:
           type: string
         has_attachments:
           type: boolean
+        hidden_text_present:
+          type: boolean
         id:
           format: int64
           type: integer
@@ -6545,6 +6354,9 @@ components:
         matches_truncated:
           type: boolean
         message_type:
+          type: string
+        rfc822_message_id:
+          description: Original Message-ID header for reply threading.
           type: string
         score:
           $ref: "#/components/schemas/ScoreBreakdown"
@@ -6575,6 +6387,7 @@ components:
         - snippet
         - labels
         - has_attachments
+        - hidden_text_present
         - size_bytes
       type: object
     HybridSearchMatch:
@@ -6598,6 +6411,9 @@ components:
       properties:
         accelerator:
           type: string
+        candidate_limit_reached:
+          format: int64
+          type: integer
         generation:
           $ref: "#/components/schemas/HybridGenerationSummary"
         has_more:
@@ -6608,6 +6424,9 @@ components:
           type: boolean
         query:
           type: string
+        ranking_limit_reached:
+          format: int64
+          type: integer
         results:
           items:
             $ref: "#/components/schemas/HybridSearchItem"
@@ -7170,6 +6989,51 @@ components:
         - candidates
         - applied
       type: object
+    ImportedMessage:
+      additionalProperties: false
+      properties:
+        body_html:
+          type: string
+        body_markdown:
+          type: string
+        body_text:
+          type: string
+        conversation:
+          $ref: "#/components/schemas/MessageImportConversation"
+        external_id:
+          description: Stable ID of the message in its source; with source.identifier it is the idempotency key
+          maxLength: 256
+          type: string
+        message_type:
+          description: Caller-chosen type such as feed_item; lowercase letters, digits and underscores, starting with a letter
+          maxLength: 64
+          pattern: ^[a-z][a-z0-9_]*$
+          type: string
+        metadata:
+          additionalProperties:
+            x-go-type: any
+          type: object
+        sender:
+          $ref: "#/components/schemas/MessageImportSender"
+        sent_at:
+          format: date-time
+          type: string
+          x-go-type: string
+        title:
+          maxLength: 4096
+          type: string
+        url:
+          description: Canonical URL of the message
+          format: uri
+          maxLength: 4096
+          type: string
+      required:
+        - external_id
+        - message_type
+        - conversation
+        - sender
+        - sent_at
+      type: object
     KataEvidenceLinkRequest:
       additionalProperties: false
       properties:
@@ -7264,7 +7128,7 @@ components:
             $ref: "#/components/schemas/KataIssueReceipt"
           type: array
         truncated:
-          description: "The list may omit issues that cite this source: more matched than were returned, or some issues could not be checked"
+          description: "The list may omit matching issues: more matched than were returned, or some citations could not be checked"
           type: boolean
       required:
         - issues
@@ -7316,6 +7180,151 @@ components:
           type: array
       required:
         - manifests
+      type: object
+    LocalEmbeddingsStatus:
+      properties:
+        done_bytes:
+          format: int64
+          type: integer
+        download_bytes:
+          format: int64
+          type: integer
+        enabled:
+          type: boolean
+        error:
+          type: string
+        host:
+          type: string
+        phase:
+          enum:
+            - idle
+            - downloading
+            - indexing
+          type: string
+        provider:
+          type: string
+        running:
+          type: boolean
+        total_bytes:
+          format: int64
+          type: integer
+      required:
+        - host
+        - enabled
+        - provider
+        - download_bytes
+        - phase
+        - done_bytes
+        - total_bytes
+      type: object
+    LoopCounterparty:
+      properties:
+        address:
+          type: string
+        display_name:
+          type: string
+        participant_id:
+          format: int64
+          type: integer
+        person_id:
+          format: int64
+          type: integer
+      required:
+        - participant_id
+        - display_name
+        - address
+      type: object
+    LoopDecisionResponse:
+      properties:
+        anchor_message_id:
+          format: int64
+          type: integer
+        snoozed_until:
+          format: date-time
+          type: string
+        state:
+          enum:
+            - open
+            - done
+            - snoozed
+          type: string
+      required:
+        - anchor_message_id
+        - state
+      type: object
+    LoopItem:
+      properties:
+        anchor_message_id:
+          description: The message that started the wait. Done and snooze use it as the loop ID.
+          format: int64
+          type: integer
+        channel:
+          enum:
+            - email
+            - chat
+          type: string
+        conversation_id:
+          format: int64
+          type: integer
+        counterparty:
+          $ref: "#/components/schemas/LoopCounterparty"
+        kind:
+          description: reply_owed waits on you; awaiting_reply waits on them
+          enum:
+            - reply_owed
+            - awaiting_reply
+          type: string
+        last_activity_at:
+          format: date-time
+          type: string
+        owed_since_at:
+          format: date-time
+          type: string
+        question_message_ids:
+          description: The questions this loop covers, oldest first. Pass them to done or snooze so a question that appeared later stays open.
+          items:
+            format: int64
+            type: integer
+          type: array
+        source_id:
+          format: int64
+          type: integer
+        summary:
+          description: The email subject, or the chat message text
+          type: string
+      required:
+        - kind
+        - anchor_message_id
+        - question_message_ids
+        - conversation_id
+        - source_id
+        - channel
+        - counterparty
+        - summary
+        - owed_since_at
+        - last_activity_at
+      type: object
+    LoopListResponse:
+      properties:
+        coverage_incomplete:
+          description: True when more history remains after checking 1,000 uncached messages; another request reuses saved evidence to continue
+          type: boolean
+        items:
+          items:
+            $ref: "#/components/schemas/LoopItem"
+          type: array
+        skipped_unparseable:
+          description: Stored originals that failed to parse and were passed over; a reply in one may have settled a listed loop
+          format: int64
+          type: integer
+        truncated:
+          description: True when more loops are open than limit returned
+          type: boolean
+      required:
+        - items
+        - truncated
+        - coverage_incomplete
+        - skipped_unparseable
       type: object
     MCPCapabilities:
       properties:
@@ -7407,8 +7416,79 @@ components:
         strongest_excerpt:
           type: string
       type: object
+    MediaAttachmentResult:
+      properties:
+        attachment_id:
+          format: int64
+          type: integer
+        containing_title:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        conversation_id:
+          format: int64
+          type: integer
+        excerpt:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        filename:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        message_id:
+          format: int64
+          type: integer
+        occurred_at:
+          format: date-time
+          type: string
+      required:
+        - message_id
+        - conversation_id
+        - attachment_id
+        - filename
+        - containing_title
+        - excerpt
+      type: object
+    MediaAttachmentSearch:
+      properties:
+        actual_mode:
+          type: string
+        coverage:
+          $ref: "#/components/schemas/SearchCoverage"
+          description: Coverage of delivered mirrored versions, excluding files awaiting upload
+        degradations:
+          items:
+            type: string
+          type: array
+        error:
+          $ref: "#/components/schemas/ErrorResponse"
+        partial:
+          type: boolean
+        requested_mode:
+          type: string
+        results:
+          items:
+            $ref: "#/components/schemas/MediaAttachmentResult"
+          type: array
+        truncated:
+          type: boolean
+      required:
+        - requested_mode
+        - actual_mode
+        - coverage
+        - partial
+        - degradations
+        - results
+        - truncated
+      type: object
     MediaSearchResponse:
       properties:
+        attachments:
+          $ref: "#/components/schemas/MediaAttachmentSearch"
         attribution_unavailable:
           description: Current recording occurrences whose selected transcript cannot be attributed, including searches with no hits
           format: int64
@@ -7421,6 +7501,8 @@ components:
         pending_occurrences:
           format: int64
           type: integer
+        recordings_error:
+          $ref: "#/components/schemas/ErrorResponse"
         results:
           items:
             $ref: "#/components/schemas/MediaSearchResult"
@@ -7453,7 +7535,7 @@ components:
           format: int64
           type: integer
         excerpt:
-          description: Plain transcript excerpt without search highlight markers
+          description: Plain text excerpt without search highlight markers
           type: string
         filename:
           type: string
@@ -7887,6 +7969,12 @@ components:
           type: string
         body_omitted:
           type: boolean
+        body_text:
+          description: Stored plain-text body of a single message, which can be generated from HTML and is empty when no plain text is stored; conversation windows leave it unset. Older servers omit this field; body keeps its HTML fallback.
+          type: string
+        calendar:
+          $ref: "#/components/schemas/CalendarProjection"
+          description: "Calendar state for calendar events: status, sequence, start, end, all-day, time zone, and iCal UID. A field is null when the stored event does not carry it; calendar sync does not store a sequence of 0."
         cc:
           items:
             type: string
@@ -7905,9 +7993,15 @@ components:
           type: string
         from_name:
           type: string
+        from_participant_id:
+          description: Sender participant ID, populated for conversation windows.
+          format: int64
+          type: integer
         from_phone:
           type: string
         has_attachments:
+          type: boolean
+        hidden_text_present:
           type: boolean
         id:
           format: int64
@@ -7924,8 +8018,10 @@ components:
           format: int64
           type: integer
         rfc822_message_id:
-          description: Original Message-ID header for In-Reply-To and References when composing a reply.
+          description: Original Message-ID header for reply threading.
           type: string
+        sender_auth:
+          $ref: "#/components/schemas/SenderAuthVerdict"
         sent_at:
           type: string
         size_bytes:
@@ -7944,6 +8040,11 @@ components:
           items:
             type: string
           type: array
+        to_participants:
+          description: Recipient participants, populated for conversation windows.
+          items:
+            $ref: "#/components/schemas/ConversationParticipant"
+          type: array
       required:
         - body
         - attachments
@@ -7955,7 +8056,95 @@ components:
         - snippet
         - labels
         - has_attachments
+        - hidden_text_present
         - size_bytes
+      type: object
+    MessageImportConversation:
+      additionalProperties: false
+      properties:
+        external_id:
+          description: Stable ID of the conversation in its source
+          maxLength: 256
+          type: string
+        title:
+          maxLength: 4096
+          type: string
+      required:
+        - external_id
+      type: object
+    MessageImportRequest:
+      additionalProperties: false
+      properties:
+        message:
+          $ref: "#/components/schemas/ImportedMessage"
+        source:
+          $ref: "#/components/schemas/MessageImportSource"
+      required:
+        - source
+        - message
+      type: object
+    MessageImportResponse:
+      properties:
+        message_id:
+          format: int64
+          type: integer
+        source_id:
+          format: int64
+          type: integer
+        source_message_id:
+          type: string
+        status:
+          enum:
+            - created
+            - updated
+          type: string
+          x-enum-names:
+            - MessageImportResponseStatusCreated
+            - MessageImportResponseStatusUpdated
+      required:
+        - status
+        - source_id
+        - message_id
+        - source_message_id
+      type: object
+    MessageImportSender:
+      additionalProperties: false
+      properties:
+        email:
+          format: email
+          type: string
+        id:
+          description: Stable identifier for this sender in the import source
+          maxLength: 200
+          type: string
+        name:
+          maxLength: 256
+          type: string
+        phone:
+          description: International phone number starting with + or 00; normalized to E.164
+          maxLength: 64
+          type: string
+        url:
+          format: uri
+          maxLength: 4096
+          type: string
+      type: object
+    MessageImportSource:
+      additionalProperties: false
+      properties:
+        account_email:
+          format: email
+          type: string
+          x-go-type: string
+        display_name:
+          maxLength: 256
+          type: string
+        identifier:
+          maxLength: 128
+          type: string
+      required:
+        - identifier
+        - account_email
       type: object
     MessageListResponse:
       properties:
@@ -8099,6 +8288,8 @@ components:
           type: string
         has_attachments:
           type: boolean
+        hidden_text_present:
+          type: boolean
         id:
           format: int64
           type: integer
@@ -8107,6 +8298,9 @@ components:
             type: string
           type: array
         message_type:
+          type: string
+        rfc822_message_id:
+          description: Original Message-ID header for reply threading.
           type: string
         sent_at:
           type: string
@@ -8135,6 +8329,7 @@ components:
         - snippet
         - labels
         - has_attachments
+        - hidden_text_present
         - size_bytes
       type: object
     MessageTag:
@@ -8835,8 +9030,6 @@ components:
         kind:
           enum:
             - carddav_sync
-            - document_embedding
-            - document_extraction
             - message_embedding
             - person_embedding
             - person_enrichment
@@ -8847,7 +9040,6 @@ components:
         lane:
           enum:
             - contacts
-            - documents
             - messages
             - person_facts
             - visual_attachments
@@ -8859,8 +9051,6 @@ components:
         related_status:
           enum:
             - listSourceStatus
-            - getDocumentIndexStatus
-            - getDocumentVectorStatus
             - getVisualAttachmentStatus
             - getCardDAVStatus
           type: string
@@ -8908,9 +9098,7 @@ components:
           enum:
             - attachments
             - books
-            - chunks
             - contacts
-            - documents
             - messages
             - people
             - writes
@@ -8918,9 +9106,7 @@ components:
           x-enum-names:
             - OperationPublicCounterUnitAttachments
             - OperationPublicCounterUnitBooks
-            - OperationPublicCounterUnitChunks
             - OperationPublicCounterUnitContacts
-            - OperationPublicCounterUnitDocuments
             - OperationPublicCounterUnitMessages
             - OperationPublicCounterUnitPeople
             - OperationPublicCounterUnitWrites
@@ -9000,8 +9186,6 @@ components:
         kind:
           enum:
             - carddav_sync
-            - document_embedding
-            - document_extraction
             - message_embedding
             - person_embedding
             - person_enrichment
@@ -9012,7 +9196,6 @@ components:
         lane:
           enum:
             - contacts
-            - documents
             - messages
             - person_facts
             - visual_attachments
@@ -9020,8 +9203,6 @@ components:
         related_status:
           enum:
             - listSourceStatus
-            - getDocumentIndexStatus
-            - getDocumentVectorStatus
             - getVisualAttachmentStatus
             - getCardDAVStatus
           type: string
@@ -9082,8 +9263,6 @@ components:
         kind:
           enum:
             - carddav_sync
-            - document_embedding
-            - document_extraction
             - message_embedding
             - person_embedding
             - person_enrichment
@@ -9094,7 +9273,6 @@ components:
         lane:
           enum:
             - contacts
-            - documents
             - messages
             - person_facts
             - visual_attachments
@@ -9163,8 +9341,6 @@ components:
         kind:
           enum:
             - carddav_sync
-            - document_embedding
-            - document_extraction
             - message_embedding
             - person_embedding
             - person_enrichment
@@ -9175,7 +9351,6 @@ components:
         lane:
           enum:
             - contacts
-            - documents
             - messages
             - person_facts
             - visual_attachments
@@ -10126,6 +10301,59 @@ components:
           format: int64
           type: integer
       type: object
+    ParticipantAddress:
+      properties:
+        display_value:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        identity_key:
+          type: string
+        participant_display_name:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        participant_id:
+          format: int64
+          type: integer
+        scope_kind:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        scope_value:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        service_label:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        service_slug:
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        type:
+          type: string
+        value:
+          type: string
+      required:
+        - identity_key
+        - participant_display_name
+        - participant_id
+        - type
+        - value
+        - display_value
+        - service_slug
+        - service_label
+        - scope_kind
+        - scope_value
+      type: object
     ParticipantCompletionHTTPRequest:
       additionalProperties: false
       properties:
@@ -10186,6 +10414,8 @@ components:
           type: string
         envelope:
           $ref: "#/components/schemas/ValueEnvelope"
+        identity_key:
+          type: string
         normalization:
           type: string
         normalization_version:
@@ -10218,6 +10448,7 @@ components:
         - address_kind
         - original_value
         - normalized_value
+        - identity_key
         - normalization
         - normalization_version
       type: object
@@ -11218,6 +11449,8 @@ components:
           type: string
         envelope:
           $ref: "#/components/schemas/ValueEnvelope"
+        identity_key:
+          type: string
         normalization:
           type: string
         normalization_version:
@@ -11234,11 +11467,14 @@ components:
           type: string
         scope_value:
           type: string
+        service_label:
+          type: string
         service_slug:
           type: string
         uri:
           type: string
       required:
+        - identity_key
         - envelope
         - person_id
         - address_kind
@@ -11973,13 +12209,21 @@ components:
         containing_title:
           type: string
         content_available:
+          description: Null means availability has not been checked.
+          nullable: true
           type: boolean
+          x-go-type: "*bool"
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
         content_state:
+          description: List availability is based on metadata; file details check whether storage can be opened.
           enum:
             - metadata_only
             - url_only
             - missing_blob
             - local_content
+            - unverified
           type: string
         conversation_id:
           format: int64
@@ -12022,6 +12266,8 @@ components:
           $ref: "#/components/schemas/PersonFileProvenance"
         search_explain:
           $ref: "#/components/schemas/FileSearchExplain"
+        sender_label:
+          type: string
         size_bytes:
           format: int64
           type: integer
@@ -12134,19 +12380,28 @@ components:
     PersonFileSuggestionRow:
       properties:
         content_available:
+          description: Null means availability has not been checked.
+          nullable: true
           type: boolean
+          x-go-type: "*bool"
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
         content_state:
+          description: Suggestion availability is based on metadata; file details check whether storage can be opened.
           enum:
             - metadata_only
             - url_only
             - missing_blob
             - local_content
+            - unverified
           type: string
           x-enum-names:
             - PersonFileSuggestionRowContentStateMetadataOnly
             - PersonFileSuggestionRowContentStateUrlOnly
             - PersonFileSuggestionRowContentStateMissingBlob
             - PersonFileSuggestionRowContentStateLocalContent
+            - PersonFileSuggestionRowContentStateUnverified
         conversation_id:
           format: int64
           type: integer
@@ -12558,6 +12813,8 @@ components:
       type: object
     PersonMergeDetail:
       properties:
+        labels:
+          $ref: "#/components/schemas/PersonMergeLabels"
         merge:
           $ref: "#/components/schemas/PersonMerge"
         participants:
@@ -12581,11 +12838,43 @@ components:
           type: array
           x-omitempty: false
       required:
+        - labels
         - merge
         - participants
         - rows
         - splits
         - review_candidates
+      type: object
+    PersonMergeLabels:
+      properties:
+        absorbed_address_count:
+          format: int64
+          type: integer
+        addresses:
+          items:
+            $ref: "#/components/schemas/ParticipantAddress"
+          type: array
+        incomplete:
+          type: boolean
+        participant_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
+        participants:
+          items:
+            $ref: "#/components/schemas/PersonMergeParticipant"
+          type: array
+        profiles:
+          items:
+            $ref: "#/components/schemas/PersonMergeRecordedProfile"
+          type: array
+      required:
+        - profiles
+        - participant_ids
+        - addresses
+        - absorbed_address_count
+        - incomplete
       type: object
     PersonMergeParticipant:
       properties:
@@ -12614,6 +12903,41 @@ components:
       required:
         - person
         - etag
+      type: object
+    PersonMergeRecordedContactPoint:
+      properties:
+        address_kind:
+          type: string
+        identity_key:
+          type: string
+        original_value:
+          type: string
+        scope_kind:
+          type: string
+        scope_value:
+          type: string
+        service_label:
+          type: string
+        service_slug:
+          type: string
+      required:
+        - identity_key
+        - address_kind
+        - original_value
+      type: object
+    PersonMergeRecordedProfile:
+      properties:
+        contact_points:
+          items:
+            $ref: "#/components/schemas/PersonMergeRecordedContactPoint"
+          type: array
+        display_name:
+          type: string
+        id:
+          format: int64
+          type: integer
+      required:
+        - id
       type: object
     PersonMergeRequiredError:
       properties:
@@ -12773,6 +13097,8 @@ components:
       type: object
     PersonMergeSummary:
       properties:
+        labels:
+          $ref: "#/components/schemas/PersonMergeLabels"
         merge:
           $ref: "#/components/schemas/PersonMerge"
         participant_count:
@@ -12793,6 +13119,7 @@ components:
           format: int64
           type: integer
       required:
+        - labels
         - merge
         - participant_count
         - row_count
@@ -13346,9 +13673,194 @@ components:
         - peak_relationship_temperature
         - peak_relationship_year
         - source_counts
-        - first_at
-        - last_at
         - cache_revision
+      type: object
+    PersonTierExplanation:
+      properties:
+        as_of:
+          type: string
+        display_name:
+          nullable: true
+          type: string
+        exclusion:
+          nullable: true
+          type: string
+        last_contact_date:
+          nullable: true
+          type: string
+        person_id:
+          format: int64
+          type: integer
+        projection:
+          $ref: "#/components/schemas/PersonTierProjection"
+        readiness:
+          $ref: "#/components/schemas/PersonTierReadiness"
+        rule:
+          type: string
+        signals:
+          $ref: "#/components/schemas/PersonTierSignals"
+        thresholds:
+          items:
+            $ref: "#/components/schemas/PersonTierThresholdCheck"
+          type: array
+        tier:
+          format: int64
+          type: integer
+        tracked:
+          type: boolean
+      required:
+        - person_id
+        - display_name
+        - tier
+        - rule
+        - exclusion
+        - tracked
+        - last_contact_date
+        - as_of
+        - readiness
+        - projection
+        - signals
+        - thresholds
+      type: object
+    PersonTierPreview:
+      properties:
+        as_of:
+          type: string
+        people:
+          items:
+            $ref: "#/components/schemas/PersonTierRow"
+          type: array
+        projection:
+          $ref: "#/components/schemas/PersonTierProjection"
+        readiness:
+          $ref: "#/components/schemas/PersonTierReadiness"
+      required:
+        - people
+        - as_of
+        - readiness
+        - projection
+      type: object
+    PersonTierProjection:
+      properties:
+        max_direct:
+          format: int64
+          type: integer
+        timezone:
+          type: string
+      required:
+        - timezone
+        - max_direct
+      type: object
+    PersonTierReadiness:
+      properties:
+        ready:
+          type: boolean
+        reasons:
+          items:
+            type: string
+          type: array
+      required:
+        - ready
+        - reasons
+      type: object
+    PersonTierRow:
+      properties:
+        display_name:
+          nullable: true
+          type: string
+        last_contact_date:
+          nullable: true
+          type: string
+        person_id:
+          format: int64
+          type: integer
+        rule:
+          type: string
+        tier:
+          format: int64
+          type: integer
+        tracked:
+          type: boolean
+      required:
+        - person_id
+        - display_name
+        - tier
+        - rule
+        - tracked
+        - last_contact_date
+      type: object
+    PersonTierSignals:
+      properties:
+        active_days_long:
+          format: int64
+          type: integer
+        active_days_short:
+          format: int64
+          type: integer
+        calls_long:
+          format: int64
+          type: integer
+        calls_short:
+          format: int64
+          type: integer
+        channels_long:
+          format: int64
+          type: integer
+        excluded_list_events:
+          format: int64
+          type: integer
+        inbound_long:
+          format: int64
+          type: integer
+        inbound_short:
+          format: int64
+          type: integer
+        large_audience_inbound_events:
+          format: int64
+          type: integer
+        meeting_days_long:
+          format: int64
+          type: integer
+        outbound_long:
+          format: int64
+          type: integer
+        outbound_short:
+          format: int64
+          type: integer
+      required:
+        - outbound_short
+        - outbound_long
+        - inbound_short
+        - inbound_long
+        - active_days_short
+        - active_days_long
+        - meeting_days_long
+        - calls_short
+        - calls_long
+        - channels_long
+        - excluded_list_events
+        - large_audience_inbound_events
+      type: object
+    PersonTierThresholdCheck:
+      properties:
+        enabled:
+          type: boolean
+        met:
+          type: boolean
+        name:
+          type: string
+        observed:
+          format: int64
+          type: integer
+        required:
+          format: int64
+          type: integer
+      required:
+        - name
+        - observed
+        - required
+        - enabled
+        - met
       type: object
     PersonTracking:
       properties:
@@ -13624,6 +14136,7 @@ components:
           type: integer
         modality_mask:
           format: int32
+          maximum: 255
           minimum: 0
           type: integer
         received:
@@ -14078,6 +14591,9 @@ components:
           maximum: 100
           minimum: 0
           type: integer
+        timezone:
+          description: IANA timezone for calendar grouping; defaults to UTC
+          type: string
       type: object
     RunSavedViewResponse:
       properties:
@@ -14176,6 +14692,7 @@ components:
             - mailing_list
             - account
             - message_type
+            - kind
             - after
             - before
             - deletion
@@ -14190,6 +14707,7 @@ components:
             - SavedViewFilterFieldMailingList
             - SavedViewFilterFieldAccount
             - SavedViewFilterFieldMessageType
+            - SavedViewFilterFieldKind
             - SavedViewFilterFieldAfter
             - SavedViewFilterFieldBefore
             - SavedViewFilterFieldDeletion
@@ -14432,6 +14950,10 @@ components:
             format: int64
             type: integer
           type: array
+        hints:
+          items:
+            $ref: "#/components/schemas/SearchHint"
+          type: array
         index_state:
           type: string
         messages:
@@ -14445,10 +14967,34 @@ components:
         total_count:
           format: int64
           type: integer
+        warnings:
+          items:
+            type: string
+          type: array
       required:
         - query
         - messages
         - total_count
+      type: object
+    SearchHint:
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        retry_with:
+          $ref: "#/components/schemas/SearchHintRetryWithStruct"
+      required:
+        - code
+        - message
+        - retry_with
+      type: object
+    SearchHintRetryWithStruct:
+      properties:
+        query:
+          type: string
+      required:
+        - query
       type: object
     SearchProvenance:
       additionalProperties: false
@@ -14502,6 +15048,10 @@ components:
         total:
           format: int64
           type: integer
+        warnings:
+          items:
+            type: string
+          type: array
       required:
         - query
         - total
@@ -14548,18 +15098,13 @@ components:
         attachment_id:
           format: int64
           type: integer
-        chunk_key:
-          type: string
         end_rune:
           format: int64
           nullable: true
           type: integer
-        extraction_id:
-          type: string
         kind:
           enum:
             - message
-            - document_chunk
             - docbank_rendition
           type: string
         max_chars:
@@ -14579,6 +15124,23 @@ components:
       required:
         - kind
         - message_id
+      type: object
+    SenderAuthVerdict:
+      properties:
+        authserv_id:
+          type: string
+        dkim:
+          type: string
+        dmarc:
+          type: string
+        domain:
+          type: string
+        spf:
+          type: string
+        verified:
+          type: boolean
+      required:
+        - verified
       type: object
     SenderCount:
       additionalProperties: false
@@ -14951,6 +15513,15 @@ components:
         - generation
         - messages
       type: object
+    SnoozeLoopRequest:
+      additionalProperties: false
+      properties:
+        until:
+          format: date-time
+          type: string
+      required:
+        - until
+      type: object
     Source:
       additionalProperties: false
       properties:
@@ -15112,6 +15683,8 @@ components:
           type: boolean
         scheduler_queued:
           type: boolean
+        scheduler_queued_at:
+          type: string
         scheduler_started_at:
           type: string
         source_type:
@@ -15762,7 +16335,11 @@ components:
           items:
             $ref: "#/components/schemas/TaskSummary"
           type: array
+        truncated:
+          description: More tasks matched than were returned
+          type: boolean
       required:
+        - truncated
         - tasks
       type: object
     TaskSummary:
@@ -16490,7 +17067,7 @@ components:
       type: apiKey
 info:
   title: msgvault API
-  version: 3.27.0
+  version: 5.4.0
 openapi: 3.0.3
 paths:
   /api/daemon/identity:
@@ -17012,6 +17589,12 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
           description: Error
         "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "403":
           content:
             application/json:
               schema:
@@ -17594,6 +18177,70 @@ paths:
       security:
         - apiKey: []
       summary: Control a live calendar event or query availability
+      tags:
+        - Calendar
+  /api/v1/calendar/events:
+    get:
+      operationId: listCalendarEvents
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema:
+            format: date-time
+            type: string
+        - in: query
+          name: to
+          required: true
+          schema:
+            format: date-time
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CalendarOccurrencePage"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List archived calendar occurrences
       tags:
         - Calendar
   /api/v1/carddav/account:
@@ -18902,6 +19549,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
           description: Error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
         "404":
           content:
             application/json:
@@ -19993,7 +20646,7 @@ paths:
           description: Error
       security:
         - apiKey: []
-      summary: List one conversation in chronological order for export
+      summary: List one conversation in chronological order for export. SQLite compares instants to the millisecond, with ties in message-ID order.
       tags:
         - API
   /api/v1/cli/rebuild-fts:
@@ -21051,329 +21704,6 @@ paths:
       summary: Inspect a staged deletion manifest
       tags:
         - API
-  /api/v1/documents/search:
-    get:
-      operationId: searchDocuments
-      parameters:
-        - description: Extracted document content or filename query
-          in: query
-          name: q
-          required: true
-          schema:
-            type: string
-        - description: Source IDs to include; repeat or comma-separate values
-          in: query
-          name: source_id
-          schema:
-            items:
-              format: int64
-              type: integer
-            type: array
-        - description: Message types to include; repeat or comma-separate values
-          in: query
-          name: message_type
-          schema:
-            items:
-              type: string
-            type: array
-        - description: Exact attachment occurrence ID
-          in: query
-          name: attachment_id
-          schema:
-            format: int64
-            type: integer
-        - description: Exact containing message ID
-          in: query
-          name: message_id
-          schema:
-            format: int64
-            type: integer
-        - description: Durable person ID
-          in: query
-          name: person_id
-          schema:
-            format: int64
-            type: integer
-        - description: Observed participant ID; translated through its durable person when bound
-          in: query
-          name: participant_id
-          schema:
-            format: int64
-            type: integer
-        - description: Person relation; repeat or comma-separate from_person, to_person, or group
-          in: query
-          name: direction
-          schema:
-            items:
-              type: string
-            type: array
-        - description: Only messages on or after an RFC3339 or YYYY-MM-DD date
-          in: query
-          name: after
-          schema:
-            type: string
-        - description: Only messages before an RFC3339 or YYYY-MM-DD date
-          in: query
-          name: before
-          schema:
-            type: string
-        - description: Maximum results to return (default 20, max 100)
-          in: query
-          name: limit
-          schema:
-            format: int64
-            type: integer
-        - description: Opaque cursor from the previous document search page
-          in: query
-          name: cursor
-          schema:
-            type: string
-        - description: "Search mode: lexical (default and auto); semantic/hybrid send the query to the embedding provider"
-          in: query
-          name: mode
-          schema:
-            type: string
-        - description: "Maximum candidates (default/max: lexical 10000; semantic/hybrid 100/1000)"
-          in: query
-          name: candidate_limit
-          schema:
-            format: int64
-            type: integer
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DocumentSearchResponse"
-          description: OK
-        "400":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "403":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "404":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "409":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "429":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "503":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Search extracted document attachments
-      tags:
-        - API
-  /api/v1/documents/status:
-    get:
-      operationId: getDocumentIndexStatus
-      parameters:
-        - description: Exact document extraction profile ID
-          in: query
-          name: profile_id
-          required: true
-          schema:
-            type: string
-        - description: Exact extraction input key
-          in: query
-          name: input_key
-          required: true
-          schema:
-            type: string
-        - description: Allowed document media types
-          in: query
-          name: media_type
-          required: true
-          schema:
-            items:
-              type: string
-            type: array
-        - description: Allowed message types
-          in: query
-          name: message_type
-          schema:
-            items:
-              type: string
-            type: array
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DocumentIndexStatusResponse"
-          description: OK
-        "400":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "403":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "429":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "503":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Get extracted document index status
-      tags:
-        - API
-  /api/v1/documents/status/current:
-    get:
-      operationId: getCurrentDocumentIndexStatus
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DocumentIndexStatusResponse"
-          description: OK
-        "400":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "403":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "429":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "503":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Get extracted document index status for the selected durable profile
-      tags:
-        - API
-  /api/v1/documents/vectors/status:
-    get:
-      operationId: getDocumentVectorStatus
-      parameters:
-        - description: Generation whose bounded failures to inspect
-          in: query
-          name: generation_id
-          schema:
-            format: int64
-            type: integer
-        - description: Stable failure cursor token
-          in: query
-          name: after_token
-          schema:
-            type: string
-        - description: Maximum failure diagnostics (default 20, max 1000)
-          in: query
-          name: limit
-          schema:
-            format: int64
-            type: integer
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DocumentVectorOperationsResponse"
-          description: OK
-        "400":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "403":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "429":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        "503":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Get document vector generation, consent, usage, and failure status
-      tags:
-        - API
   /api/v1/domains/search:
     post:
       operationId: searchDomains
@@ -21619,6 +21949,71 @@ paths:
       summary: Get one domain's canonical activity timeline
       tags:
         - Exploration
+  /api/v1/embeddings/local:
+    get:
+      operationId: getLocalEmbeddings
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LocalEmbeddingsStatus"
+          description: OK
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get local search setup
+      tags:
+        - API
+    post:
+      operationId: enableLocalEmbeddings
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LocalEmbeddingsStatus"
+          description: Accepted
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Turn on local search
+      tags:
+        - API
   /api/v1/embeddings/status:
     get:
       operationId: getEmbeddingStatus
@@ -23077,6 +23472,39 @@ paths:
       summary: Import one meeting
       tags:
         - API
+  /api/v1/import/message:
+    post:
+      operationId: importMessage
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageImportRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageImportResponse"
+          description: OK
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MessageImportResponse"
+          description: Created
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Import one message
+      tags:
+        - API
   /api/v1/import/muesli:
     post:
       operationId: importMuesli
@@ -23725,6 +24153,63 @@ paths:
       summary: Add exact archive evidence to an existing Kata issue
       tags:
         - API
+  /api/v1/integrations/kata/open-issues:
+    get:
+      operationId: listOpenKataIssues
+      parameters:
+        - description: Search open issue text by whole word or enter an exact qualified ref, including closed issues, up to 256 bytes
+          in: query
+          name: q
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KataIssueListResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List or search Kata issues in the configured project
+      tags:
+        - API
   /api/v1/integrations/kata/status:
     get:
       operationId: getKataIntegrationStatus
@@ -23750,10 +24235,9 @@ paths:
     get:
       operationId: searchIntegrationTasks
       parameters:
-        - description: Task title search within the configured project
+        - description: Task title search within the configured project; omit to list tasks
           in: query
           name: q
-          required: true
           schema:
             type: string
       responses:
@@ -23816,6 +24300,344 @@ paths:
       summary: Test task integration discovery, authentication, capabilities, and project
       tags:
         - API
+  /api/v1/loops:
+    get:
+      operationId: listLoops
+      parameters:
+        - description: Only loops with this person
+          in: query
+          name: person_id
+          schema:
+            format: int64
+            type: integer
+        - description: Maximum loops to return
+          in: query
+          name: limit
+          schema:
+            default: 50
+            format: int64
+            maximum: 200
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoopListResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List conversations waiting on a reply
+      tags:
+        - API
+  /api/v1/loops/{message_id}/done:
+    post:
+      operationId: markLoopDone
+      parameters:
+        - description: ID of the message that anchors the loop
+          in: path
+          name: message_id
+          required: true
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+        - description: The list item's question_message_ids; only these are marked. Omit to cover every question visible now.
+          in: query
+          name: question_message_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoopDecisionResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "415":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: "Open loops unavailable, or loop_scan_incomplete: retry to continue checking retained evidence"
+          headers:
+            Retry-After:
+              description: Seconds before retrying an incomplete evidence scan
+              schema:
+                type: string
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Mark a loop done
+      tags:
+        - API
+  /api/v1/loops/{message_id}/reopen:
+    post:
+      operationId: reopenLoop
+      parameters:
+        - description: ID of the message that anchors the loop
+          in: path
+          name: message_id
+          required: true
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoopDecisionResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "415":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: "Open loops unavailable, or loop_scan_incomplete: retry to continue checking retained evidence"
+          headers:
+            Retry-After:
+              description: Seconds before retrying an incomplete evidence scan
+              schema:
+                type: string
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Clear a loop decision
+      tags:
+        - API
+  /api/v1/loops/{message_id}/snooze:
+    post:
+      operationId: snoozeLoop
+      parameters:
+        - description: ID of the message that anchors the loop
+          in: path
+          name: message_id
+          required: true
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+        - description: The list item's question_message_ids; only these are marked. Omit to cover every question visible now.
+          in: query
+          name: question_message_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnoozeLoopRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoopDecisionResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "415":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: "Open loops unavailable, or loop_scan_incomplete: retry to continue checking retained evidence"
+          headers:
+            Retry-After:
+              description: Seconds before retrying an incomplete evidence scan
+              schema:
+                type: string
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Hide a loop until a later time
+      tags:
+        - API
   /api/v1/mcp/capabilities:
     get:
       operationId: getMCPCapabilities
@@ -23841,13 +24663,13 @@ paths:
     get:
       operationId: searchMedia
       parameters:
-        - description: Spoken words to find in transcripts
+        - description: Words to find in recordings and attachments
           in: query
           name: q
           required: true
           schema:
             type: string
-        - description: Lexical mode; semantic and hybrid are unavailable
+        - description: "Attachment mode: lexical (default), semantic, or hybrid; recordings support lexical only"
           in: query
           name: mode
           schema:
@@ -23940,7 +24762,7 @@ paths:
           description: Error
       security:
         - apiKey: []
-      summary: Search source-selected transcripts as visible messages
+      summary: Search recording transcripts and mirrored attachment text as visible messages
       tags:
         - API
   /api/v1/media/search/status:
@@ -24566,6 +25388,12 @@ paths:
           name: search_mode
           schema:
             type: string
+        - description: Maximum results for bounded search-aware deletion resolution (max 100001)
+          in: query
+          name: max_results
+          schema:
+            format: int64
+            type: integer
         - description: Aggregate view type; required for aggregate search
           in: query
           name: view_type
@@ -25143,8 +25971,6 @@ paths:
           schema:
             enum:
               - carddav_sync
-              - document_embedding
-              - document_extraction
               - message_embedding
               - person_embedding
               - person_enrichment
@@ -25158,7 +25984,6 @@ paths:
           schema:
             enum:
               - contacts
-              - documents
               - messages
               - person_facts
               - visual_attachments
@@ -26704,6 +27529,11 @@ paths:
           name: q
           schema:
             type: string
+        - description: Literal case-insensitive substring of current bound participant identities or curated contact points
+          in: query
+          name: address
+          schema:
+            type: string
         - description: Opaque cursor returned by the previous Directory page
           in: query
           name: cursor
@@ -26925,6 +27755,39 @@ paths:
       security:
         - apiKey: []
       summary: Search durable people semantically
+      tags:
+        - API
+  /api/v1/people/tiers:
+    get:
+      operationId: previewPersonTiers
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonTierPreview"
+          description: OK
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List saved people in tier 1 or 2
       tags:
         - API
   /api/v1/people/{id}:
@@ -29530,6 +30393,53 @@ paths:
       summary: Split absorbed participant lineage into a new person
       tags:
         - API
+  /api/v1/people/{id}/tier:
+    get:
+      operationId: explainPersonTier
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonTierExplanation"
+          description: OK
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Show every count behind one person's tier
+      tags:
+        - API
   /api/v1/people/{id}/tracking:
     get:
       operationId: getPersonTracking
@@ -30835,7 +31745,7 @@ paths:
       tags:
         - API
     patch:
-      description: Sending canonical_state without schema_version keeps the stored schema version, so schema 1 keeps pipes as literal text. Send schema_version 2 to adopt pipe OR.
+      description: Sending canonical_state without schema_version keeps the stored schema version, so schema 1 keeps pipes as literal text. Send schema_version 2 to adopt pipe OR, or 3 for local date offsets.
       operationId: patchSavedView
       parameters:
         - description: Saved View ID

@@ -20,6 +20,9 @@ import (
 // ErrNotSupported is returned for operations not available through the daemon API.
 var ErrNotSupported = errors.New("operation not supported through daemon API")
 
+// ErrBoundedDeletionSearchUnsupported means the daemon needs an upgrade for bounded staging.
+var ErrBoundedDeletionSearchUnsupported = errors.New("bounded deletion search unsupported")
+
 // ErrMessageRawNotFound means the daemon holds the message but no raw data.
 var ErrMessageRawNotFound = errors.New("message raw data not found")
 
@@ -41,6 +44,8 @@ const (
 	accountScopeMinAPISchemaVersion = "3.11.0"
 	// filenameMinAPISchemaVersion is the first daemon contract with filename: filters.
 	filenameMinAPISchemaVersion = "3.14.0"
+	// boundedDeletionSearchMinAPISchemaVersion adds one-request bounded MCP staging.
+	boundedDeletionSearchMinAPISchemaVersion = "3.26.0"
 )
 
 // Engine implements query.Engine by making HTTP calls to a msgvault daemon.
@@ -66,6 +71,7 @@ var _ query.CollectionScopeLister = (*Engine)(nil)
 var _ query.MessageBodySearcher = (*Engine)(nil)
 var _ query.SemanticMessageSearcher = (*Engine)(nil)
 var _ query.DeletionTargetSearchResolver = (*Engine)(nil)
+var _ query.BoundedDeletionTargetSearchResolver = (*Engine)(nil)
 var _ query.DeletionTargetAggregateSearchResolver = (*Engine)(nil)
 
 const tuiSearchContractMinAPISchemaVersion = "2.16.0"
@@ -605,6 +611,7 @@ func querySummaryFromAPIMessage(msg store.APIMessage) query.MessageSummary {
 		ID:                   msg.ID,
 		SourceID:             msg.SourceID,
 		SourceMessageID:      msg.SourceMessageID,
+		RFC822MessageID:      msg.RFC822MessageID,
 		ConversationID:       msg.ConversationID,
 		SourceConversationID: msg.SourceConversationID,
 		Subject:              msg.Subject,
@@ -620,6 +627,7 @@ func querySummaryFromAPIMessage(msg store.APIMessage) query.MessageSummary {
 		Snippet:              msg.Snippet,
 		Labels:               msg.Labels,
 		HasAttachments:       msg.HasAttachments,
+		HiddenTextPresent:    msg.HiddenTextPresent,
 		SizeEstimate:         msg.SizeEstimate,
 	}
 }
@@ -663,14 +671,14 @@ func textConversationRowsFromGenerated(rows []generated.TextConversationRow) []q
 	return out
 }
 
-func (c *Client) queryMessageSummariesFromCLIGenerated(msgs []generated.CLIQueryMessageSummary) []query.MessageSummary {
+func (c *Client) queryMessageSummariesFromCLIGenerated(ctx context.Context, msgs []generated.CLIQueryMessageSummary) []query.MessageSummary {
 	if msgs == nil {
 		return nil
 	}
 	out := make([]query.MessageSummary, len(msgs))
 	for i, msg := range msgs {
 		out[i] = queryMessageSummaryFromGenerated(msg)
-		out[i].WebURL = c.messageWebURL(msg.ID)
+		out[i].WebURL = c.messageWebURL(ctx, msg.ID)
 	}
 	return out
 }
@@ -793,7 +801,7 @@ func (e *Engine) ListMessages(ctx context.Context, filter query.MessageFilter) (
 	if err := requireAppliedSourceIDs(filter.SourceIDs, resp.JSON200.AppliedSourceIds, "message filter"); err != nil {
 		return nil, err
 	}
-	return e.store.messageSummariesWithURLs(resp.JSON200.Messages), nil
+	return e.store.messageSummariesWithURLs(ctx, resp.JSON200.Messages), nil
 }
 
 // GetMessage returns a single message by ID.
@@ -808,7 +816,7 @@ func (e *Engine) GetMessage(ctx context.Context, id int64) (*query.MessageDetail
 
 	detail := queryDetailFromAPIMessage(msg)
 	if detail != nil {
-		detail.WebURL = e.store.messageWebURL(detail.ID)
+		detail.WebURL = e.store.messageWebURL(ctx, detail.ID)
 	}
 	return detail, nil
 }
@@ -820,6 +828,9 @@ func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
 	detail := &query.MessageDetail{
 		RelatedMessageID:     msg.RelatedMessageID,
 		ID:                   msg.ID,
+		IsFromMe:             msg.IsFromMe,
+		SenderAuth:           msg.SenderAuth,
+		Calendar:             msg.Calendar,
 		SourceID:             msg.SourceID,
 		SourceMessageID:      msg.SourceMessageID,
 		RFC822MessageID:      msg.RFC822MessageID,
@@ -833,6 +844,7 @@ func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
 		DeletedAt:            msg.DeletedAt,
 		SizeEstimate:         msg.SizeEstimate,
 		HasAttachments:       msg.HasAttachments,
+		HiddenTextPresent:    msg.HiddenTextPresent,
 		Labels:               msg.Labels,
 		BodyText:             apiMessageBodyText(msg),
 		BodyHTML:             msg.BodyHTML,
@@ -858,14 +870,11 @@ func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
 	return detail
 }
 
-// apiMessageBodyText returns the plain-text body. store.APIMessage.Body falls
-// back to the HTML when there is no text part; that must not be reported as
-// text, or body_format=auto/html never sees the HTML.
 func apiMessageBodyText(msg *store.APIMessage) string {
 	if msg.BodyText != "" {
 		return msg.BodyText
 	}
-	if msg.Body == msg.BodyHTML {
+	if msg.BodyHTML != "" && msg.Body == msg.BodyHTML {
 		return ""
 	}
 	return msg.Body
@@ -934,6 +943,7 @@ func (e *Engine) GetMessageSummariesByIDs(ctx context.Context, ids []int64) ([]q
 			DeletedAt:            md.DeletedAt,
 			SizeEstimate:         md.SizeEstimate,
 			HasAttachments:       md.HasAttachments,
+			HiddenTextPresent:    md.HiddenTextPresent,
 			AttachmentCount:      len(md.Attachments),
 			Labels:               md.Labels,
 		}
@@ -1022,7 +1032,7 @@ func (e *Engine) Search(ctx context.Context, q *search.Query, limit, offset int)
 	if err != nil {
 		return nil, err
 	}
-	return e.store.messageSummariesWithURLs(resp.JSON200.Messages), nil
+	return e.store.messageSummariesWithURLs(ctx, resp.JSON200.Messages), nil
 }
 
 // SearchDeep preserves the TUI's complete view filter across the daemon
@@ -1104,7 +1114,7 @@ func (e *Engine) SearchDeepWithStats(
 		return nil, err
 	}
 	return &query.SearchFastResult{
-		Messages:   e.store.messageSummariesWithURLs(resp.JSON200.Messages),
+		Messages:   e.store.messageSummariesWithURLs(ctx, resp.JSON200.Messages),
 		TotalCount: resp.JSON200.TotalCount,
 		Stats:      totalStatsFromGenerated(resp.JSON200.Stats),
 	}, nil
@@ -1147,7 +1157,7 @@ func (e *Engine) SearchMessageBodies(ctx context.Context, q *search.Query, limit
 	}
 	messages, err := bodySearchSummariesFromGenerated(resp.JSON200.Messages, resp.JSON200.BodyContexts)
 	for i := range messages {
-		messages[i].WebURL = e.store.messageWebURL(messages[i].ID)
+		messages[i].WebURL = e.store.messageWebURL(ctx, messages[i].ID)
 	}
 	if err != nil {
 		return nil, err
@@ -1226,9 +1236,10 @@ func (e *Engine) SearchFastWithStats(ctx context.Context, q *search.Query, query
 	}
 	return &query.SearchFastResult{
 		IndexState: stringValue(resp.JSON200.IndexState),
-		Messages:   e.store.messageSummariesWithURLs(resp.JSON200.Messages),
+		Messages:   e.store.messageSummariesWithURLs(ctx, resp.JSON200.Messages),
 		TotalCount: resp.JSON200.TotalCount,
 		Stats:      totalStatsFromGenerated(resp.JSON200.Stats),
+		Hints:      searchHintsFromGenerated(resp.JSON200.Hints),
 	}, nil
 }
 
@@ -1296,6 +1307,53 @@ func (e *Engine) GetDeletionTargetsBySearch(
 		return nil, err
 	}
 	return deletionTargetsFromGenerated(resp.JSON200)
+}
+
+func (e *Engine) GetDeletionTargetsBySearchBounded(
+	ctx context.Context,
+	searchQuery *search.Query,
+	filter query.MessageFilter,
+	mode query.DeletionSearchMode,
+	maxResults int,
+) ([]query.DeletionTarget, int, error) {
+	if filter.SourceIDs != nil && len(filter.SourceIDs) == 0 {
+		return []query.DeletionTarget{}, 0, nil
+	}
+	if mode != query.DeletionSearchFast && mode != query.DeletionSearchDeep {
+		return nil, 0, fmt.Errorf("unsupported bounded deletion search mode %q", mode)
+	}
+	if err := validateParsedSearchQuery(searchQuery); err != nil {
+		return nil, 0, err
+	}
+	searchQuery, filter = hoistQueryScopes(searchQuery, filter)
+	queryString := search.Format(searchQuery)
+	if queryString == "" {
+		return nil, 0, errors.New("bounded deletion search requires a nonempty query")
+	}
+	compatible, err := e.store.SupportsAPISchemaVersion(ctx, boundedDeletionSearchMinAPISchemaVersion)
+	if err != nil {
+		return nil, 0, fmt.Errorf("check bounded daemon search-aware deletion capability: %w", err)
+	}
+	if !compatible {
+		return nil, 0, fmt.Errorf("%w: bounded search-aware deletion resolution requires daemon API schema %s or newer; upgrade the daemon and retry", ErrBoundedDeletionSearchUnsupported, boundedDeletionSearchMinAPISchemaVersion)
+	}
+	modeString := string(mode)
+	limit := int64(maxResults)
+	params := gmailIDsFilterQuery(filter)
+	params.Q = &queryString
+	params.SearchMode = &modeString
+	params.MaxResults = &limit
+	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.GetGmailIDsByFilterResp, error) {
+		return client.GetGmailIDsByFilterWithResponse(ctx, &generated.GetGmailIDsByFilterRequestOptions{Query: params})
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if err := requireAppliedSourceIDs(filter.SourceIDs, resp.JSON200.AppliedSourceIds, "deletion-target"); err != nil {
+		return nil, 0, err
+	}
+	targets, err := deletionTargetsFromGenerated(resp.JSON200)
+	return targets, intValue(resp.JSON200.MatchedCount), err
 }
 
 func (e *Engine) GetDeletionTargetsByAggregateSearch(
@@ -1451,7 +1509,7 @@ func (e *Engine) SearchByDomains(ctx context.Context, domains []string, after, b
 		return query.DomainSearchResult{}, nil
 	}
 	return query.DomainSearchResult{
-		Messages: e.store.messageSummariesWithURLs(resp.JSON200.Messages),
+		Messages: e.store.messageSummariesWithURLs(ctx, resp.JSON200.Messages),
 		HasMore:  resp.JSON200.HasMore,
 	}, nil
 }
@@ -1533,7 +1591,7 @@ func (e *Engine) ListConversationMessages(ctx context.Context, convID int64, fil
 	if err != nil {
 		return nil, err
 	}
-	return e.store.queryMessageSummariesFromCLIGenerated(resp.JSON200.Messages), nil
+	return e.store.queryMessageSummariesFromCLIGenerated(ctx, resp.JSON200.Messages), nil
 }
 
 func (e *Engine) TextSearch(ctx context.Context, queryStr string, sourceID *int64, limit, offset int) ([]query.MessageSummary, error) {
@@ -1553,7 +1611,7 @@ func (e *Engine) TextSearch(ctx context.Context, queryStr string, sourceID *int6
 	if sourceID != nil && (resp.JSON200.AppliedSourceID == nil || *resp.JSON200.AppliedSourceID != *sourceID) {
 		return nil, errors.New("daemon did not confirm text-search source ID; upgrade the daemon and retry")
 	}
-	return e.store.queryMessageSummariesFromCLIGenerated(resp.JSON200.Messages), nil
+	return e.store.queryMessageSummariesFromCLIGenerated(ctx, resp.JSON200.Messages), nil
 }
 
 func (e *Engine) GetTextStats(ctx context.Context, opts query.TextStatsOptions) (*query.TotalStats, error) {

@@ -16,6 +16,7 @@ import (
 )
 
 func TestClientRetriesOn429(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	var calls atomic.Int32
@@ -31,13 +32,14 @@ func TestClientRetriesOn429(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testToken, 1000)
-	accounts, err := c.ListAccounts(context.Background())
+	accounts, err := c.ListAccounts(t.Context())
 	require.NoError(err)
 	assert.Empty(accounts)
 	assert.EqualValues(3, calls.Load())
 }
 
 func TestClientCapsOversizedRetryAfter(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -55,7 +57,7 @@ func TestClientCapsOversizedRetryAfter(t *testing.T) {
 	c := NewClient(srv.URL, testToken, 1000)
 	c.retryAfterMax = 10 * time.Millisecond
 	start := time.Now()
-	accounts, err := c.ListAccounts(context.Background())
+	accounts, err := c.ListAccounts(t.Context())
 	require.NoError(err)
 	assert.Empty(accounts)
 	assert.EqualValues(2, calls.Load())
@@ -64,6 +66,7 @@ func TestClientCapsOversizedRetryAfter(t *testing.T) {
 }
 
 func TestClientUnauthorizedMessage(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -72,13 +75,14 @@ func TestClientUnauthorizedMessage(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testToken, 1000)
-	_, err := c.ListAccounts(context.Background())
+	_, err := c.ListAccounts(t.Context())
 	require.Error(err)
 	assert.Contains(err.Error(), "add-beeper")
 	assert.Contains(err.Error(), "Beeper Desktop")
 }
 
 func TestClientNotFound(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -87,13 +91,14 @@ func TestClientNotFound(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testToken, 1000)
-	_, err := c.GetMessage(context.Background(), "!c:x", "1")
+	_, err := c.GetMessage(t.Context(), "!c:x", "1")
 	require.Error(err)
 	require.ErrorIs(err, ErrNotFound)
 	assert.NotErrorIs(err, ErrAssetUnavailable)
 }
 
 func TestClientContextCancelDuringBackoff(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -101,7 +106,7 @@ func TestClientContextCancelDuringBackoff(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the server always fails, so only the context ends the backoff
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond) //nolint:kennlint // deadlinetest: the deadline is the expected result; the server always fails, so only the context ends the backoff
 	defer cancel()
 
 	c := NewClient(srv.URL, testToken, 1000)
@@ -113,6 +118,7 @@ func TestClientContextCancelDuringBackoff(t *testing.T) {
 }
 
 func TestClientSendsBearerToken(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	var got string
@@ -123,12 +129,13 @@ func TestClientSendsBearerToken(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testToken, 1000)
-	_, err := c.ListAccounts(context.Background())
+	_, err := c.ListAccounts(t.Context())
 	require.NoError(err)
 	assert.Equal("Bearer test-token", got)
 }
 
 func TestSearchChatsParams(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeBeeper(t)
@@ -142,7 +149,7 @@ func TestSearchChatsParams(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testToken, 1000)
-	out, err := c.SearchChats(context.Background(), SearchChatsParams{
+	out, err := c.SearchChats(t.Context(), SearchChatsParams{
 		AccountID:         "signal",
 		LastActivityAfter: time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
 	})
@@ -152,6 +159,7 @@ func TestSearchChatsParams(t *testing.T) {
 }
 
 func TestListMessagesPagination(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeBeeper(t)
@@ -168,7 +176,7 @@ func TestListMessagesPagination(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testToken, 1000)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Newest page first, then walk older until the empty end-of-history page
 	// (the live API's hasMore flag is not a reliable termination signal).
@@ -226,6 +234,7 @@ func assetServer(t *testing.T, responses ...assetResponse) (*Client, *atomic.Int
 // phrase-table sentinels and their precedence, a bare 404, statuses that win
 // over the phrase table, transient retries, and unhandled 4xx statuses.
 func TestGetAssetBytesClassification(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		responses   []assetResponse
@@ -370,7 +379,7 @@ func TestGetAssetBytesClassification(t *testing.T) {
 			assert := assert.New(t)
 			require := require.New(t)
 			c, calls := assetServer(t, tt.responses...)
-			data, err := c.GetAssetBytes(context.Background(), "mxc://example.test/a", 1<<20)
+			data, err := c.GetAssetBytes(t.Context(), "mxc://example.test/a", 1<<20)
 			assert.Equal(tt.wantCalls, calls.Load())
 			if tt.wantOK {
 				require.NoError(err)
@@ -392,10 +401,11 @@ func TestGetAssetBytesClassification(t *testing.T) {
 }
 
 func TestGetAssetBytesLargeErrorBodyIsNotSizeCap(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	body := expiredAssetBody + strings.Repeat(" ", 2048)
 	c, calls := assetServer(t, assetResponse{status: http.StatusInternalServerError, body: body})
-	_, err := c.GetAssetBytes(context.Background(), "mxc://example.test/a", 16)
+	_, err := c.GetAssetBytes(t.Context(), "mxc://example.test/a", 16)
 	require.Error(t, err)
 	require.NotErrorIs(t, err, ErrAssetTooLarge, "an error body is not the asset")
 	require.ErrorIs(t, err, ErrAssetUnavailable)
@@ -403,23 +413,25 @@ func TestGetAssetBytesLargeErrorBodyIsNotSizeCap(t *testing.T) {
 }
 
 func TestClientPermanentPhraseIgnoredOffAssets(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	c, calls := assetServer(t,
 		assetResponse{status: http.StatusInternalServerError, body: expiredAssetBody},
 		assetResponse{status: http.StatusOK, body: `[]`},
 	)
-	accounts, err := c.ListAccounts(context.Background())
+	accounts, err := c.ListAccounts(t.Context())
 	require.NoError(t, err)
 	assert.Empty(accounts)
 	assert.EqualValues(2, calls.Load())
 }
 
+// serial: asserts a real-time retry duration.
 func TestClientDoesNotSleepAfterFinalAttempt(t *testing.T) {
 	assert := assert.New(t)
 	c, calls := assetServer(t, assetResponse{status: http.StatusInternalServerError})
 	c.retryAfterMax = 500 * time.Millisecond
 	start := time.Now()
-	_, err := c.GetAssetBytes(context.Background(), "mxc://example.test/a", 1<<20)
+	_, err := c.GetAssetBytes(t.Context(), "mxc://example.test/a", 1<<20)
 	require.Error(t, err)
 	assert.EqualValues(3, calls.Load())
 	// Two capped waits (1s total) separate three attempts; a third wait

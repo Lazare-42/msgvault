@@ -1,4 +1,7 @@
 <script lang="ts">
+  import { getContext } from 'svelte';
+  import { conversationTaskStatusKey, type ConversationTaskStatus } from './task-status';
+  import { createBrowserRequestID } from '../../api/request-id';
   import {
     createOrLinkMessageTask as generatedCreateOrLinkMessageTask,
     getTaskIntegrationStatus as generatedGetTaskIntegrationStatus,
@@ -6,48 +9,57 @@
     searchIntegrationTasks as generatedSearchIntegrationTasks,
     unlinkMessageTask as generatedUnlinkMessageTask,
   } from '../../api/generated/api/api';
-  import { Button, TextInput } from '@kenn-io/kit-ui';
+  import { Button, SegmentedControl } from '@kenn-io/kit-ui';
   import type { APIClient } from '../../api/client';
   import type {
     TaskLinkLookupResponse as GeneratedTaskLinkLookupResponse,
     TaskLinkOutboundMetadata as GeneratedTaskLinkOutboundMetadata,
     TaskSummary as GeneratedTaskSummary,
   } from '../../api/generated/models';
+  import TaskIssuePicker from '../common/TaskIssuePicker.svelte';
   import CreateTaskDialog from './CreateTaskDialog.svelte';
   type Lookup = GeneratedTaskLinkLookupResponse;
   type OutboundMetadata = GeneratedTaskLinkOutboundMetadata;
   type Task = GeneratedTaskSummary;
   let {
     client,
+    mode = 'list',
+    showSetup = true,
+    busy = $bindable(false),
+    oncomplete = undefined,
+    oncancel = undefined,
     messageId,
     title,
-    sourceType,
-    sourceIdentifier,
     onsettings = () => undefined,
   }: {
     client: APIClient;
+    mode?: 'list' | 'add';
+    showSetup?: boolean;
+    busy?: boolean;
+    oncomplete?: () => void;
+    oncancel?: () => void;
     messageId: number;
     title: string;
-    sourceType: string;
-    sourceIdentifier: string;
     onsettings?: () => void;
   } = $props();
+  const conversationStatus = getContext<ConversationTaskStatus | undefined>(conversationTaskStatusKey);
+  let action = $state('create');
   let loading = $state(true);
-  let integrationState = $state('loading');
-  let integrationMessage = $state('');
+  let localStatus = $state<{ state: string; project?: string; message?: string }>({ state: 'loading' });
+  const status = $derived(conversationStatus?.latest ?? localStatus);
+  const integrationState = $derived(status.state);
+  const integrationMessage = $derived(status.message ?? 'Task integration status is unavailable.');
+  const project = $derived(status.project ?? '');
   let indexState = $state('loading');
   let complete = $state(false);
   let reason = $state('');
   let lastScan = $state('');
   let tasks = $state<Task[]>([]);
-  let project = $state('');
-  let searchQuery = $state('');
-  let searchResults = $state<Task[]>([]);
-  let searching = $state(false);
+  let selected = $state('');
   let mutating = $state(false);
   let error = $state('');
-  let creating = $state(false);
   let outboundMetadata = $state<OutboundMetadata | null>(null);
+  let creationInitialized = $state(false);
   let generation = 0;
   let activeController: AbortController | null = null;
   let existingLinkRetry:
@@ -66,21 +78,17 @@
   });
   function resetForSelection(): void {
     loading = true;
-    integrationState = 'loading';
-    integrationMessage = '';
+    localStatus = { state: 'loading' };
     indexState = 'loading';
     complete = false;
     reason = '';
     lastScan = '';
     tasks = [];
-    project = '';
-    searchQuery = '';
-    searchResults = [];
-    searching = false;
+    selected = '';
     mutating = false;
     error = '';
-    creating = false;
     outboundMetadata = null;
+    creationInitialized = false;
     existingLinkRetry = undefined;
   }
   async function loadFor(selectedMessageID: number): Promise<void> {
@@ -90,24 +98,28 @@
     activeController = controller;
     resetForSelection();
     try {
-      const status = await generatedGetTaskIntegrationStatus({
-        ...client,
-        signal: controller.signal,
-      });
-      if (currentGeneration !== generation) return;
-      project = status.data?.project ?? '';
-      integrationState = status.data?.state ?? 'unavailable';
-      integrationMessage = status.data?.message ?? 'Task integration status is unavailable.';
       // The reverse-index response is independently authoritative and may
-      // contain a safe last-good snapshot even when the live integration is down.
-      const { data, error: responseError } = await generatedListMessageTasks(
-        { id: selectedMessageID },
-        {
+      // contain a safe last-good snapshot even when the live integration is
+      // down, so both reads start together.
+      const [statusResult, tasksResult] = await Promise.allSettled([
+        conversationStatus?.load() ?? generatedGetTaskIntegrationStatus({
           ...client,
           signal: controller.signal,
-        },
-      );
-      if (currentGeneration !== generation) return;
+        }),
+        generatedListMessageTasks(
+          { id: selectedMessageID },
+          {
+            ...client,
+            signal: controller.signal,
+          },
+        ),
+      ]);
+      if (currentGeneration !== generation || controller.signal.aborted) return;
+      if (statusResult.status === 'rejected') throw statusResult.reason;
+      const status = statusResult.value;
+      localStatus = status.data ?? { state: 'unavailable' };
+      if (tasksResult.status === 'rejected') throw tasksResult.reason;
+      const { data, error: responseError } = tasksResult.value;
       if (!data) throw new Error(messageFor(responseError, 'Unable to load linked tasks.'));
       apply(data);
     } catch (cause) {
@@ -127,30 +139,10 @@
     tasks = data.tasks ?? [];
     outboundMetadata = data.outbound_metadata;
   }
-  async function search(): Promise<void> {
-    const query = searchQuery.trim();
-    if (!query || searching || !mutationReady) return;
-    const currentGeneration = generation;
-    searching = true;
-    error = '';
-    searchResults = [];
-    try {
-      const { data, error: responseError } = await generatedSearchIntegrationTasks(
-        { q: query },
-        {
-          ...client,
-          signal: activeController?.signal,
-        },
-      );
-      if (currentGeneration !== generation) return;
-      if (!data) throw new Error(messageFor(responseError, 'Unable to search tasks.'));
-      searchResults = data.tasks ?? [];
-    } catch (cause) {
-      if (currentGeneration !== generation || activeController?.signal.aborted) return;
-      error = cause instanceof Error ? cause.message : 'Unable to search tasks.';
-    } finally {
-      if (currentGeneration === generation) searching = false;
-    }
+  async function loadTasks(query: string, signal: AbortSignal) {
+    const { data, error } = await generatedSearchIntegrationTasks(query ? { q: query } : {}, { ...client, signal });
+    if (!data) throw new Error(messageFor(error, 'Unable to search tasks.'));
+    return { items: (data.tasks ?? []).map(task => ({ id: task.id, label: task.title, detail: task.id })), truncated: data.truncated };
   }
   async function linkExisting(taskID: string): Promise<void> {
     if (!taskID || mutating || !mutationReady) return;
@@ -159,9 +151,10 @@
     const retry =
       existingLinkRetry?.taskID === taskID
         ? existingLinkRetry
-        : { taskID, requestID: globalThis.crypto.randomUUID(), addedAt: new Date().toISOString() };
+        : { taskID, requestID: createBrowserRequestID(), addedAt: new Date().toISOString() };
     existingLinkRetry = retry;
     mutating = true;
+    busy = true;
     error = '';
     try {
       const { data, error: responseError } = await generatedCreateOrLinkMessageTask(
@@ -176,14 +169,16 @@
       if (currentGeneration !== generation) return;
       if (!data) throw new Error(messageFor(responseError, 'Unable to link task.'));
       existingLinkRetry = undefined;
-      searchQuery = '';
-      searchResults = [];
-      await loadFor(selectedMessageID);
+      selected = '';
+      oncomplete?.();
     } catch (cause) {
       if (currentGeneration !== generation || activeController?.signal.aborted) return;
       error = cause instanceof Error ? cause.message : 'Unable to link task.';
     } finally {
-      if (currentGeneration === generation) mutating = false;
+      if (currentGeneration === generation) {
+        mutating = false;
+        busy = false;
+      }
     }
   }
   async function unlink(taskID: string): Promise<void> {
@@ -218,11 +213,15 @@
   // Mutations go through the live task service, so a partial reverse index
   // only limits lookup completeness — it does not block create/link/unlink.
   const mutationReady = $derived(integrationState === 'ready' && (indexState === 'ready' || indexState === 'partial'));
+  $effect(() => {
+    if (mode === 'add' && mutationReady && outboundMetadata) creationInitialized = true;
+  });
   const degraded = $derived(!mutationReady);
   const partialIndex = $derived(mutationReady && indexState === 'partial');
   const sessionOnlyIndex = $derived(mutationReady && reason === 'cache_persistence_unsupported');
   const stateMessage = $derived(
-    integrationState !== 'ready' && integrationState !== 'loading'
+    integrationState === 'disabled' ? integrationMessage || 'Task integration is disabled.'
+      : integrationState !== 'ready' && integrationState !== 'loading'
       ? `Task integration ${integrationState}: ${integrationMessage || 'No status detail was provided.'}`
       : reason === 'cache_persistence_unsupported'
         ? 'Linked-task cache persistence is unavailable on this platform; current-session links may be shown.'
@@ -231,7 +230,7 @@
           : indexState === 'incompatible'
             ? 'The configured task service is incompatible.'
             : indexState === 'partial'
-              ? `The reverse index is partial${lastScan ? ` (last scanned ${new Date(lastScan).toLocaleString()})` : ''}; an empty result is not authoritative.`
+              ? `Some linked tasks may be missing${lastScan ? ` (last scanned ${new Date(lastScan).toLocaleString()})` : ''}.`
               : indexState === 'stale'
                 ? `The linked-task index is stale${lastScan ? ` (last scanned ${new Date(lastScan).toLocaleString()})` : ''}.`
                 : indexState === 'unavailable'
@@ -248,28 +247,22 @@
   );
 </script>
 
-<section class="task-links" aria-label="Linked tasks">
-  <header>
+{#if showSetup || integrationState === 'ready' || integrationState === 'loading' || (tasks.length > 0 && integrationState !== 'authentication_required') || error}
+<section class="task-links" class:add={mode === 'add'} aria-label="Linked tasks">
+  {#if mode !== 'add' && integrationState !== 'disabled'}<header>
     <h2>Tasks</h2>
-    {#if mutationReady}<Button
-        size="sm"
-        surface="soft"
-        label="Create task"
-        onclick={() => {
-          creating = true;
-        }}
-      />{/if}
-  </header>
+  </header>{/if}
   {#if loading}<p role="status">Loading linked tasks…</p>
   {:else}
-    {#if degraded}<div class="degraded" role="alert">
-        <p>{stateMessage} Mutations are disabled.</p>
-        <Button size="sm" surface="soft" label="Open Settings" onclick={onsettings} />
+    {#if degraded && (showSetup || integrationState === 'ready')}<div class="degraded" role={integrationState === 'disabled' ? 'status' : 'alert'}>
+        <p>{stateMessage}</p>
+        <Button size="sm" surface="soft" label={integrationState === 'disabled' ? 'Set up' : 'Open Settings'} onclick={onsettings} />
       </div>{/if}
     {#if partialIndex}<p role="alert">{stateMessage}</p>{/if}
     {#if sessionOnlyIndex}<p role="status">
         Linked-task index updates are available for this session but are not persisted to disk on this platform.
       </p>{/if}
+    {#if mode !== 'add' && integrationState !== 'authentication_required'}
     {#if tasks.length > 0}
       <ul>
         {#each tasks as task (task.id)}<li>
@@ -283,58 +276,45 @@
           </li>{/each}
       </ul>
     {:else if complete}<p>No linked tasks.</p>{/if}
-    {#if mutationReady}
-      <form
-        onsubmit={(event) => {
-          event.preventDefault();
-          void search();
-        }}
-      >
-        <label
-          >Search tasks<TextInput ariaLabel="Search tasks" bind:value={searchQuery} autocomplete="off" block /></label
-        >
-        <Button type="submit" size="sm" surface="soft" label="Search" disabled={searching || !searchQuery.trim()} />
-      </form>
-      {#if searchResults.length > 0}
-        <ul aria-label="Task search results">
-          {#each searchResults as task (task.id)}<li>
-              <span>{task.title}</span><Button
-                size="sm"
-                surface="soft"
-                label={`Link ${task.title}`}
-                disabled={mutating}
-                onclick={() => void linkExisting(task.id)}
-              />
-            </li>{/each}
-        </ul>
+    {/if}
+    {#if mutationReady && mode === 'add'}
+      <SegmentedControl variant="borderless" disabled={busy || mutating} ariaLabel="Task" options={[{ value: 'create', label: 'New' }, { value: 'existing', label: 'Existing' }]} value={action} onchange={(value) => action = value} />
+      {#if action !== 'create'}
+      <TaskIssuePicker load={loadTasks} noun="tasks" moreNote="Showing the first 25 tasks. Type to search the rest." empty={`No tasks in ${project} yet.`} disabled={busy} bind:selected />
+      {#if error}<p role="alert">{error}</p>{/if}
+      <p class="disclosure">Bodies and attachments are never sent.</p>
+      <div class="actions">
+        <Button surface="soft" label="Cancel" disabled={busy} onclick={oncancel} />
+        <Button tone={selected ? 'info' : 'neutral'} surface={selected ? 'solid' : 'soft'} label="Link task" disabled={busy || !mutationReady || !selected} onclick={() => void linkExisting(selected)} />
+      </div>
       {/if}
     {/if}
-    {#if error}<p role="alert">{error}</p>{/if}
+    {#if error && (mode !== 'add' || action === 'create' || !mutationReady)}<p role="alert">{error}</p>{/if}
   {/if}
 </section>
+{/if}
 
-{#if creating && outboundMetadata}
-  <CreateTaskDialog
-    {client}
-    {messageId}
-    {project}
-    defaultTitle={title}
-    archiveUID={outboundMetadata.archive_uid}
-    conversationId={outboundMetadata.conversation_id}
-    sourceType={outboundMetadata.source_type}
-    sourceIdentifier={outboundMetadata.source_identifier}
-    sourceMessageId={outboundMetadata.source_message_id}
-    subject={outboundMetadata.subject}
-    from={outboundMetadata.from}
-    sentAt={outboundMetadata.sent_at}
-    onclose={() => {
-      creating = false;
-    }}
-    oncreated={() => {
-      creating = false;
-      void loadFor(messageId);
-    }}
-  />
+{#if mode === 'add' && creationInitialized && outboundMetadata}
+  <div class="create-task" hidden={action !== 'create'}>
+    <CreateTaskDialog
+      bind:pending={busy}
+      disabled={!mutationReady}
+      {client}
+      {messageId}
+      {project}
+      defaultTitle={title}
+      archiveUID={outboundMetadata.archive_uid}
+      conversationId={outboundMetadata.conversation_id}
+      sourceType={outboundMetadata.source_type}
+      sourceIdentifier={outboundMetadata.source_identifier}
+      sourceMessageId={outboundMetadata.source_message_id}
+      subject={outboundMetadata.subject}
+      from={outboundMetadata.from}
+      sentAt={outboundMetadata.sent_at}
+      onclose={oncancel}
+      oncreated={() => oncomplete?.()}
+    />
+  </div>
 {/if}
 
 <style>
@@ -343,8 +323,12 @@
     gap: var(--space-3);
     padding: 0 var(--space-5) var(--space-5);
   }
+  .task-links.add { padding: 0; gap: var(--space-6); }
+  .create-task:not([hidden]) { margin-top: var(--space-6); }
+  .disclosure { color: var(--text-secondary); font-size: 12px; }
+  .task-links.add > :global(.kit-segmented) { justify-self: start; }
+  .actions { display: flex; justify-content: flex-end; gap: var(--space-4); }
   header,
-  form,
   li {
     display: flex;
     align-items: center;
@@ -370,13 +354,6 @@
     gap: var(--space-2);
     padding: 0;
     list-style: none;
-  }
-  label {
-    display: grid;
-    flex: 1;
-    gap: var(--space-1);
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
   }
   [role='alert'] {
     color: var(--text-muted);

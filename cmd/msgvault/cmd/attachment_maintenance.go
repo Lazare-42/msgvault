@@ -44,9 +44,14 @@ type attachmentMaintenance struct {
 	logger              *slog.Logger
 	packCreationEnabled bool
 	attachmentsDir      string
-	// packPending records that a scheduled sync wrote loose blobs that no
-	// pack pass has drained yet. Startup requests one scan of existing blobs.
+	// packPending requests a loose-blob scan after ingestion, an unfinished or
+	// failed pack pass, or startup.
 	packPending atomic.Bool
+	// verifyPending records that the indexed-blob verification window has
+	// more slices to walk. It is deliberately separate from packPending: a
+	// verification follow-up needs no loose-candidate scan, and conflating
+	// the two made every follow-up re-enumerate every attachment row.
+	verifyPending atomic.Bool
 }
 
 func newAttachmentMaintenance(
@@ -126,10 +131,8 @@ func (m *attachmentMaintenance) unpack(ctx context.Context) (packstore.UnpackSta
 	return stats, nil
 }
 
-// runAutomaticPack performs one bounded maintenance pass. Errors remain
-// visible to schedulers, while callers following a successful ingest can log
-// or stream the warning and deliberately preserve the ingest result.
-func (m *attachmentMaintenance) runAutomaticPack(ctx context.Context, emitWarning func(string) error) error {
+// runAutomaticPack performs one bounded maintenance pass and reports errors to the scheduler.
+func (m *attachmentMaintenance) runAutomaticPack(ctx context.Context) error {
 	if !m.packCreationEnabled {
 		m.log().Debug("automatic attachment packing disabled")
 		return nil
@@ -156,18 +159,16 @@ func (m *attachmentMaintenance) runAutomaticPack(ctx context.Context, emitWarnin
 		m.log().Warn("automatic attachment maintenance failed",
 			"error", err,
 			"retry", retry)
-		if emitWarning != nil {
-			warning := fmt.Sprintf("Automatic attachment maintenance failed: %v; %s.\n", err, retry)
-			if emitErr := emitWarning(warning); emitErr != nil {
-				m.log().Warn("failed to emit automatic attachment maintenance warning",
-					"error", emitErr)
-			}
-		}
 		return err
 	}
 
 	m.logAutomaticPackSummary("automatic attachment maintenance complete", stats, duration)
-	if stats.BudgetExhausted {
+	// Pruning a mapping whose pack is missing leaves its loose copy unpacked,
+	// and a verification-only pass skipped loose enumeration. Kit counts
+	// unreferenced pruning in the same field, so a deletion can also queue one
+	// extra enumerating pass.
+	if stats.BudgetExhausted || (store.PackVerificationSkipsLooseEnumeration(ctx) &&
+		(stats.MappingsPruned > 0 || stats.RecordsDropped > 0)) {
 		m.markPackPending()
 	}
 	return nil
@@ -242,7 +243,10 @@ func (m *attachmentMaintenance) logAutomaticRepackSummary(message string, stats 
 }
 
 // runScheduledPack bounds existing-blob verification as well as new pack bytes.
-func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) error {
+// enumerateLoose reports whether this pass should look for loose blobs to
+// pack. A pass that only advances the verification window passes false, which
+// skips a scan of every attachment row for candidates it cannot find.
+func (m *attachmentMaintenance) runScheduledPack(ctx context.Context, enumerateLoose bool) error {
 	if !m.packCreationEnabled {
 		return nil
 	}
@@ -250,7 +254,10 @@ func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := m.runAutomaticPack(packCtx, nil); err != nil {
+	if !enumerateLoose {
+		pass.SkipLooseEnumeration()
+	}
+	if err := m.runAutomaticPack(packCtx); err != nil {
 		return err
 	}
 	more, err := m.store.FinishPackVerification(ctx, pass)
@@ -261,7 +268,7 @@ func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) error {
 		// A completed verification cycle restarts on the next request. Only an
 		// unfinished window provides a resume point for a budgeted follow-up.
 		jobctx.RecordProgress(ctx)
-		m.markPackPending()
+		m.verifyPending.Store(true)
 	}
 	return nil
 }
@@ -270,12 +277,16 @@ func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) error {
 // job so the scheduler records the failure instead of obscuring it with a
 // second maintenance result.
 func (m *attachmentMaintenance) daily(ctx context.Context) error {
-	m.packPending.Store(false)
-	if err := m.runScheduledPack(ctx); err != nil {
+	// Look for loose blobs when a sync queued a pass or nothing is queued.
+	// A pass queued only to continue verification skips loose enumeration.
+	loose := m.packPending.Swap(false)
+	verify := m.verifyPending.Swap(false)
+	enumerateLoose := loose || !verify
+	if err := m.runScheduledPack(ctx, enumerateLoose); err != nil {
 		m.markPackPending()
 		return err
 	}
-	if m.packPending.Load() {
+	if m.packPending.Load() || m.verifyPending.Load() {
 		return scheduler.ErrReschedule
 	}
 	return m.runAutomaticRepack(ctx, nil)
@@ -288,18 +299,23 @@ func (m *attachmentMaintenance) markPackPending() {
 	}
 }
 
-// runPendingPack runs one automatic pack pass when a scheduled sync left new
-// loose blobs since the last pass. A failed pass leaves the request pending;
+// runPendingPack runs one automatic pack pass when ingestion, startup, or an
+// unfinished pack or verification pass queued it. A failed pass leaves the request pending;
 // an exhausted byte budget queues another pass behind waiting work.
 func (m *attachmentMaintenance) runPendingPack(ctx context.Context) error {
-	if m == nil || !m.packPending.Swap(false) {
+	if m == nil {
 		return nil
 	}
-	if err := m.runScheduledPack(ctx); err != nil {
+	loose := m.packPending.Swap(false)
+	verify := m.verifyPending.Swap(false)
+	if !loose && !verify {
+		return nil
+	}
+	if err := m.runScheduledPack(ctx, loose); err != nil {
 		m.packPending.Store(true)
 		return err
 	}
-	if m.packPending.Load() {
+	if m.packPending.Load() || m.verifyPending.Load() {
 		return scheduler.ErrReschedule
 	}
 	return nil
@@ -321,22 +337,15 @@ func (m *attachmentMaintenance) log() *slog.Logger {
 	return slog.Default()
 }
 
-// runAfterSuccessfulAttachmentIngest runs bounded maintenance only after a
-// successful ingest. Maintenance and warning-stream failures are best-effort:
-// neither may replace the successful ingest result.
-func runAfterSuccessfulAttachmentIngest(
+// runAttachmentIngest defers packing even when an import partially fails.
+func runAttachmentIngest(
 	ctx context.Context,
 	maintenance *attachmentMaintenance,
 	ingest func(context.Context) error,
-	emitWarning func(string) error,
 ) error {
-	if err := runWithAttachmentMutation(ctx, maintenance, ingest); err != nil {
-		return err
-	}
-	if maintenance != nil {
-		_ = maintenance.runAutomaticPack(ctx, emitWarning)
-	}
-	return nil
+	err := runWithAttachmentMutation(ctx, maintenance, ingest)
+	maintenance.markPackPending()
+	return err
 }
 
 // runAfterSuccessfulAttachmentRemoval runs bounded physical GC only after a
@@ -429,11 +438,14 @@ func registerScheduledBeeperJob(
 	run func(context.Context) error,
 ) error {
 	// Every beeper store source (one per beeper AccountID) maps to this
-	// singleton job name via api.SchedulerJobNameForSource.
+	// singleton job name via api.SchedulerJobNameForSource. A yield request
+	// stops imports at their next chat or page boundary (ShouldStop) instead
+	// of cancelling them mid-account, so a large account keeps its progress.
 	return sched.AddJob(scheduler.Job{
-		Name:        api.BeeperJobName,
-		Schedule:    schedule,
-		Preemptible: true,
+		Name:                  api.BeeperJobName,
+		Schedule:              schedule,
+		Preemptible:           true,
+		CooperativePreemption: true,
 		Run: func(ctx context.Context) error {
 			return runScheduledSource(ctx, maintenance, true, run)
 		},
@@ -450,6 +462,7 @@ func attachmentProducingCommand(args []string) bool {
 	case "archive-remote-images",
 		"backfill-beeper-media",
 		"backfill-discord-media",
+		"backfill-inline-media",
 		"backfill-slack-media",
 		"backfill-teams-media",
 		"import",
@@ -463,11 +476,15 @@ func attachmentProducingCommand(args []string) bool {
 		"import-messenger",
 		"import-pst",
 		"import-slackdump",
+		"import-telegram",
+		"import-x",
 		"import-synctech-sms",
 		"import-whatsapp",
 		"sync-beeper",
 		"sync-chatwoot",
 		"sync-discord",
+		"sync-inline",
+		"sync-matrix",
 		"sync-slack",
 		"sync-synctech-sms",
 		"sync-teams",

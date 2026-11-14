@@ -14,6 +14,7 @@ import (
 // reading Parquet files mid-mutation, and must acquire promptly once the
 // build releases.
 func TestAcquireCacheReadLockBlocksDuringBuild(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	dir := t.TempDir()
 
@@ -22,13 +23,13 @@ func TestAcquireCacheReadLockBlocksDuringBuild(t *testing.T) {
 	require.NoError(err, "acquire exclusive build lock")
 	require.True(locked, "acquire exclusive build lock")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the held build lock keeps the reader waiting
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond) //nolint:kennlint // deadlinetest: the deadline is the expected result; the held build lock keeps the reader waiting
 	defer cancel()
 	_, err = AcquireCacheReadLock(ctx, dir)
 	require.Error(err, "reader must block while a build holds the lock exclusively")
 
 	require.NoError(build.Unlock(), "release build lock")
-	release, err := AcquireCacheReadLock(context.Background(), dir)
+	release, err := AcquireCacheReadLock(t.Context(), dir)
 	require.NoError(err, "reader must acquire after the build releases")
 	release()
 }
@@ -36,14 +37,15 @@ func TestAcquireCacheReadLockBlocksDuringBuild(t *testing.T) {
 // TestAcquireCacheReadLockSharedHoldersDoNotConflict pins that concurrent
 // queries never block each other: only builds hold the lock exclusively.
 func TestAcquireCacheReadLockSharedHoldersDoNotConflict(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	dir := t.TempDir()
 
-	first, err := AcquireCacheReadLock(context.Background(), dir)
+	first, err := AcquireCacheReadLock(t.Context(), dir)
 	require.NoError(err, "first shared holder")
 	defer first()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	second, err := AcquireCacheReadLock(ctx, dir)
 	require.NoError(err, "second shared holder must not conflict with the first")

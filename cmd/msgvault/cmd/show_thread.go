@@ -22,8 +22,10 @@ func newShowThreadCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use: "show-thread <id>", Short: "Show a message's thread in chronological order",
 		Long: `Show the thread containing an internal message ID or provider message ID.
-Messages appear oldest first, with undated messages last. Quoted lines, complete
-single-line dated reply headers above them, and "-- " signatures are removed.
+Messages appear oldest first, with undated messages last.
+SQLite compares instants to the millisecond, with ties in message-ID order.
+Quoted lines, complete single-line dated reply headers above them, and "-- "
+signatures are removed.
 Inline replies, uncertain wrapped headers, and complete URLs are preserved.
 Only ">" quoting and English "On ... wrote:" headers are recognized; Outlook
 "Original Message" blocks and other languages stay as written.
@@ -95,6 +97,12 @@ Examples:
 				enc := jsontext.NewEncoder(cmd.OutOrStdout(), jsontext.WithIndent("  "))
 				return json.MarshalEncode(enc, map[string]any{"conversation_id": page.ConversationID, "total": page.Total, "offset": page.Offset, "has_more": page.HasMore, "messages": values}, json.Deterministic(true))
 			}
+			for _, msg := range messages {
+				if msg.HiddenTextPresent {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Warning: this message's HTML may hide text.")
+					break
+				}
+			}
 			if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Thread %d (%d messages, offset %d)\n", page.ConversationID, page.Total, page.Offset); err != nil {
 				return fmt.Errorf("write thread: %w", err)
 			}
@@ -103,7 +111,8 @@ Examples:
 				if !msg.SentAt.IsZero() {
 					date = msg.SentAt.Format("2006-01-02 15:04:05Z07:00")
 				}
-				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "\nMessage %d · %s · %s\n%s\n%s\n", msg.ID, date, textutil.SanitizeTerminal(formatAddresses(msg.From)), textutil.SanitizeTerminal(msg.Subject), textutil.SanitizeTerminalMultiline(messageTextBody(msg, stripQuoted))); err != nil {
+				body, _ := messageTextBody(msg, stripQuoted)
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "\nMessage %d · %s · %s\n%s\n%s\n", msg.ID, date, textutil.SanitizeTerminal(formatAddresses(msg.From)), textutil.SanitizeTerminal(msg.Subject), textutil.SanitizeTerminalMultiline(body)); err != nil {
 					return fmt.Errorf("write thread: %w", err)
 				}
 			}

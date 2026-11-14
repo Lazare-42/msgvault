@@ -40,7 +40,7 @@ func TestClientCreateDraftAppendsToDrafts(t *testing.T) {
 		ThreadID:  "INBOX|1",
 	}
 
-	draft, err := client.CreateDraft(context.Background(), compose)
+	draft, err := client.CreateDraft(t.Context(), compose)
 	require.NoError(err)
 	require.NotNil(draft)
 	assert.Equal("Synthetic IMAP draft", draft.Message.Subject)
@@ -51,7 +51,7 @@ func TestClientCreateDraftAppendsToDrafts(t *testing.T) {
 	assert.Equal("Drafts", mailbox)
 	assert.NotZero(uid)
 
-	raw, err := client.GetMessageRaw(context.Background(), draft.ID)
+	raw, err := client.GetMessageRaw(t.Context(), draft.ID)
 	require.NoError(err)
 	require.NotNil(raw)
 
@@ -75,24 +75,24 @@ func TestClientDraftCRUD(t *testing.T) {
 	require := require.New(t)
 	client := newDraftTestClient(t)
 
-	first, err := client.CreateDraft(context.Background(), &gmailapi.DraftCompose{
+	first, err := client.CreateDraft(t.Context(), &gmailapi.DraftCompose{
 		To:      []string{"alice@example.com"},
 		Subject: "first draft",
 		Body:    "first body",
 	})
 	require.NoError(err)
 
-	got, err := client.GetDraft(context.Background(), first.ID)
+	got, err := client.GetDraft(t.Context(), first.ID)
 	require.NoError(err)
 	assert.Equal("first draft", got.Message.Subject)
 	assert.Equal("first body", strings.TrimSpace(got.Message.Body))
 
-	listed, err := client.ListDrafts(context.Background(), "first", 10)
+	listed, err := client.ListDrafts(t.Context(), "first", 10)
 	require.NoError(err)
 	require.Len(listed, 1)
 	assert.Equal(first.ID, listed[0].ID)
 
-	updated, err := client.UpdateDraft(context.Background(), first.ID, &gmailapi.DraftCompose{
+	updated, err := client.UpdateDraft(t.Context(), first.ID, &gmailapi.DraftCompose{
 		To:      []string{"bob@example.com"},
 		Subject: "updated draft",
 		Body:    "updated body",
@@ -101,15 +101,15 @@ func TestClientDraftCRUD(t *testing.T) {
 	assert.NotEqual(first.ID, updated.ID)
 	assert.Equal("updated draft", updated.Message.Subject)
 
-	_, err = client.GetDraft(context.Background(), first.ID)
+	_, err = client.GetDraft(t.Context(), first.ID)
 	require.Error(err)
 
-	listed, err = client.ListDrafts(context.Background(), "", 10)
+	listed, err = client.ListDrafts(t.Context(), "", 10)
 	require.NoError(err)
 	require.Len(listed, 1)
 	assert.Equal(updated.ID, listed[0].ID)
-	require.NoError(client.DeleteDraft(context.Background(), updated.ID))
-	listed, err = client.ListDrafts(context.Background(), "", 10)
+	require.NoError(client.DeleteDraft(t.Context(), updated.ID))
+	listed, err = client.ListDrafts(t.Context(), "", 10)
 	require.NoError(err)
 	assert.Empty(listed)
 }
@@ -129,7 +129,7 @@ func TestClientSendDraftSendsAppendsSentAndDeletesDraft(t *testing.T) {
 		return nil
 	}
 
-	draft, err := client.CreateDraft(context.Background(), &gmailapi.DraftCompose{
+	draft, err := client.CreateDraft(t.Context(), &gmailapi.DraftCompose{
 		To:      []string{"alice@example.com"},
 		Cc:      []string{"bob@example.com"},
 		Bcc:     []string{"carol@example.com"},
@@ -138,7 +138,7 @@ func TestClientSendDraftSendsAppendsSentAndDeletesDraft(t *testing.T) {
 	})
 	require.NoError(err)
 
-	sent, err := client.SendDraft(context.Background(), draft.ID)
+	sent, err := client.SendDraft(t.Context(), draft.ID)
 	require.NoError(err)
 	require.NotNil(sent)
 	assert.Equal(testIMAPUsername, sentFrom)
@@ -146,17 +146,17 @@ func TestClientSendDraftSendsAppendsSentAndDeletesDraft(t *testing.T) {
 	assert.Contains(string(sentRaw), "Subject: send me")
 	assert.Equal([]string{"Sent Items"}, sent.LabelIDs)
 
-	_, err = client.GetDraft(context.Background(), draft.ID)
+	_, err = client.GetDraft(t.Context(), draft.ID)
 	require.Error(err)
 
-	raw, err := client.GetMessageRaw(context.Background(), sent.ID)
+	raw, err := client.GetMessageRaw(t.Context(), sent.ID)
 	require.NoError(err)
 	require.NotNil(raw)
 	msg, err := mail.ReadMessage(bytes.NewReader(raw.Raw))
 	require.NoError(err)
 	assert.Equal("send me", msg.Header.Get("Subject"))
 
-	drafts, err := client.ListDrafts(context.Background(), "", 10)
+	drafts, err := client.ListDrafts(t.Context(), "", 10)
 	require.NoError(err)
 	assert.Empty(drafts)
 }
@@ -173,7 +173,7 @@ func TestClientModifyMessageLabelsFlagSubset(t *testing.T) {
 	_, uid, err := parseCompositeID(id)
 	require.NoError(err)
 	require.NoError(client.ModifyMessageLabels(
-		context.Background(),
+		t.Context(),
 		id,
 		[]string{"STARRED"},
 		[]string{"UNREAD"},
@@ -182,7 +182,7 @@ func TestClientModifyMessageLabelsFlagSubset(t *testing.T) {
 	assert.Contains(flags, goimap.FlagFlagged)
 	assert.Contains(flags, goimap.FlagSeen)
 	require.NoError(client.ModifyMessageLabels(
-		context.Background(),
+		t.Context(),
 		id,
 		[]string{"UNREAD"},
 		[]string{"STARRED"},
@@ -202,18 +202,18 @@ func TestClientModifyMessageLabelsArchive(t *testing.T) {
 		Body:    "body",
 	})
 	require.NoError(client.ModifyMessageLabels(
-		context.Background(),
+		t.Context(),
 		id,
 		nil,
 		[]string{"INBOX"},
 	))
 
-	_, err := client.GetMessageRaw(context.Background(), id)
+	_, err := client.GetMessageRaw(t.Context(), id)
 	require.Error(err)
 
 	archiveIDs := listMailboxMessageIDs(t, client, "Archive")
 	require.Len(archiveIDs, 1)
-	raw, err := client.GetMessageRaw(context.Background(), archiveIDs[0])
+	raw, err := client.GetMessageRaw(t.Context(), archiveIDs[0])
 	require.NoError(err)
 	assert.Contains(string(raw.Raw), "Subject: archive me")
 }
@@ -226,7 +226,7 @@ func TestClientModifyMessageLabelsRejectsArbitraryLabels(t *testing.T) {
 		Body:    "body",
 	})
 
-	err := client.ModifyMessageLabels(context.Background(), id, []string{"Projects"}, nil)
+	err := client.ModifyMessageLabels(t.Context(), id, []string{"Projects"}, nil)
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "unsupported")
 }
@@ -242,7 +242,7 @@ func newDraftTestClient(t *testing.T) *Client {
 	require.NoError(t, user.Create("Sent Items", nil))
 	memServer.AddUser(user)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
 	server := imapserver.New(&imapserver.Options{
@@ -298,7 +298,7 @@ func appendTestMessage(
 	require.NoError(t, err)
 
 	var id string
-	err = client.withConn(context.Background(), func(conn *imapclient.Client) error {
+	err = client.withConn(t.Context(), func(conn *imapclient.Client) error {
 		var err error
 		id, err = client.appendMessageLocked(conn, mailbox, raw, nil)
 		return err
@@ -311,8 +311,8 @@ func listMailboxMessageIDs(t *testing.T, client *Client, mailbox string) []strin
 	t.Helper()
 
 	var ids []string
-	err := client.withConn(context.Background(), func(conn *imapclient.Client) error {
-		if err := client.selectMailbox(mailbox); err != nil {
+	err := client.withConn(t.Context(), func(conn *imapclient.Client) error {
+		if err := client.selectMailbox(t.Context(), mailbox); err != nil {
 			return err
 		}
 		searchData, err := conn.UIDSearch(&goimap.SearchCriteria{}, nil).Wait()
@@ -337,8 +337,8 @@ func fetchMessageFlags(t *testing.T, client *Client, mailbox string, uid goimap.
 	t.Helper()
 
 	var flags []goimap.Flag
-	err := client.withConn(context.Background(), func(conn *imapclient.Client) error {
-		if err := client.selectMailbox(mailbox); err != nil {
+	err := client.withConn(t.Context(), func(conn *imapclient.Client) error {
+		if err := client.selectMailbox(t.Context(), mailbox); err != nil {
 			return err
 		}
 		var uidSet goimap.UIDSet

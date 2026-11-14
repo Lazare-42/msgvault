@@ -1,15 +1,18 @@
 package store_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -91,7 +94,8 @@ func multibyteOversizedBody() string {
 func nullSearchFTSCount(t *testing.T, st interface{ DB() *sql.DB }) int {
 	t.Helper()
 	var n int
-	require.NoError(t, st.DB().QueryRow(
+	require.NoError(t, st.DB().QueryRowContext(
+		t.Context(),
 		"SELECT COUNT(*) FROM messages WHERE search_fts IS NULL").Scan(&n),
 		"count NULL search_fts")
 	return n
@@ -117,7 +121,8 @@ func TestPG_FTSUpsert_OversizedBodyTruncates(t *testing.T) {
 	require.NoError(err, "UpsertFTS with oversized body must succeed (truncated indexing)")
 
 	var isNull bool
-	require.NoError(f.Store.DB().QueryRow(
+	require.NoError(f.Store.DB().QueryRowContext(
+		t.Context(),
 		"SELECT search_fts IS NULL FROM messages WHERE id = $1", msgID).Scan(&isNull),
 		"probe search_fts")
 	assert.False(t, isNull, "search_fts must be non-NULL after truncated upsert")
@@ -142,13 +147,13 @@ func TestPG_BackfillFTS_OversizedBodyDoesNotWedge(t *testing.T) {
 	const total = 5500
 	const oversizedIdx = 2500
 	// Bulk insertion skips UpsertMessage's journal and attribution writes, which BackfillFTS doesn't read.
-	_, err := f.Store.DB().Exec(f.Store.Rebind(`INSERT INTO messages (conversation_id, source_id, source_message_id, message_type, size_estimate)
+	_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`INSERT INTO messages (conversation_id, source_id, source_message_id, message_type, size_estimate)
 		SELECT ?, ?, 'msg-' || g, 'email', 1000 FROM generate_series(0, ?) g`), f.ConvID, f.Source.ID, total-2)
 	require.NoError(err)
 	sentinelID := f.CreateMessage("sentinel")
 
 	var oversizedID int64
-	require.NoError(f.Store.DB().QueryRow(f.Store.Rebind("SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?"), f.Source.ID, fmt.Sprintf("msg-%d", oversizedIdx)).Scan(&oversizedID))
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind("SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?"), f.Source.ID, fmt.Sprintf("msg-%d", oversizedIdx)).Scan(&oversizedID))
 
 	require.NoError(f.Store.UpsertMessageBody(oversizedID,
 		sql.NullString{String: oversizedBody(), Valid: true}, sql.NullString{}),
@@ -204,7 +209,8 @@ func TestPG_FTSUpsert_MultibyteOversizedBody(t *testing.T) {
 		"UpsertFTS with a multibyte oversized body must NOT return a hard error (byte-truncated)")
 
 	var isNull bool
-	require.NoError(f.Store.DB().QueryRow(
+	require.NoError(f.Store.DB().QueryRowContext(
+		t.Context(),
 		"SELECT search_fts IS NULL FROM messages WHERE id = $1", msgID).Scan(&isNull),
 		"probe search_fts")
 	assert.False(t, isNull,
@@ -241,7 +247,8 @@ func TestPG_FTSUpsert_OversizedSubjectAndRecipients(t *testing.T) {
 			"UpsertFTS with a multibyte oversized subject must succeed (subject is now byte-truncated)")
 
 		var isNull bool
-		require.NoError(t, f.Store.DB().QueryRow(
+		require.NoError(t, f.Store.DB().QueryRowContext(
+			t.Context(),
 			"SELECT search_fts IS NULL FROM messages WHERE id = $1", msgID).Scan(&isNull),
 			"probe search_fts")
 		assert.False(t, isNull, "search_fts must be non-NULL after byte-truncated subject upsert")
@@ -255,7 +262,8 @@ func TestPG_FTSUpsert_OversizedSubjectAndRecipients(t *testing.T) {
 			"UpsertFTS with multibyte oversized subject + recipient list must succeed (all fields byte-truncated)")
 
 		var isNull bool
-		require.NoError(t, f.Store.DB().QueryRow(
+		require.NoError(t, f.Store.DB().QueryRowContext(
+			t.Context(),
 			"SELECT search_fts IS NULL FROM messages WHERE id = $1", msgID).Scan(&isNull),
 			"probe search_fts")
 		assert.False(t, isNull, "search_fts must be non-NULL after byte-truncated subject+recipients upsert")
@@ -264,12 +272,8 @@ func TestPG_FTSUpsert_OversizedSubjectAndRecipients(t *testing.T) {
 
 // TestPG_BackfillFTS_MultibyteOversizedBodyDoesNotWedge (finding B1) seeds a
 // batch containing one message whose DB body is a pathological multibyte
-// document (distinct 2-byte tokens, >1MB tsvector pre-cap). The backfill SQL
-// path applies only the LEFT char cap (a UTF-8-safe byte truncation is not
-// cleanly available in SQL), so for adversarial multibyte input the row may
-// still overflow — in which case backfillFTSRowByRow skips it. The pinned
-// property: BackfillFTS COMPLETES WITHOUT ERROR and indexes every OTHER row,
-// regardless of whether the pathological row itself survives the char cap.
+// document (distinct 2-byte tokens, >1MB tsvector pre-cap). The backfill
+// applies the same byte bound as live writes and continues indexing later rows.
 func TestPG_BackfillFTS_MultibyteOversizedBodyDoesNotWedge(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -296,20 +300,20 @@ func TestPG_BackfillFTS_MultibyteOversizedBodyDoesNotWedge(t *testing.T) {
 	require.NoError(f.Store.UpsertMessageBody(ids[oversizedIdx],
 		sql.NullString{String: multibyteOversizedBody(), Valid: true}, sql.NullString{}),
 		"attach multibyte oversized body")
+	_, err := f.Store.DB().ExecContext(t.Context(), `UPDATE messages SET subject = 'repairsubject' WHERE id = $1`, ids[oversizedIdx])
+	require.NoError(err)
 
 	n, err := f.Store.BackfillFTS(nil)
 	require.NoError(err,
 		"BackfillFTS must COMPLETE without error despite a pathological multibyte body")
 
-	// Every row EXCEPT possibly the pathological one is indexed; at most one row
-	// (the oversized multibyte body, if it still overflows the char cap) is
-	// skipped. The invariant is: BackfillFTS never errors and never wedges later
-	// rows.
-	nulls := nullSearchFTSCount(t, f.Store)
-	assert.LessOrEqual(nulls, 1,
-		"at most the one pathological row may be left NULL; got %d", nulls)
-	assert.GreaterOrEqual(n, int64(total-1),
-		"every row except (at most) the pathological one must be indexed")
+	assert.Zero(nullSearchFTSCount(t, f.Store))
+	assert.Equal(int64(total), n)
+	matches, count, err := f.Store.SearchMessages("repairsubject", 0, 10)
+	require.NoError(err)
+	require.EqualValues(1, count)
+	require.Len(matches, 1)
+	assert.Equal(ids[oversizedIdx], matches[0].ID)
 
 	// Every non-oversized token — including the ones AFTER the pathological row
 	// — must be searchable, proving the bad row never wedged later rows.
@@ -320,5 +324,120 @@ func TestPG_BackfillFTS_MultibyteOversizedBodyDoesNotWedge(t *testing.T) {
 		_, hits, searchErr := f.Store.SearchMessages(tok, 0, 10)
 		require.NoError(searchErr, "SearchMessages %q", tok)
 		assert.Equal(int64(1), hits, "token %q must be searchable after backfill", tok)
+	}
+}
+
+// denseShortTokenBody builds about 700 KB of distinct four-character tokens:
+// three ASCII letters and one two-byte Cyrillic letter. A distinct lexeme
+// costs more tsvector bytes than it takes as text, so this body overflows
+// PostgreSQL's limit even inside the byte and character caps.
+func denseShortTokenBody() string {
+	cyrillic := []rune("абвгдежзийклмнопрстуфхцчшщъыьэюя")
+	var b strings.Builder
+	for i := 0; b.Len() < 700_000; i++ {
+		n := i
+		for range 3 {
+			b.WriteByte(byte('a' + n%26))
+			n /= 26
+		}
+		b.WriteRune(cyrillic[n%len(cyrillic)])
+		b.WriteByte(' ')
+	}
+	return b.String()
+}
+
+// TestPG_PersistMessage_OverflowingIndexKeepsMessage verifies that a message
+// whose search entry overflows the tsvector limit is still archived, marked
+// unsearchable, and that a retry of the same write succeeds too.
+func TestPG_PersistMessage_OverflowingIndexKeepsMessage(t *testing.T) {
+	require := require.New(t)
+	skipUnlessPostgres(t)
+	f := storetest.New(t)
+	require.True(f.Store.FTS5Available(), "FTS must be available on PG")
+
+	body := denseShortTokenBody()
+	persist := func() int64 {
+		t.Helper()
+		id, err := f.Store.PersistMessageContext(t.Context(), &store.MessagePersistData{
+			Message: &store.Message{
+				SourceID: f.Source.ID, ConversationID: f.ConvID,
+				SourceMessageID: "dense-body", MessageType: store.MessageTypeEmail,
+			},
+			BodyText: sql.NullString{String: body, Valid: true},
+			FTS:      &store.FTSDoc{Subject: "dense", Body: body},
+		})
+		require.NoError(err, "an index overflow must not fail the message write")
+		return id
+	}
+	messageID := persist()
+	require.Equal(messageID, persist(), "a retry rewrites the same message")
+
+	var unsearchable bool
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(),
+		"SELECT search_fts = ''::tsvector FROM messages WHERE id = $1", messageID).Scan(&unsearchable))
+	assert.True(t, unsearchable, "the overflowing message is marked unsearchable")
+}
+
+// The standalone entries return real vector overflow without marking a saved
+// message terminal. Stored-message indexing can fail during comparison itself.
+func TestPG_DirectFTSOverflowReturnsError(t *testing.T) {
+	skipUnlessPostgres(t)
+	for _, tc := range []struct {
+		name         string
+		index        func(context.Context, *store.Store, store.FTSDoc) error
+		errorContext string
+	}{
+		{
+			name: "supplied document",
+			index: func(ctx context.Context, st *store.Store, doc store.FTSDoc) error {
+				return st.UpsertFTSContext(ctx, doc.MessageID, doc.Subject, doc.Body, doc.FromAddr, doc.ToAddrs, doc.CcAddrs)
+			},
+		},
+		{
+			name: "stored document comparison",
+			index: func(ctx context.Context, st *store.Store, doc store.FTSDoc) error {
+				return st.IndexStoredMessageContext(ctx, doc.MessageID)
+			},
+			errorContext: "compare stored search entry",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert, require := assert.New(t), require.New(t)
+			f := storetest.New(t)
+			body := denseShortTokenBody()
+			raw := []byte("Content-Type: text/plain; charset=UTF-8\r\n\r\n" + body)
+			id, err := f.Store.PersistMessageContext(t.Context(), &store.MessagePersistData{
+				Message: &store.Message{
+					SourceID: f.Source.ID, ConversationID: f.ConvID,
+					SourceMessageID: "saved-before-indexing", MessageType: store.MessageTypeEmail,
+				},
+				BodyText: sql.NullString{String: body, Valid: true}, RawMIME: raw,
+			})
+			require.NoError(err)
+			err = tc.index(t.Context(), f.Store, store.FTSDoc{MessageID: id, Body: body})
+			var overflow *pgconn.PgError
+			require.ErrorAs(err, &overflow)
+			assert.Equal("54000", overflow.Code)
+			if tc.errorContext != "" {
+				require.ErrorContains(err, tc.errorContext)
+			}
+			var missing bool
+			require.NoError(f.Store.DB().QueryRowContext(t.Context(),
+				`SELECT search_fts IS NULL AND search_fts_fields IS NULL FROM messages WHERE id = $1`, id).Scan(&missing))
+			assert.True(missing, "a direct failure must not record the terminal empty vector")
+			gotRaw, err := f.Store.GetMessageRaw(id)
+			require.NoError(err)
+			assert.Equal(raw, gotRaw, "the earlier message commit survives")
+			needs, err := f.Store.NeedsFTSBackfillContext(t.Context())
+			require.NoError(err)
+			assert.True(needs)
+
+			require.NoError(f.Store.UpsertMessageBodyContext(t.Context(), id,
+				sql.NullString{String: "orchard", Valid: true}, sql.NullString{}))
+			require.NoError(f.Store.IndexStoredMessageContext(t.Context(), id))
+			_, found, err := f.Store.SearchMessages("orchard", 0, 10)
+			require.NoError(err)
+			assert.Equal(int64(1), found, "saved data can be indexed after reducing the document")
+		})
 	}
 }

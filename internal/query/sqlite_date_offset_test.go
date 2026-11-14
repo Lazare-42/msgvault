@@ -1,7 +1,6 @@
 package query_test
 
 import (
-	"context"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +13,7 @@ import (
 )
 
 func TestSQLiteQueryEngineDateBoundsCompareMixedOffsetsAsInstants(t *testing.T) {
+	t.Parallel()
 	req := require.New(t)
 	f := storetest.New(t)
 	if f.Store.IsPostgreSQL() {
@@ -89,7 +89,7 @@ func TestSQLiteQueryEngineDateBoundsCompareMixedOffsetsAsInstants(t *testing.T) 
 			require.NoError(err, "ListMessages")
 			assert.ElementsMatch(tc.want, ids(listed), "ListMessages")
 
-			searched, err := eng.SearchFast(context.Background(), &search.Query{
+			searched, err := eng.SearchFast(t.Context(), &search.Query{
 				AfterDate:  afterBound,
 				BeforeDate: beforeBound,
 			}, query.MessageFilter{}, 50, 0)
@@ -108,6 +108,7 @@ func TestSQLiteQueryEngineDateBoundsCompareMixedOffsetsAsInstants(t *testing.T) 
 }
 
 func TestSQLiteInstantDatePredicateUsesExpressionIndex(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := storetest.New(t)

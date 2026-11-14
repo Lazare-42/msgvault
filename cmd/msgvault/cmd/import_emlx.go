@@ -163,7 +163,7 @@ Examples:
 			}
 		}()
 
-		st, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+		st, cleanup, err := openWritableStoreAndInitForIngestInvocation(ctx, state)
 		if err != nil {
 			return err
 		}
@@ -184,7 +184,11 @@ Examples:
 			importErr = importAutoAccounts(ctx, cmd, st, mailDir, attachmentsDir)
 		}
 
-		return errors.Join(importErr, rebuildCacheAfterWrite(dbPath, state))
+		cacheErr := rebuildCacheAfterWrite(ctx, dbPath, state)
+		if importErr == nil && cacheErr != nil {
+			return fmt.Errorf("import completed successfully; %w", cacheErr)
+		}
+		return errors.Join(importErr, cacheErr)
 	},
 }
 
@@ -210,6 +214,7 @@ func importSingleAccount(
 			MaxMessageBytes:    importEmlxMaxMessageBytes,
 			AttachmentsDir:     attachmentsDir,
 			RemoteImages:       configuredRemoteImageFetcher(cfg),
+			RelayedSenders:     cfg.RelayedSenders,
 			Logger:             logger,
 		},
 	)
@@ -217,11 +222,16 @@ func importSingleAccount(
 		return err
 	}
 
+	// The import itself succeeded, so a cancel that arrives now must not
+	// skip either post-import step: identity confirmation and the migration
+	// both run on an uncancelled context.
+	postImportCtx := context.WithoutCancel(ctx)
+
 	// Auto-default-identity must run BEFORE the legacy migration
 	// retry — see comment in account_identity.go.
-	if ctx.Err() == nil && !summary.HardErrors && !noDefaultIdentityImportEmlx {
+	if !summary.HardErrors && !noDefaultIdentityImportEmlx {
 		if summary.SourceID != 0 {
-			confirmDefaultIdentity(cmd.OutOrStdout(), st, summary.SourceID, identifier, identifier, "account-identifier", state.logger)
+			confirmDefaultIdentity(postImportCtx, cmd.OutOrStdout(), st, summary.SourceID, identifier, identifier, "account-identifier", state.logger)
 		} else {
 			logger.Warn("auto-default-identity: missing source id", "identifier", identifier)
 		}
@@ -237,7 +247,7 @@ func importSingleAccount(
 		// next invocation retries and prints the summary then. UX
 		// polish tracked separately in
 		// private/drafts/2026-05-02-issue-import-migration-error-ux.md.
-		if err := runPostSourceCreateMigrationsForInvocation(st, state); err != nil {
+		if err := runPostSourceCreateMigrationsForInvocation(postImportCtx, st, state); err != nil {
 			return fmt.Errorf("post-source-create migrations: %w", err)
 		}
 	}
@@ -266,7 +276,7 @@ func importAutoAccounts(
 
 	out := cmd.OutOrStdout()
 
-	accounts, err := applemail.DiscoverV10Accounts(mailDir, accountsDBPath, logger)
+	accounts, err := applemail.DiscoverV10Accounts(ctx, mailDir, accountsDBPath, logger)
 	if err != nil {
 		return fmt.Errorf("discover accounts: %w", err)
 	}
@@ -352,6 +362,7 @@ func importAutoAccounts(
 				MaxMessageBytes:    importEmlxMaxMessageBytes,
 				AttachmentsDir:     attachmentsDir,
 				RemoteImages:       configuredRemoteImageFetcher(cfg),
+				RelayedSenders:     cfg.RelayedSenders,
 				Logger:             logger,
 			},
 		)
@@ -365,15 +376,19 @@ func importAutoAccounts(
 			continue
 		}
 
+		// See importSingleAccount: after a successful import, a cancel must
+		// skip neither identity confirmation nor the migration.
+		postImportCtx := context.WithoutCancel(ctx)
+
 		// Auto-default-identity must run BEFORE the legacy migration
 		// retry — see comment in account_identity.go.
-		if ctx.Err() == nil && !summary.HardErrors && !noDefaultIdentityImportEmlx {
+		if !summary.HardErrors && !noDefaultIdentityImportEmlx {
 			accountDisplay := account.Identifier()
 			if account.Email != "" {
 				accountDisplay = account.Email
 			}
 			if summary.SourceID != 0 {
-				confirmDefaultIdentity(cmd.OutOrStdout(), st, summary.SourceID, accountDisplay, identifier, "account-identifier", state.logger)
+				confirmDefaultIdentity(postImportCtx, cmd.OutOrStdout(), st, summary.SourceID, accountDisplay, identifier, "account-identifier", state.logger)
 			} else {
 				logger.Warn("auto-default-identity: missing source id", "identifier", identifier)
 			}
@@ -385,7 +400,7 @@ func importAutoAccounts(
 			// above. UX polish tracked in
 			// private/drafts/2026-05-02-issue-import-migration-error-ux.md
 			// for a follow-up PR.
-			if err := runPostSourceCreateMigrationsForInvocation(st, state); err != nil {
+			if err := runPostSourceCreateMigrationsForInvocation(postImportCtx, st, state); err != nil {
 				importErrors = append(importErrors, fmt.Errorf("%s: post-source-create migrations: %w", identifier, err))
 				continue
 			}

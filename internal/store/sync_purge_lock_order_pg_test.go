@@ -15,7 +15,7 @@ func TestChannelPurgeDoesNotDeadlockWithSyncPhoneParticipant(t *testing.T) {
 		write func(context.Context, *Store) error
 	}{
 		{"messaging", func(_ context.Context, st *Store) error {
-			_, err := st.EnsureParticipantByPhone("+12025550123", "Example participant", "sms")
+			_, err := st.EnsureParticipantByPhone(t.Context(), "+12025550123", "Example participant", "sms")
 			return err
 		}},
 		{"meeting", func(ctx context.Context, st *Store) error {
@@ -26,7 +26,8 @@ func TestChannelPurgeDoesNotDeadlockWithSyncPhoneParticipant(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			assertions := assert.New(t)
 			requirements := require.New(t)
-			st := newPGStoreInternal(t, skipUnlessPostgresInternal(t))
+			skipUnlessPostgresInternal(t)
+			st := newPGStoreInternal(t)
 			st.DB().SetMaxOpenConns(12)
 			ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 			defer cancel()
@@ -34,7 +35,7 @@ func TestChannelPurgeDoesNotDeadlockWithSyncPhoneParticipant(t *testing.T) {
 			requirements.NoError(err)
 			purging, err := st.GetOrCreateSource("slack", "purging-workspace")
 			requirements.NoError(err)
-			removed, err := st.EnsureConversation(purging.ID, "remove", "Remove channel")
+			removed, err := st.EnsureConversation(t.Context(), purging.ID, "remove", "Remove channel")
 			requirements.NoError(err)
 			run, err := st.StartSyncContext(ctx, writing.ID, "full")
 			requirements.NoError(err)

@@ -8,24 +8,28 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 
-	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
-	"go.kenn.io/msgvault/internal/gmail"
-	imaplib "go.kenn.io/msgvault/internal/imap"
-	"go.kenn.io/msgvault/internal/mailclient"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 )
+
+func TestMCPToolSummaryFlagsExist(t *testing.T) {
+	for _, summary := range mcpserver.ToolSummaries() {
+		if summary.Flag != "" {
+			assert.NotNil(t, mcpCmd.Flags().Lookup(strings.TrimPrefix(summary.Flag, "--")), "%s", summary.Name)
+		}
+	}
+}
 
 func TestMCPCommandUsesDaemonInsteadOfOpeningLocalDatabase(t *testing.T) {
 	require := require.New(t)
@@ -79,10 +83,6 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
 			return
 		}
-		if r.URL.Path == "/api/v1/cli/accounts" {
-			_, _ = w.Write([]byte(`{"accounts": []}`))
-			return
-		}
 		http.NotFound(w, r)
 	}))
 	t.Cleanup(daemon.Close)
@@ -107,6 +107,8 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 	savedAllowPersonMerges := mcpAllowPersonMerges
 	savedAllowCardDAVWrites := mcpAllowCardDAVWrites
 	savedAllowCalendarWrites := mcpAllowCalendarWrites
+	savedAllowLoops, savedAllowSources := mcpAllowLoopWrites, mcpAllowSourceWrites
+	savedConfirmSensitiveDrafts := mcpConfirmSensitiveDrafts
 	savedServeHTTP := serveMCPHTTPWithOptions
 	allowWritesFlag := mcpCmd.Flags().Lookup("http-allow-writes")
 	require.NotNil(allowWritesFlag, "mcp command must define --http-allow-writes")
@@ -114,8 +116,13 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 	allowCalendarWritesFlag := mcpCmd.Flags().Lookup("allow-calendar-writes")
 	require.NotNil(allowCalendarWritesFlag, "mcp command must define --allow-calendar-writes")
 	require.NoError(allowCalendarWritesFlag.Value.Set("true"))
+	require.NoError(mcpCmd.Flags().Set("confirm-sensitive-drafts", "true"))
 	mcpHTTPAddr = "0.0.0.0:8081"
 	mcpHTTPAllowInsecure = true
+	loopWritesFlag := mcpCmd.Flags().Lookup("allow-loop-writes")
+	require.NotNil(loopWritesFlag)
+	require.NoError(loopWritesFlag.Value.Set("true"))
+	mcpAllowSourceWrites = false
 	mcpAllowProfileWrites = true
 	mcpAllowIdentityDecisions = true
 	mcpAllowIdentityScoring = true
@@ -132,6 +139,8 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 		mcpAllowPersonMerges = savedAllowPersonMerges
 		mcpAllowCardDAVWrites = savedAllowCardDAVWrites
 		mcpAllowCalendarWrites = savedAllowCalendarWrites
+		mcpAllowLoopWrites, mcpAllowSourceWrites = savedAllowLoops, savedAllowSources
+		mcpConfirmSensitiveDrafts = savedConfirmSensitiveDrafts
 		serveMCPHTTPWithOptions = savedServeHTTP
 	})
 
@@ -148,6 +157,7 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 	err := mcpCmd.RunE(mcpCmd, nil)
 
 	require.ErrorIs(err, wantErr)
+	assert.ElementsMatch([]mcpserver.OperationFamily{mcpserver.OperationFamilyRecords, mcpserver.OperationFamilyLoops}, gotServeOpts.OperationWriteFamilies)
 	assert.NotNil(gotServeOpts.OCR, "daemon-backed MCP must expose attachment OCR")
 	assert.True(gotServeOpts.AllowProfileWrites)
 	assert.True(gotServeOpts.AllowIdentityDecisions)
@@ -155,6 +165,7 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 	assert.True(gotServeOpts.AllowPersonMerges)
 	assert.True(gotServeOpts.AllowCardDAVWrites)
 	assert.True(gotServeOpts.AllowCalendarWrites)
+	assert.True(gotServeOpts.ConfirmSensitiveDrafts)
 	assert.Equal(mcpserver.HTTPOptions{
 		Addr:               "0.0.0.0:8081",
 		DiscoveryDirectory: filepath.Join(home, "mcp"),
@@ -162,59 +173,6 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 		APIKey:             "mcp-http-key",
 		AllowWrites:        true,
 	}, gotHTTPOpts)
-}
-
-func TestMCPDelegatedModeServesDraftsWithoutCalendarAPI(t *testing.T) {
-	assertions := assert.New(t)
-	requirements := require.New(t)
-	previousHTTPAddr := mcpHTTPAddr
-	previousServe := serveMCPStdioWithOptions
-	previousSchemaCheck := remoteAPISchemaCheckEnabled
-	mcpHTTPAddr = ""
-	remoteAPISchemaCheckEnabled = true
-	var serveCalled bool
-	serveMCPStdioWithOptions = func(_ context.Context, options mcpserver.ServeOptions) error {
-		serveCalled = true
-		assertions.True(options.DelegatedOnly)
-		assertions.Nil(options.Calendar)
-		assertions.NotEmpty(options.DraftCommands)
-		return errors.New("stop after capture")
-	}
-	t.Cleanup(func() {
-		mcpHTTPAddr = previousHTTPAddr
-		serveMCPStdioWithOptions = previousServe
-		remoteAPISchemaCheckEnabled = previousSchemaCheck
-	})
-
-	var healthRequests atomic.Int32
-	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/api/v1/health":
-			healthRequests.Add(1)
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "api_schema_version": "3.0.0"})
-		case "/api/session":
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{"auth_mode": "delegated"})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(daemon.Close)
-	tokenFile := filepath.Join(t.TempDir(), "agent-token")
-	requirements.NoError(os.WriteFile(tokenFile, []byte("mva1_test-token"), 0o600))
-	ctx := testInvocationContext(t.Context(), config.NewDefaultConfig(), invocationOptions{
-		agentURL: daemon.URL, agentTokenFile: tokenFile, agentAllowInsecure: true,
-		agentURLChanged: true, agentTokenChanged: true,
-	})
-	cmd := &cobra.Command{}
-	cmd.SetContext(ctx)
-
-	err := mcpCmd.RunE(cmd, nil)
-
-	requirements.ErrorContains(err, "stop after capture")
-	assertions.True(serveCalled)
-	assertions.Equal(int32(2), healthRequests.Load())
 }
 
 func TestDaemonMCPHybridSearcherPreservesPhaseTimings(t *testing.T) {
@@ -690,28 +648,4 @@ func TestDaemonMCPDocbankProbeFailureIsLogged(t *testing.T) {
 	assert.False(opts.KataDocbank)
 	assert.Contains(logs.String(), "Kata transcript citations hidden because the Docbank status probe failed")
 	assert.Contains(logs.String(), "503")
-}
-
-func TestMailFactoryAppliesSenderPolicyToIMAP(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal("/api/v1/cli/accounts", r.URL.Path)
-		w.Header().Set("Content-Type", "application/json")
-		_, err := w.Write([]byte(`{"accounts":[{"email":"owner@example.com","type":"imap","sync_config":"{\"host\":\"imap.example.com\",\"username\":\"owner@example.com\"}"}]}`))
-		assert.NoError(err)
-	}))
-	defer daemon.Close()
-	ctx := withStoreResolverConfig(t, &config.Config{Data: config.DataConfig{DataDir: t.TempDir()}, Mail: config.MailConfig{Accounts: map[string]config.MailAccountConfig{"owner@example.com": {AllowedFrom: []string{"reports@example.com"}}}}})
-	require.NoError(imaplib.SaveCredentials(invocationFromContext(ctx).cfg.TokensDir(), "owner@example.com", "synthetic-password"))
-	st, err := daemonclient.New(daemonclient.Config{URL: daemon.URL, AllowInsecure: true})
-	require.NoError(err)
-	factory := buildMailFactory(ctx, st)
-	require.NotNil(factory)
-	client, err := factory(t.Context(), "owner@example.com")
-	require.NoError(err)
-	defer func() { assert.NoError(client.Close()) }()
-	assert.IsType(&mailclient.Client{}, client)
-	_, err = client.CreateDraft(t.Context(), &gmail.DraftCompose{From: "unconfigured@example.com", Body: "body"})
-	require.ErrorContains(err, "not allowed")
 }

@@ -1,5 +1,6 @@
 <script lang="ts">
   import { Button } from '@kenn-io/kit-ui';
+  import BuildIndexAction from './BuildIndexAction.svelte';
 
   import type { ExploreSearchMode } from '../../explore/models';
   import type { SearchCoverageAction, SearchCoverageValue } from '../../search/modes';
@@ -12,7 +13,6 @@
 
   let { requestedMode = 'full_text', coverage, onaction = undefined }: Props = $props();
 
-  let confirmingBuild = $state(false);
 
   const count = $derived(coverage.eligible_count.toLocaleString());
   const percentage = $derived(Math.round(coverage.percentage).toLocaleString());
@@ -21,48 +21,25 @@
     switch (coverage.status) {
       case 'disabled': return 'Semantic search is disabled';
       case 'initializing': return 'Semantic index is initializing';
-      case 'stale': return 'Semantic index is stale';
+      case 'stale': return 'Semantic search is unavailable; check the index';
       case 'unavailable': return 'Semantic index is unavailable';
       case 'incomplete':
       case 'ready': return `Semantic index: ${percentage}% of ${count} items`;
     }
   });
-
-  function requestAction(action: SearchCoverageAction): void {
-    if (action === 'build_index') {
-      confirmingBuild = true;
-      return;
-    }
-    onaction?.(action);
-  }
-
-  function cancelBuild(): void {
-    confirmingBuild = false;
-  }
-
-  function confirmBuild(): void {
-    confirmingBuild = false;
-    onaction?.('build_index');
-  }
 </script>
 
 <div class="coverage" role="status" aria-live="polite">
   <span>{summary}.</span>
   {#if coverage.detail}<span>{coverage.detail}</span>{/if}
   {#if requestedMode === 'semantic' && coverage.status === 'incomplete'}
-    <span>Unembedded items cannot appear in Semantic results.</span>
+    <span>Items not yet prepared for semantic search won't appear in results.</span>
   {/if}
   {#if actions.includes('retry')}
-    <Button label="Retry" tone="info" surface="outline" onclick={() => requestAction('retry')} />
+    <Button label="Retry" tone="info" surface="outline" onclick={() => onaction?.('retry')} />
   {/if}
   {#if actions.includes('build_index')}
-    {#if confirmingBuild}
-      <span>Start a full rebuild of the semantic index?</span>
-      <Button label="Cancel" tone="neutral" surface="outline" onclick={cancelBuild} />
-      <Button label="Confirm full rebuild" tone="info" surface="solid" onclick={confirmBuild} />
-    {:else}
-      <Button label="Build index" tone="info" surface="outline" onclick={() => requestAction('build_index')} />
-    {/if}
+    <BuildIndexAction onconfirm={() => onaction?.('build_index')} />
   {/if}
 </div>
 

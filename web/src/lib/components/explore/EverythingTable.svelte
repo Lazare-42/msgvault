@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { Button, EmptyState, Tooltip, virtualSlice } from '@kenn-io/kit-ui';
+  import { Button, EmptyState, MEDIA, Tooltip, virtualSlice } from '@kenn-io/kit-ui';
   import { onDestroy, onMount, tick, untrack } from 'svelte';
+  import { MediaQuery } from 'svelte/reactivity';
 
   import type {
     EntryRow,
@@ -11,7 +12,7 @@
   import { EXPLORE_COLUMNS } from '../../explore/labels';
   import { DEFAULT_EXPLORE_COLUMNS, isEmailMessageType } from '../../explore/models';
   import type { ExploreSelectionState } from '../../explore/state.svelte';
-  import { rebaseVirtualScroll, RowGeometry, tableViewportHeight } from '../../theme/preferences.svelte';
+  import { rebaseVirtualScroll, RowGeometry, scrollPositionAnchor, tableViewportHeight } from '../../theme/preferences.svelte';
   import { formatBytes, formatShortDate as formatTime } from '../../util/format';
   import SelectionCheckbox from '../common/SelectionCheckbox.svelte';
   import IdentityBadge from './IdentityBadge.svelte';
@@ -19,7 +20,7 @@
 
   interface Props {
     rows: EntryRow[];
-    selection: ExploreSelectionState;
+    selection?: ExploreSelectionState;
     columns?: ExploreColumn[];
     columnWidths?: Partial<Record<ExploreColumn, number>>;
     loading?: boolean;
@@ -41,6 +42,7 @@
     onActiveKey?: (key: string) => void;
     onVisibleRows?: (rowKeys: string[]) => void;
     onRetry?: () => void;
+    onAddSource?: () => void;
   }
 
   let {
@@ -66,9 +68,11 @@
     onLoadThroughEnd = undefined,
     onActiveKey = undefined,
     onVisibleRows = undefined,
-    onRetry = undefined
+    onRetry = undefined,
+    onAddSource = undefined
   }: Props = $props();
 
+  const compact = new MediaQuery(MEDIA.compact);
   const geometry = new RowGeometry();
   const rowHeight = $derived(geometry.height);
   const OVERSCAN = 6;
@@ -98,9 +102,7 @@
     scrollIntent += 1;
     const preservedKey = activeKey;
     const focusedIndex = activeKey ? rows.findIndex((row) => row.key === activeKey) : -1;
-    const rebased = focusedIndex >= 0
-      ? focusedIndex * nextHeight
-      : rebaseVirtualScroll(scrollTop, previousHeight, nextHeight);
+    const rebased = rebaseVirtualScroll(scrollTop, previousHeight, nextHeight, focusedIndex, untrack(() => viewport));
     const expectedScrollHeight = rows.length * nextHeight;
     requestAnimationFrame(() => applyDensityRebase(
       element, nextHeight, expectedScrollHeight, rebased, preservedKey
@@ -126,7 +128,7 @@
     const index = rows.findIndex((row) => row.key === scrollAnchor.key);
     if (index < 0) return;
     const element = gridElement;
-    const target = index * height + scrollAnchor.offset;
+    const target = index * height + Math.min(scrollAnchor.offset, height - 1);
     const intent = scrollIntent;
     restoredAnchor = signature;
     afterVirtualLayout(element, rows.length * height, () => {
@@ -185,15 +187,15 @@
   const activeRow = $derived(activeIndex >= 0 ? rows[activeIndex] : undefined);
   const orderedKeys = $derived(rows.map((row) => row.key));
   const allLoadedSelected = $derived(
-    orderedKeys.length > 0 && orderedKeys.every((key) => selection.isSelected(key))
+    orderedKeys.length > 0 && orderedKeys.every((key) => selection?.isSelected(key))
   );
   const someLoadedSelected = $derived(
-    orderedKeys.some((key) => selection.isSelected(key))
+    orderedKeys.some((key) => selection?.isSelected(key))
   );
-  const selectionMode = $derived(selection.mode === 'all_matching' || selection.count > 0);
+  const selectionMode = $derived(selection?.mode === 'all_matching' || (selection?.count ?? 0) > 0);
   const template = $derived(
     [
-      '32px',
+      ...(selection ? ['32px'] : []),
       ...visibleColumns.map((column) => {
         const configured = columnWidths[column];
         if (configured !== undefined) return `${configured}px`;
@@ -275,6 +277,7 @@
       suppressedScrollTop = rebased;
       element.scrollTop = rebased;
       scrollTop = element.scrollTop;
+      if (!restoring) persistAnchor(height);
       suppressedScrollTop = element.scrollTop;
       if (preservedKey && rows.some((row) => row.key === preservedKey)) {
         activeKey = preservedKey;
@@ -349,16 +352,16 @@
     }
     else if (event.key === 'PageDown') await moveTo(activeIndex + Math.max(1, Math.floor(viewport / height)));
     else if (event.key === 'PageUp') await moveTo(activeIndex - Math.max(1, Math.floor(viewport / height)));
-    else if (event.key === ' ' && activeRow) {
+    else if (event.key === ' ' && activeRow && selection) {
       selection.toggle(activeRow.key, activeIndex, rows.map((row) => row.key), event.shiftKey);
-    } else if (event.key.toLowerCase() === 'a') {
+    } else if (event.key.toLowerCase() === 'a' && selection) {
       const firstVisible = Math.max(0, Math.ceil(scrollTop / height));
       const lastVisible = Math.min(
         rows.length - 1,
         Math.ceil((scrollTop + viewport) / height) - 1
       );
       selection.selectVisible(rows.slice(firstVisible, lastVisible + 1).map((row) => row.key));
-    } else if (event.key === 'x') {
+    } else if (event.key === 'x' && selection) {
       selection.clear();
     } else if (event.key === 'Enter' && activeRow) {
       onOpen?.(activeRow);
@@ -376,37 +379,42 @@
       suppressedScrollTop = undefined;
       if (isProgrammaticRestoration) return;
     }
-    const first = Math.min(rows.length - 1, Math.max(0, Math.floor(scrollTop / height)));
-    const row = rows[first];
+    const { index } = scrollPositionAnchor(scrollTop, height, rows.length);
+    const row = rows[index];
     if (row && !restoring) {
       const lastVisible = Math.min(
         rows.length - 1,
         Math.ceil((scrollTop + viewport) / height) - 1
       );
-      if (activeIndex < first || activeIndex > lastVisible) {
+      if (activeIndex < index || activeIndex > lastVisible) {
         activeKey = row.key;
         onActiveKey?.(row.key);
       }
-      onScrollAnchor?.(row.key, scrollTop - first * height);
+      persistAnchor(height);
     }
     if (!restoring && hasMore && !loadingMore && slice.end >= rows.length - OVERSCAN) void onLoadMore?.();
   }
 
+  function persistAnchor(height: number): void {
+    const { index, offset } = scrollPositionAnchor(scrollTop, height, rows.length);
+    const row = rows[index];
+    if (row) onScrollAnchor?.(row.key, offset);
+  }
+
   function toggleLoadedSelection(): void {
-    if (allLoadedSelected) selection.clear();
-    else selection.selectVisible(orderedKeys);
+    if (allLoadedSelected) selection?.clear();
+    else selection?.selectVisible(orderedKeys);
   }
 </script>
 
-<section class="everything-table" aria-label="Everything table">
+<section class="everything-table" aria-label="Messages table">
   <div
     class="table-grid"
     bind:this={gridElement}
     role="grid"
-    data-scroll
-    aria-label="Everything results"
+    aria-label="Messages results"
     aria-rowcount={accessibilityRowCount}
-    aria-colcount={visibleColumns.length + 1}
+    aria-colcount={visibleColumns.length + (selection ? 1 : 0)}
     aria-busy={loading || loadingMore}
     aria-activedescendant={activeRow ? rowId(activeRow) : undefined}
     class:selection-mode={selectionMode}
@@ -414,8 +422,8 @@
     onkeydown={handleKeydown}
     onscroll={handleScroll}
   >
-    <div class="table-header" bind:this={headerElement} role="row" style:grid-template-columns={template}>
-      <span role="columnheader" class="selection-header">
+    <div class="table-header" bind:this={headerElement} role="row" style:--row-template={template}>
+      {#if selection}<span role="columnheader" class="selection-header">
         <SelectionCheckbox
           checked={allLoadedSelected}
           mixed={!allLoadedSelected && someLoadedSelected}
@@ -423,11 +431,11 @@
           inGrid
           onToggle={toggleLoadedSelection}
         />
-      </span>
+      </span>{/if}
       {#each visibleColumns as column (column)}
         <span
           role="columnheader"
-          class={`header-cell header-cell--${column}`}
+          class={['header-cell', `header-cell--${column}`, compact.current && 'kit-sr-only']}
           aria-label={column === 'attachments' ? 'Attachments' : undefined}
         >
           {column === 'attachments' ? '⌕' : EXPLORE_COLUMNS.find((entry) => entry.id === column)?.label}
@@ -470,9 +478,9 @@
               class="skeleton-row"
               data-testid="everything-skeleton"
               role="row"
-              style:grid-template-columns={template}
+              style:--row-template={template}
             >
-              <span class="skeleton-cell selection-cell" role="gridcell"><i></i></span>
+              {#if selection}<span class="skeleton-cell selection-cell" role="gridcell"><i></i></span>{/if}
               {#each visibleColumns as column (column)}
                 <span class="skeleton-cell" role="gridcell"><i></i></span>
               {/each}
@@ -481,7 +489,13 @@
         </div>
       {:else if rows.length === 0}
         <div role="row"><div class="empty" role="gridcell" aria-colspan={visibleColumns.length + 1}>
-          <EmptyState title="No items match this view" description="Adjust the search or clear filters to widen the view." />
+          {#if onAddSource}
+            <EmptyState title="No mail yet" description="Add an account or import an export to start your archive.">
+              <Button size="sm" tone="info" surface="solid" label="Add source…" onclick={onAddSource} />
+            </EmptyState>
+          {:else}
+            <EmptyState title="No items match this view" description="Adjust the search or clear filters to widen the view." />
+          {/if}
         </div></div>
       {:else if !slice || rowHeight === undefined}
         <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length + 1}><p class="empty" role="status">Preparing table layout…</p></div></div>
@@ -495,15 +509,15 @@
               <div
                 class="data-row"
                 class:data-row--active={index === activeIndex}
-                class:data-row--selected={selection.isSelected(row.key)}
+                class:data-row--selected={selection?.isSelected(row.key)}
                 class:data-row--inspected={inspectedKey === row.key}
                 id={rowId(row)}
                 data-row-key={row.key}
                 role="row"
                 aria-rowindex={index + 2}
-                aria-selected={selection.isSelected(row.key)}
+                aria-selected={selection?.isSelected(row.key)}
                 aria-current={inspectedKey === row.key ? 'true' : undefined}
-                style:grid-template-columns={template}
+                style:--row-template={template}
                 onpointerdown={() => {
                   activeKey = row.key;
                   onActiveKey?.(row.key);
@@ -511,7 +525,7 @@
                 }}
                 onclick={() => onOpen?.(row)}
               >
-                <span class="selection-cell" role="gridcell">
+                {#if selection}<span class="selection-cell" role="gridcell">
                   <SelectionCheckbox
                     checked={selection.isSelected(row.key)}
                     label={`${selection.isSelected(row.key) ? 'Unselect' : 'Select'} ${row.title || 'item'}`}
@@ -519,17 +533,21 @@
                     onToggle={(range) => {
                       activeKey = row.key;
                       onActiveKey?.(row.key);
-                      selection.toggle(row.key, index, orderedKeys, range);
+                      selection?.toggle(row.key, index, orderedKeys, range);
                     }}
                   />
-                </span>
+                </span>{/if}
                 {#each visibleColumns as column (column)}
                   <span class={`cell cell--${column}`} role="gridcell">
                     {#if column === 'kind'}
                       <RowKind kind={row.kind} messageType={row.message_type} />
                     {:else if column === 'people'}
                       {@const label = people(row)}
-                      <Tooltip text={label}><span class="people-label" title={label}>{label}</span></Tooltip>
+                      {#if compact.current}
+                        <span class="phone-sender">{row.kind === 'conversation' ? label : row.sender_label || label}</span>
+                      {:else}
+                        <span class="desktop-people"><Tooltip text={label}><span class="people-label" title={label}>{label}</span></Tooltip></span>
+                      {/if}
                       {#if isEmailMessageType(row.message_type)}
                         <IdentityBadge
                           senderIdentities={row.matched_sender_identities}
@@ -549,7 +567,7 @@
                       {#if row.has_attachments}
                         <span class="attachment" aria-label={`${row.attachment_count} attachments`}>⌕</span>
                       {:else}
-                        <span aria-label="No attachments">—</span>
+                        <span class="no-attachments" aria-label="No attachments">—</span>
                       {/if}
                     {:else if column === 'size'}
                       <span data-mono>{formatBytes(row.attachment_size)}</span>
@@ -604,6 +622,7 @@
   .data-row {
     display: grid;
     align-items: center;
+    grid-template-columns: var(--row-template);
   }
 
   .table-grid {
@@ -688,7 +707,7 @@
 
   .data-row,
   .skeleton-row {
-    height: var(--row-height);
+    height: var(--table-row-height);
     border-bottom: 1px solid var(--border-muted);
   }
 
@@ -709,6 +728,8 @@
   }
 
   .data-row--active {
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
     box-shadow: inset 2px 0 0 var(--accent-blue);
   }
 
@@ -716,9 +737,14 @@
     background: color-mix(in srgb, var(--accent-blue) 8%, var(--bg-surface));
   }
 
-  .data-row--selected {
-    background: var(--selected-bg);
-    box-shadow: inset 2px 0 0 var(--accent-blue), inset 0 0 0 1px var(--selected-border);
+  /* Selected rows read as one block: the fill and the 3px accent run under each
+   * row's divider, so neither a stripe nor a rule breaks them. */
+  .data-row.data-row--selected {
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
+    border-bottom-color: transparent;
+    background: linear-gradient(to right, var(--accent-blue) 3px, var(--selected-bg) 3px);
+    box-shadow: none;
   }
 
   .cell--people :global(.kit-tooltip-trigger) { max-width: 100%; }
@@ -733,6 +759,8 @@
   /* The row open in the reading pane shares the app-wide selection
    * language: 2px accent inset bar over the selected surface. */
   .data-row--inspected {
+    border-start-start-radius: 0;
+    border-end-start-radius: 0;
     background: var(--selected-bg);
     box-shadow: inset 2px 0 0 var(--accent-blue);
   }
@@ -775,6 +803,7 @@
   }
 
   .skeleton-row {
+    grid-template-columns: var(--row-template);
     display: grid;
     align-items: center;
   }
@@ -858,5 +887,36 @@
     *::after {
       scroll-behavior: auto !important;
     }
+  }
+  @media (max-width: 640px) {
+    .virtual-spacer { min-width: 0; }
+    .data-row {
+      grid-template-columns: 16px minmax(0, 1fr) auto auto auto;
+      grid-template-areas: 'kind people att size time' 'title title title title title' 'excerpt excerpt excerpt excerpt excerpt';
+      align-content: center;
+      column-gap: var(--control-gap);
+      row-gap: var(--space-1);
+      padding: var(--pane-pad-y) var(--pane-pad-x);
+    }
+    .cell, .selection-cell { padding: 0; }
+    .data-row:not(:has(.cell--size)) {
+      grid-template-columns: 16px minmax(0, 1fr) auto auto;
+      grid-template-areas: 'kind people att time' 'title title title title' 'excerpt excerpt excerpt excerpt';
+    }
+    .selection-cell { grid-area: kind; z-index: 1; }
+    .data-row:hover .selection-cell ~ .cell--kind, .data-row:focus-within .selection-cell ~ .cell--kind, .selection-mode .selection-cell ~ .cell--kind { visibility: hidden; }
+    .cell--kind { grid-area: kind; justify-self: center; color: var(--artifact-ink); }
+    .cell--kind :global(.row-kind__label) { display: none; }
+    .cell--people { grid-area: people; font-weight: 500; }
+    .cell--time { grid-area: time; font-size: var(--font-size-xs); }
+    .cell--attachments { grid-area: att; }
+    .no-attachments { display: none; }
+    .cell--size { grid-area: size; font-size: var(--font-size-xs); }
+    .cell--title { grid-area: title; }
+    .cell--excerpt { grid-area: excerpt; color: var(--text-muted); font-size: var(--font-size-xs); }
+    .table-header { grid-template-columns: 16px; padding: 0 var(--pane-pad-x); box-shadow: none; }
+    .table-header .selection-header { padding: 0; }
+    .skeleton-row { grid-template-columns: minmax(0, 1fr); }
+    .skeleton-cell:not(:first-child) { display: none; }
   }
 </style>

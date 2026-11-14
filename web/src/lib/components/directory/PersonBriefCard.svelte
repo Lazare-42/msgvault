@@ -3,21 +3,25 @@
   import { onDestroy, tick, untrack } from 'svelte';
 
   import type { APIClient } from '../../api/client';
+  import EmptyLine from '../common/EmptyLine.svelte';
   import { PersonBriefController } from '../../directory/person-brief-controller.svelte';
   import type { PersonBriefVersionView } from '../../directory/person-brief-controller.svelte';
 
   interface Props {
     client: APIClient;
     personID: number;
+    refreshKey?: string;
+    onSetUp?: () => void;
     onAnnounce?: (message: string) => void;
   }
 
-  let { client, personID, onAnnounce = () => undefined }: Props = $props();
+  let { client, personID, refreshKey, onSetUp, onAnnounce = () => undefined }: Props = $props();
   const controller = new PersonBriefController(untrack(() => client));
   let root = $state<HTMLElement>();
   let alsoTrack = $state(false);
   let rejectReason = $state('');
   let expandedSentence = $state<string | null>(null);
+  let loadedRefreshKey: string | undefined;
   // The switch is bound, not read-only, because a native checkbox keeps
   // whatever the owner clicked. Binding lets a refused change snap it back to
   // the state the daemon still holds without replacing the focused control.
@@ -32,11 +36,19 @@
 
   $effect.pre(() => {
     const nextPersonID = personID;
-    alsoTrack = false;
-    rejectReason = '';
-    expandedSentence = null;
+    const nextRefreshKey = refreshKey;
+    const pending = controller.pending;
     untrack(() => {
-      void controller.setPerson(nextPersonID);
+      if (controller.personID !== nextPersonID) {
+        alsoTrack = false;
+        rejectReason = '';
+        expandedSentence = null;
+        loadedRefreshKey = nextRefreshKey;
+        void controller.setPerson(nextPersonID);
+      } else if (nextRefreshKey !== loadedRefreshKey && pending === null) {
+        loadedRefreshKey = nextRefreshKey;
+        void controller.refresh();
+      }
     });
   });
 
@@ -142,15 +154,12 @@
 </script>
 
 <section bind:this={root} class="brief" aria-labelledby={headingID}>
-  <Card level="default" padding="sm">
+
     <div class="brief-content">
       <div class="heading-row">
         <div>
           <h3 id={headingID} tabindex="-1">Last time we talked</h3>
-          <p>
-            Catch up before your next conversation with a summary of what this person recently shared
-            in supported chat and text messages. Expand a sentence to see its sources.
-          </p>
+
         </div>
         {#if busy}
           <span class="working" aria-label="Loading the brief" aria-busy="true">
@@ -158,6 +167,8 @@
           </span>
         {/if}
       </div>
+
+      {#if onSetUp}<EmptyLine message="Needs people lookups." onsetup={onSetUp} setupLabel="Set up Briefs" />{/if}
 
       {#if controller.enrollmentError}
         <div class="notice notice--error" role="alert">
@@ -171,12 +182,12 @@
         </div>
       {/if}
 
-      {#if controller.enrollment}
+      {#if controller.enrollment && (!onSetUp || controller.enrollment.enrolled)}
         {@const enrollment = controller.enrollment}
         <div class="enrollment-row">
           <Toggle
             bind:checked={enrolledSwitch}
-            ariaLabel="Enroll this person in briefs"
+            label="Write briefs for this person"
             disabled={controller.enrollmentLoading || controller.pending !== null}
             onchange={(checked) => void changeEnrollment(checked)}
           />
@@ -196,9 +207,7 @@
         </div>
       {/if}
 
-      {#if controller.enrollment && !controller.enrollment.enrolled}
-        <p class="muted">This person is not enrolled, so no brief is generated or shown.</p>
-      {:else if controller.enrollment}
+      {#if controller.enrollment?.enrolled}
         {#if controller.briefError}
           <div class="notice notice--error" role="alert">
             <span>{controller.briefError}</span>
@@ -237,8 +246,9 @@
 
           {#if brief.sentences.length > 0}
             <p class="paragraph">
-              {#each brief.sentences as sentence (sentence.key)}
-                <button
+              <!-- The daemon trims each sentence, and the buttons carry no padding, so a real word space separates them. -->
+              {#each brief.sentences as sentence, index (sentence.key)}
+                {#if index > 0}{' '}{/if}<button
                   type="button"
                   class="sentence"
                   aria-expanded={expandedSentence === sentence.key}
@@ -303,7 +313,7 @@
               {/if}
             {/if}
           {:else}
-            <p class="paragraph paragraph--plain">{brief.rendered_text}</p>
+            <p class="paragraph">{brief.rendered_text}</p>
             <p class="muted">Sentence expansion is unavailable for this brief version.</p>
           {/if}
 
@@ -333,7 +343,7 @@
             <Button
               size="sm"
               label="Regenerate this brief"
-              disabled={actionsDisabled}
+              disabled={actionsDisabled || Boolean(onSetUp)}
               onclick={() => void generateBrief()}
             />
           </div>
@@ -343,7 +353,7 @@
             <Button
               size="sm"
               label="Generate a brief now"
-              disabled={actionsDisabled}
+              disabled={actionsDisabled || Boolean(onSetUp)}
               onclick={() => void generateBrief()}
             />
           </div>
@@ -395,38 +405,43 @@
         </div>
       {/if}
     </div>
-  </Card>
+
 </section>
 
 <style>
-  .brief, .brief-content, .expansion, .history { display: grid; gap: var(--space-3); min-width: 0; }
-  .heading-row, .enrollment-row, .notice, .actions, .history-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
+  /* L2, drawn here because the title is the section's focus target: a 28 header in Heading type, the body 8
+   * below it, and its parts 8 apart. Boxes (notices, the expansion, cited items) are padded 12. */
+  .brief, .brief-content, .expansion, .history { display: grid; gap: var(--space-group); min-width: 0; }
+  .heading-row, .enrollment-row, .notice, .actions, .history-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-group); }
+  .heading-row { align-items: center; min-height: var(--control-h); }
   .heading-row > div, .history-heading { align-items: center; }
-  .heading-row > div { display: grid; gap: var(--space-1); }
+  .heading-row > div { display: grid; }
   .enrollment-row, .actions { align-items: center; justify-content: flex-start; flex-wrap: wrap; }
+  .enrollment-row { column-gap: var(--space-box); }
+  /* The switch and checkbox labels are Body, like every checkbox row. */
+  .enrollment-row :global(.kit-toggle__label) { font-size: var(--type-body-size); line-height: var(--type-body-line); }
   h3, h4, p, ul { margin: 0; }
-  h3 { font-size: var(--font-size-md); }
-  h4 { font-size: var(--font-size-sm); }
-  .heading-row p, .muted, .version-line, .meta, .evidence span { color: var(--text-muted); font-size: var(--font-size-sm); }
-  .working { display: flex; align-items: center; gap: var(--space-2); }
-  .notice { align-items: center; padding: var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-md); }
+  h3, h4 { font-size: var(--type-heading-size); line-height: var(--type-heading-line); }
+  .brief-content { font-size: var(--type-body-size); line-height: var(--type-body-line); }
+  .muted, .version-line, .meta, .evidence span { color: var(--text-muted); font-size: var(--type-meta-size); line-height: var(--type-meta-line); }
+  .working { display: flex; align-items: center; gap: var(--space-group); }
+  .notice { align-items: center; padding: var(--space-box); border: 1px solid var(--border-default); border-radius: var(--radius-md); font-size: var(--type-meta-size); line-height: var(--type-meta-line); }
   .notice--error { border-color: var(--status-error-ink); background: var(--status-error-bg); color: var(--status-error-ink); }
-  .run-outcome { padding: var(--space-2) var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-md); }
-  .paragraph { line-height: 1.6; overflow-wrap: anywhere; }
-  .paragraph--plain { padding: var(--space-1) 0; }
-  .sentence { display: inline; margin: 0 2px 0 0; padding: 0 2px; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-primary); font: inherit; text-align: left; cursor: pointer; }
+  .run-outcome { padding: var(--space-group) var(--space-box); border: 1px solid var(--border-default); border-radius: var(--radius-md); }
+  .paragraph { overflow-wrap: anywhere; }
+  .sentence { display: inline; margin: 0; padding: 0; border: 0; border-radius: var(--radius-sm); background: transparent; color: var(--text-primary); font: inherit; text-align: left; cursor: pointer; }
   .sentence:hover, .sentence[aria-expanded="true"] { background: var(--bg-surface-hover); }
   .sentence[aria-expanded="true"] { box-shadow: inset 0 -1px 0 var(--border-strong); }
-  .expansion { padding: var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-inset); }
+  .expansion { padding: var(--space-box); border: 1px solid var(--border-default); border-radius: var(--radius-md); background: var(--bg-inset); }
   .detail { font-weight: 600; }
-  .meta, .evidence { display: grid; gap: var(--space-1); padding: 0; list-style: none; }
-  .evidence li, .version-list li { display: grid; align-content: start; gap: var(--space-1); min-width: 0; padding: var(--space-2); border: 1px solid var(--border-default); border-radius: var(--radius-md); overflow-wrap: anywhere; }
+  .meta, .evidence { display: grid; gap: var(--space-tight); padding: 0; list-style: none; }
+  .evidence li, .version-list li { display: grid; align-content: start; gap: var(--space-tight); min-width: 0; padding: var(--space-box); border: 1px solid var(--border-default); border-radius: var(--radius-md); overflow-wrap: anywhere; }
   .unsupported { color: var(--status-error-ink) !important; }
-  .version-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-2); padding: 0; list-style: none; }
-  .version-list span { color: var(--text-muted); font-size: var(--font-size-sm); }
+  .version-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-group); padding: 0; list-style: none; }
+  .version-list span { color: var(--text-muted); font-size: var(--type-meta-size); line-height: var(--type-meta-line); }
 
   @media (max-width: 760px) {
-    .heading-row, .notice, .history-heading { align-items: stretch; flex-direction: column; }
+    .notice, .history-heading { align-items: stretch; flex-direction: column; }
     .version-list { grid-template-columns: minmax(0, 1fr); }
   }
 </style>

@@ -1,7 +1,7 @@
 ---
 last_edited: "2026-10-08"
 title: Vector Search
-description: Find messages by meaning and set up separate people, visual, and document search indexes.
+description: Find messages by meaning and set up separate people and visual search indexes.
 ---
 
 Semantic search finds messages by meaning:
@@ -39,18 +39,36 @@ Choose the index for the thing you want to find:
 | Messages, chats, and meeting transcripts | `search --mode vector` or `--mode hybrid` | This page |
 | Curated people | `person search` | [People](/docs/usage/people/#find-a-person-by-what-you-remember) |
 | Image and video content | `multimodal search` | [Visual attachment search](#visual-attachment-search) |
-| Extracted document text | `documents search --mode semantic` or `--mode hybrid` | [Document indexing](/docs/usage/document-indexing/#semantic-and-hybrid-document-search) |
+| Mirrored document text | `media search <query>` | [Docbank configuration](https://msgvault.io/docs/configuration/#search-document-text-through-docbank) |
 
 Message embeddings do not include attachment pixels or extracted document
-text. Those indexes have separate builds and consent. For a guided setup using
+text. Visual indexing has its own build and consent; Docbank manages document
+processing. For a guided setup using
 the provider keys you have, start with
 [Recommended Configuration](/docs/usage/recommended-configuration/).
 
+## Turn on search by meaning
+
+In the Web UI, open Settings, then Overview, and click **Turn on** beside
+**Search by meaning**. MsgVault downloads the shared local server if needed,
+builds the message index, and enables semantic search in the running daemon.
+The row shows download and indexing progress. You can close the page while it
+runs and keep using keyword search.
+
+If you turned on built-in search in another app, MsgVault starts indexing a SQLite archive at launch when the shared model files are installed and no provider is configured. It does not download missing files at startup. A configured provider takes precedence. PostgreSQL archives require an explicit setup.
+
+If Ollama already serves `nomic-embed-text`, Turn on uses it. An existing
+Ollama configuration stays on Ollama.
+When the browser uses a remote address, the download line names the daemon host.
+The **Turn on** hint below full-text search results opens Settings.
+
 ## Prerequisites
 
-1. **A running embedding endpoint.** msgvault does
-   not host a model. Point it at a local, self-hosted, or hosted
-   endpoint that you trust. Common local options include [Ollama](https://ollama.com),
+1. **An embedding provider.** Run `msgvault setup providers --local-embeddings`
+   to install and start the shared local server after confirming any missing
+   downloads. This works without a running endpoint. You can also point msgvault
+   at a running local, self-hosted, or hosted endpoint that you trust.
+   Common local options include [Ollama](https://ollama.com),
    [llama.cpp's `server`](https://github.com/ggerganov/llama.cpp/tree/master/examples/server),
    and [LM Studio](https://lmstudio.ai). On an Apple Silicon Mac,
    [`afm`](https://github.com/scouzi1966/maclocal-api) is another option
@@ -109,7 +127,11 @@ go build -tags "fts5 sqlite_vec" -o msgvault.exe ./cmd/msgvault
 
 ## Enable
 
-Use `msgvault setup providers` to select defaults, or add a `[vector]` block
+Use `msgvault setup providers` to select defaults. Without a hosted key, setup uses Ollama with `nomic-embed-text` or offers the shared local server. It asks once before downloading missing model and runtime files.
+
+Run `msgvault setup providers --local-embeddings` to switch to the shared local server while Ollama is running. Switching an Ollama-built Nomic message index with the same recipe keeps its generation; the next build embeds only new messages. Switching from another model requires `msgvault embeddings build --full-rebuild --yes`. This CLI switch changes semantic-person consent identities once, so renew those consents. Later local server port changes preserve the local generation and consent identities. Configured providers remain tied to their endpoints.
+
+For manual configuration, add a `[vector]` block
 to `~/.msgvault/config.toml`.
 
 Guided Ollama setup uses a conservative `max_input_chars = 2000`, leaving
@@ -276,9 +298,7 @@ and a fixed tokenizer, pooling, precision and output recipe. An alias is an
 operator convention; msgvault does not verify the loaded checkpoint through
 HTTP. Give a changed serving recipe a new alias. Changing `model`, `dimension`
 or either prefix separates message generations and requires a full rebuild.
-Extracted document vectors have their own generation and consent policy;
-those settings change that identity too. Follow the separate
-[document setup](document-indexing.md#semantic-and-hybrid-document-search).
+Docbank owns document processing and embeddings. See [Docbank configuration](https://msgvault.io/docs/configuration/#search-document-text-through-docbank).
 
 The [model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card_2)
 specifies mean pooling including prompts, L2-normalized output, and
@@ -380,8 +400,8 @@ msgvault embeddings build --full-rebuild --yes
 For message embeddings, enabling `[vector]` is the opt-in. The command does not
 create a separate stored provider-consent record; `--yes` only skips the full
 rebuild confirmation. If the endpoint is hosted, both indexed message text and
-semantic query text leave the archive as described above. People, visual, and
-document vectors use separate consent gates.
+semantic query text leave the archive as described above. People and visual vectors use separate consent gates. Docbank manages
+document processing consent.
 
 This creates a new **building generation**, scans every non-deleted
 message in the configured scope, embeds missing rows in batches through your
@@ -501,9 +521,9 @@ trigger).
 |---|---|
 | Manual `sync-full` / `sync` (Gmail, IMAP) | No. Run `msgvault embeddings build` afterward |
 | Manual `sync-calendar` / `sync-teams` / `sync-discord` | No. Run `msgvault embeddings build` afterward |
-| Manual `sync-slack` / `sync-beeper` / `sync-omi` / `sync-granola` / `sync-plaud` / `sync-circleback` / `sync-notion-meetings` / `sync-muesli` / `sync-twilio` / `sync-twenty` / `sync-chatwoot` | No. Run `msgvault embeddings build` afterward |
+| Manual `sync-slack` / `sync-beeper` / `sync-omi` / `sync-granola` / `sync-plaud` / `sync-circleback` / `sync-pocket` / `sync-notion-meetings` / `sync-muesli` / `sync-twilio` / `sync-twenty` / `sync-chatwoot` | No. Run `msgvault embeddings build` afterward |
 | Scheduled account syncs in `msgvault serve` (Gmail, IMAP, Teams, Discord) | Yes, when `[vector.embed.schedule].run_after_sync = true` |
-| Scheduled calendar, Slack, Beeper, Omi, Granola, Plaud, Circleback, Notion, Muesli, Twilio, Twenty, and Chatwoot syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
+| Scheduled calendar, Slack, Beeper, Omi, Granola, Plaud, Circleback, Pocket, Notion, Muesli, Twilio, Twenty, and Chatwoot syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
 | Local email imports (`import-pst`, `import-emlx`, `import-eml`, `import-mbox`) | No. Run `msgvault embeddings build` afterward |
 | Local chat/text imports | No. Run `msgvault embeddings build` afterward |
 
@@ -920,9 +940,9 @@ and `multimodal resume` to continue processing. `multimodal retire
 Original attachments remain in the archive.
 
 MCP clients use `search_visual_attachments` for visual queries,
-`search_document_attachments` for document text, and `search_person_files` for
-attachment metadata. The CLI `person files --lane all` combines those search
-paths for one person. The Web UI's [Operations workspace](/docs/web-ui/#operations) shows
+`search_media` for document text, and `search_person_files` for
+attachment metadata. The CLI `person files --lane all` combines metadata and
+visual results for one person. The Web UI's [Past runs](/docs/web-ui/#background-jobs-and-past-runs) shows
 visual coverage and the build or resume actions the daemon currently allows.
 
 ## See Also

@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"go.kenn.io/msgvault/internal/attachmentstore"
@@ -26,11 +27,13 @@ import (
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/senderauth"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/chunkmatch"
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
+	"go.kenn.io/msgvault/internal/verification"
 	"golang.org/x/oauth2"
 )
 
@@ -133,8 +136,10 @@ type SourceStatus struct {
 	NextSyncAt            *string        `json:"next_sync_at"`
 	SchedulerLastError    string         `json:"scheduler_last_error,omitempty"`
 	// SchedulerQueued reports a scheduled run waiting for another job to
-	// finish; SchedulerPending a follow-up run requested while one executes;
+	// finish; SchedulerQueuedAt gives when the wait began.
+	// SchedulerPending reports a follow-up run requested while one executes;
 	// SchedulerStartedAt when the executing run began.
+	SchedulerQueuedAt  *string `json:"scheduler_queued_at,omitempty"`
 	SchedulerQueued    bool    `json:"scheduler_queued,omitempty"`
 	SchedulerPending   bool    `json:"scheduler_pending,omitempty"`
 	SchedulerStartedAt *string `json:"scheduler_started_at,omitempty"`
@@ -276,10 +281,12 @@ type GmailIDsResponse struct {
 	Targets          []query.DeletionTarget `json:"targets,omitempty"`
 	SearchQuery      string                 `json:"search_query,omitempty"`
 	SearchMode       string                 `json:"search_mode,omitempty"`
+	MatchedCount     *int64                 `json:"matched_count,omitempty"`
 	AppliedSourceIDs []int64                `json:"applied_source_ids,omitempty"`
 }
 
 type DeepSearchResponse struct {
+	Warnings     []string            `json:"warnings,omitempty"`
 	IndexState   string              `json:"index_state,omitempty"`
 	Query        string              `json:"query"`
 	Scope        string              `json:"scope,omitempty"`
@@ -304,39 +311,45 @@ type BodySearchContext struct {
 
 // MessageSummary represents a message in list responses.
 type MessageSummary struct {
-	ID              int64    `json:"id"`
-	SourceID        int64    `json:"source_id,omitzero"`
-	SourceMessageID string   `json:"source_message_id,omitempty"`
-	ConversationID  int64    `json:"conversation_id,omitzero"`
-	Subject         string   `json:"subject"`
-	MessageType     string   `json:"message_type,omitempty"`
-	From            string   `json:"from"`
-	FromEmail       string   `json:"from_email,omitempty"`
-	FromName        string   `json:"from_name,omitempty"`
-	FromPhone       string   `json:"from_phone,omitempty"`
-	To              []string `json:"to"`
-	Cc              []string `json:"cc,omitempty"`
-	Bcc             []string `json:"bcc,omitempty"`
-	SentAt          string   `json:"sent_at"`
-	DeletedAt       string   `json:"deleted_at,omitempty"`
-	Snippet         string   `json:"snippet"`
-	Labels          []string `json:"labels"`
-	HasAttach       bool     `json:"has_attachments"`
-	SizeBytes       int64    `json:"size_bytes"`
+	ID                int64    `json:"id"`
+	SourceID          int64    `json:"source_id,omitzero"`
+	SourceMessageID   string   `json:"source_message_id,omitempty"`
+	RFC822MessageID   string   `json:"rfc822_message_id,omitempty" doc:"Original Message-ID header for reply threading."`
+	ConversationID    int64    `json:"conversation_id,omitzero"`
+	Subject           string   `json:"subject"`
+	MessageType       string   `json:"message_type,omitempty"`
+	From              string   `json:"from"`
+	FromEmail         string   `json:"from_email,omitempty"`
+	FromName          string   `json:"from_name,omitempty"`
+	FromPhone         string   `json:"from_phone,omitempty"`
+	To                []string `json:"to"`
+	Cc                []string `json:"cc,omitempty"`
+	Bcc               []string `json:"bcc,omitempty"`
+	SentAt            string   `json:"sent_at"`
+	DeletedAt         string   `json:"deleted_at,omitempty"`
+	Snippet           string   `json:"snippet"`
+	Labels            []string `json:"labels"`
+	HasAttach         bool     `json:"has_attachments"`
+	HiddenTextPresent bool     `json:"hidden_text_present"`
+	SizeBytes         int64    `json:"size_bytes"`
 }
 
 // MessageDetail represents a full message response.
 type MessageDetail struct {
 	MessageSummary
 
-	RFC822MessageID string `json:"rfc822_message_id,omitempty" doc:"Original Message-ID header for In-Reply-To and References when composing a reply."`
+	FromParticipantID int64                     `json:"from_participant_id,omitzero" doc:"Sender participant ID, populated for conversation windows."`
+	ToParticipants    []ConversationParticipant `json:"to_participants,omitempty" doc:"Recipient participants, populated for conversation windows."`
 
-	RelatedMessageID  *int64 `json:"related_message_id,omitempty"`
-	ConversationTitle string `json:"conversation_title,omitempty" doc:"Conversation title, when available."`
+	RelatedMessageID  *int64                    `json:"related_message_id,omitempty"`
+	ConversationTitle string                    `json:"conversation_title,omitempty" doc:"Conversation title, when available."`
+	SenderAuth        *senderauth.Verdict       `json:"sender_auth,omitempty"`
+	Calendar          *store.CalendarProjection `json:"calendar,omitempty" doc:"Calendar state for calendar events: status, sequence, start, end, all-day, time zone, and iCal UID. A field is null when the stored event does not carry it; calendar sync does not store a sequence of 0."`
 
-	Body     string `json:"body"`
-	BodyHTML string `json:"body_html,omitempty"`
-	IsFromMe bool   `json:"is_from_me,omitzero"`
+	Body     string  `json:"body"`
+	BodyText *string `json:"body_text,omitzero" nullable:"false" doc:"Stored plain-text body of a single message, which can be generated from HTML and is empty when no plain text is stored; conversation windows leave it unset. Older servers omit this field; body keeps its HTML fallback."`
+	BodyHTML string  `json:"body_html,omitempty"`
+	IsFromMe bool    `json:"is_from_me,omitzero"`
 	// BodyOmitted marks a conversation-window message whose body was left
 	// out to keep the response within the cumulative inline-body budget.
 	// The snippet is still present; fetch the full body via
@@ -370,6 +383,7 @@ func attachmentInfoFromStore(att store.APIAttachment) AttachmentInfo {
 
 // SearchResult represents search results.
 type SearchResult struct {
+	Warnings   []string         `json:"warnings,omitempty"`
 	IndexState string           `json:"index_state,omitempty"`
 	Query      string           `json:"query"`
 	Total      int64            `json:"total"`
@@ -382,18 +396,20 @@ type SearchResult struct {
 // PoolSaturated is always emitted so clients can read "pool not
 // saturated" as a positive signal rather than an absent field.
 type hybridSearchResponse struct {
-	Query            string                  `json:"query"`
-	Mode             string                  `json:"mode"`
-	Returned         int                     `json:"returned"`
-	PoolSaturated    bool                    `json:"pool_saturated"`
-	Accelerator      string                  `json:"accelerator,omitempty"`
-	HasMore          bool                    `json:"has_more"`
-	Generation       hybridGenerationSummary `json:"generation"`
-	TookMS           int64                   `json:"took_ms"`
-	Timings          hybridSearchTimings     `json:"timings"`
-	ScopeLabel       string                  `json:"scope_label,omitempty"`
-	ScopeSourceCount int                     `json:"scope_source_count,omitzero"`
-	Results          []hybridSearchItem      `json:"results"`
+	Query                 string                  `json:"query"`
+	Mode                  string                  `json:"mode"`
+	Returned              int                     `json:"returned"`
+	PoolSaturated         bool                    `json:"pool_saturated"`
+	Accelerator           string                  `json:"accelerator,omitempty"`
+	HasMore               bool                    `json:"has_more"`
+	RankingLimitReached   int                     `json:"ranking_limit_reached,omitzero"`
+	CandidateLimitReached int                     `json:"candidate_limit_reached,omitzero"`
+	Generation            hybridGenerationSummary `json:"generation"`
+	TookMS                int64                   `json:"took_ms"`
+	Timings               hybridSearchTimings     `json:"timings"`
+	ScopeLabel            string                  `json:"scope_label,omitempty"`
+	ScopeSourceCount      int                     `json:"scope_source_count,omitzero"`
+	Results               []hybridSearchItem      `json:"results"`
 }
 
 type hybridSearchTimings struct {
@@ -482,7 +498,7 @@ func writeError(w http.ResponseWriter, status int, err string, message string) {
 	writeJSON(w, status, ErrorResponse{Error: err, Message: message})
 }
 
-// writeIfContextError converts a context deadline/cancellation into a
+// writeIfContextError converts context and cache-unavailable errors into a
 // structured 503 response and returns true. A request that overran its
 // server-side query budget (see requestTimeoutForPath) or was abandoned by
 // the client surfaces here as context.DeadlineExceeded/Canceled; without this
@@ -496,6 +512,10 @@ func (s *Server) writeIfContextError(w http.ResponseWriter, err error) bool {
 	case errors.Is(err, context.Canceled):
 		writeError(w, http.StatusServiceUnavailable, "query_canceled",
 			"the query was canceled before it completed")
+		return true
+	case errors.Is(err, query.ErrCacheUnavailable):
+		writeError(w, http.StatusServiceUnavailable, "analytical_cache_unavailable",
+			"The committed analytical cache is unavailable")
 		return true
 	default:
 		return false
@@ -562,32 +582,35 @@ func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 	}
 
 	return MessageDetail{
-		RFC822MessageID:   qMsg.RFC822MessageID,
 		RelatedMessageID:  qMsg.RelatedMessageID,
 		ConversationTitle: qMsg.ConversationTitle,
 
-		ID:              qMsg.ID,
-		SourceID:        qMsg.SourceID,
-		SourceMessageID: qMsg.SourceMessageID,
-		ConversationID:  qMsg.ConversationID,
-		Subject:         qMsg.Subject,
-		MessageType:     qMsg.MessageType,
-		From:            from,
-		FromEmail:       fromEmail,
-		FromName:        fromName,
-		To:              toAddrs,
-		Cc:              ccAddrs,
-		Bcc:             bccAddrs,
-		SentAt:          qMsg.SentAt.UTC().Format(time.RFC3339),
-		DeletedAt:       formatDeletedAt(qMsg.DeletedAt),
-		Snippet:         qMsg.Snippet,
-		Labels:          labels,
-		HasAttach:       qMsg.HasAttachments,
-		SizeBytes:       qMsg.SizeEstimate,
-		IsFromMe:        qMsg.IsFromMe,
-		Body:            body,
-		BodyHTML:        qMsg.BodyHTML,
-		Attachments:     attachments,
+		ID:                qMsg.ID,
+		SourceID:          qMsg.SourceID,
+		SourceMessageID:   qMsg.SourceMessageID,
+		RFC822MessageID:   qMsg.RFC822MessageID,
+		ConversationID:    qMsg.ConversationID,
+		Subject:           qMsg.Subject,
+		MessageType:       qMsg.MessageType,
+		From:              from,
+		FromEmail:         fromEmail,
+		FromName:          fromName,
+		To:                toAddrs,
+		Cc:                ccAddrs,
+		Bcc:               bccAddrs,
+		SentAt:            qMsg.SentAt.UTC().Format(time.RFC3339),
+		DeletedAt:         formatDeletedAt(qMsg.DeletedAt),
+		Snippet:           qMsg.Snippet,
+		Labels:            labels,
+		HasAttach:         qMsg.HasAttachments,
+		HiddenTextPresent: qMsg.HiddenTextPresent,
+		SizeBytes:         qMsg.SizeEstimate,
+		IsFromMe:          qMsg.IsFromMe,
+		Calendar:          qMsg.Calendar,
+		Body:              body,
+		BodyText:          new(qMsg.BodyText),
+		BodyHTML:          qMsg.BodyHTML,
+		Attachments:       attachments,
 	}
 }
 
@@ -602,25 +625,27 @@ func toMessageSummary(m APIMessage) MessageSummary {
 		labels = []string{}
 	}
 	return MessageSummary{
-		ID:              m.ID,
-		SourceID:        m.SourceID,
-		SourceMessageID: m.SourceMessageID,
-		ConversationID:  m.ConversationID,
-		Subject:         m.Subject,
-		MessageType:     m.MessageType,
-		From:            m.From,
-		FromEmail:       m.FromEmail,
-		FromName:        m.FromName,
-		FromPhone:       m.FromPhone,
-		To:              to,
-		Cc:              m.Cc,
-		Bcc:             m.Bcc,
-		SentAt:          m.SentAt.UTC().Format(time.RFC3339),
-		DeletedAt:       formatDeletedAt(m.DeletedAt),
-		Snippet:         m.Snippet,
-		Labels:          labels,
-		HasAttach:       m.HasAttachments,
-		SizeBytes:       m.SizeEstimate,
+		ID:                m.ID,
+		SourceID:          m.SourceID,
+		SourceMessageID:   m.SourceMessageID,
+		RFC822MessageID:   m.RFC822MessageID,
+		ConversationID:    m.ConversationID,
+		Subject:           m.Subject,
+		MessageType:       m.MessageType,
+		From:              m.From,
+		FromEmail:         m.FromEmail,
+		FromName:          m.FromName,
+		FromPhone:         m.FromPhone,
+		To:                to,
+		Cc:                m.Cc,
+		Bcc:               m.Bcc,
+		SentAt:            m.SentAt.UTC().Format(time.RFC3339),
+		DeletedAt:         formatDeletedAt(m.DeletedAt),
+		Snippet:           m.Snippet,
+		Labels:            labels,
+		HasAttach:         m.HasAttachments,
+		HiddenTextPresent: m.HiddenTextPresent,
+		SizeBytes:         m.SizeEstimate,
 	}
 }
 
@@ -635,10 +660,28 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Vector stats are best-effort and bounded: log errors but still
+	// include whatever partial stats came back. They live in a separate
+	// database, so they are collected while the archive stats load.
+	_, backend, _ := s.vectorComponents()
+	vectorCtx, cancelVector := context.WithTimeout(r.Context(), s.vectorStatsTimeout)
+	var (
+		vs             *vector.StatsView
+		vsErr          error
+		vectorTimedOut bool
+		vectorDone     sync.WaitGroup
+	)
+	vectorDone.Go(func() {
+		vs, vsErr = vector.CollectStats(vectorCtx, backend)
+		vectorTimedOut = errors.Is(vectorCtx.Err(), context.DeadlineExceeded)
+	})
+
 	stats, asOf, stale, err := s.statsSnapshots.get(
 		r.Context(), s.importContext, "", s.statsSnapshotWait, s.getStats,
 	)
 	if err != nil {
+		cancelVector()
+		vectorDone.Wait()
 		if s.writeIfContextError(w, err) {
 			return
 		}
@@ -646,13 +689,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve statistics")
 		return
 	}
-
-	// Vector stats are best-effort and bounded: log errors but still
-	// include whatever partial stats came back.
-	_, backend, _ := s.vectorComponents()
-	vectorCtx, cancelVector := context.WithTimeout(r.Context(), s.vectorStatsTimeout)
-	vs, vsErr := vector.CollectStats(vectorCtx, backend)
-	vectorTimedOut := errors.Is(vectorCtx.Err(), context.DeadlineExceeded)
+	vectorDone.Wait()
 	cancelVector()
 	if vsErr != nil {
 		s.logger.Warn("vector stats", "error", vsErr)
@@ -734,6 +771,9 @@ func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
 	for i, m := range messages {
 		summaries[i] = toMessageSummary(m)
 	}
+	if !s.maskMessageSummaries(w, r, summaries, nil) {
+		return
+	}
 	writeJSON(w, http.StatusOK, MessageListResponse{
 		Total:    total,
 		Page:     page,
@@ -768,7 +808,9 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 				writeError(w, http.StatusNotFound, "not_found", "Message not found")
 				return
 			}
+			s.maskMessageDetail(r, qMsg)
 			detail := messageDetailFromQuery(qMsg)
+			detail.SenderAuth = s.senderAuth(r.Context(), id, qMsg.SourceID, qMsg.MessageType, detail.FromEmail)
 			detail.BodyHTML = s.archivedRemoteImageHTML(r.Context(), id, detail.BodyHTML)
 			writeJSON(w, http.StatusOK, detail)
 			return
@@ -801,20 +843,23 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "Message not found")
 		return
 	}
+	s.maskStoreMessage(r, msg)
 	detail := MessageDetail{
-		RFC822MessageID:   msg.RFC822MessageID,
 		RelatedMessageID:  msg.RelatedMessageID,
 		MessageSummary:    toMessageSummary(*msg),
 		ConversationTitle: msg.ConversationTitle,
 		Body:              msg.Body,
+		BodyText:          new(msg.BodyText),
 		BodyHTML:          msg.BodyHTML,
 		IsFromMe:          msg.IsFromMe,
+		Calendar:          msg.Calendar,
 	}
 
 	attachments := make([]AttachmentInfo, 0, len(msg.Attachments))
 	for _, att := range msg.Attachments {
 		attachments = append(attachments, attachmentInfoFromStore(att))
 	}
+	detail.SenderAuth = s.senderAuth(r.Context(), id, msg.SourceID, msg.MessageType, msg.FromEmail)
 	detail.Attachments = attachments
 	detail.BodyHTML = s.archivedRemoteImageHTML(r.Context(), id, detail.BodyHTML)
 
@@ -868,7 +913,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var err error
-		scope, err = resolveCLIStatsScope(bindCLIStoreContext(r.Context(), cliStore), account, collection)
+		scope, err = resolveCLIStatsScope(r.Context(), bindCLIStoreContext(r.Context(), cliStore), account, collection)
 		if err != nil {
 			writeAPIHTTPError(w, s.cliScopeError(err))
 			return
@@ -1012,7 +1057,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		summaries[i] = toMessageSummary(m)
 	}
 
+	if !s.maskMessageSummaries(w, r, summaries, nil) {
+		return
+	}
 	writeJSON(w, http.StatusOK, SearchResult{
+		Warnings:   search.LiteralORWarnings(searchText),
 		IndexState: agentIndexState(r),
 		Query:      searchText,
 		Total:      total,
@@ -1108,9 +1157,7 @@ func (s *Server) handleHybridSearch(
 	}
 
 	fetchLimit := offset + pageSize + 1
-	if maxPage := vectorCfg.Search.MaxPageSizeHybridClamp(); maxPage > 0 && fetchLimit > maxPage {
-		fetchLimit = maxPage
-	}
+	maxPage := vectorCfg.Search.MaxPageSizeHybridClamp()
 	req := hybrid.SearchRequest{
 		Mode:         hybrid.Mode(mode),
 		FreeText:     freeText,
@@ -1146,7 +1193,18 @@ func (s *Server) handleHybridSearch(
 	hydrationStarted := time.Now()
 	pageStart := min(offset, len(hits))
 	pageEnd := min(pageStart+pageSize, len(hits))
+	rankingLimitReached := 0
+	candidateLimitReached := 0
+	if meta.CandidatePoolOmitted {
+		candidateLimitReached = vectorCfg.Search.KPerSignal
+	}
 	hasMore := pageEnd < len(hits)
+	if maxPage > 0 && pageEnd >= maxPage {
+		if hasMore || candidateLimitReached > 0 {
+			rankingLimitReached = maxPage
+		}
+		hasMore = false
+	}
 	pageHits := hits[pageStart:pageEnd]
 
 	// Bulk-hydrate to avoid the per-hit GetMessage N+1: a single
@@ -1216,14 +1274,16 @@ func (s *Server) handleHybridSearch(
 	hydrationDuration := time.Since(hydrationStarted)
 
 	writeJSON(w, http.StatusOK, hybridSearchResponse{
-		Query:            q,
-		Mode:             mode,
-		Returned:         len(items),
-		PoolSaturated:    meta.PoolSaturated,
-		Accelerator:      meta.Accelerator,
-		HasMore:          hasMore,
-		ScopeLabel:       scope.displayName(),
-		ScopeSourceCount: len(scope.sourceIDs()),
+		Query:                 q,
+		Mode:                  mode,
+		Returned:              len(items),
+		PoolSaturated:         meta.PoolSaturated,
+		Accelerator:           meta.Accelerator,
+		HasMore:               hasMore,
+		RankingLimitReached:   rankingLimitReached,
+		CandidateLimitReached: candidateLimitReached,
+		ScopeLabel:            scope.displayName(),
+		ScopeSourceCount:      len(scope.sourceIDs()),
 		Generation: hybridGenerationSummary{
 			ID:          int64(meta.Generation.ID),
 			Model:       meta.Generation.Model,
@@ -1423,7 +1483,7 @@ func (s *Server) similarSearchFilter(r *http.Request) (vector.Filter, *apiHTTPEr
 		if apiErr != nil {
 			return filter, apiErr
 		}
-		scope, err := resolveCLIStatsScope(cliStore, account, "")
+		scope, err := resolveCLIStatsScope(r.Context(), cliStore, account, "")
 		if err != nil {
 			return filter, s.cliScopeError(err)
 		}
@@ -1565,7 +1625,7 @@ func (s *Server) handleSourceStatus(w http.ResponseWriter, r *http.Request) {
 		if r.Context().Err() != nil {
 			return
 		}
-		status, err := s.sourceStatus(r.Context(), statusStore, source)
+		status, err := s.sourceStatus(r.Context(), statusStore, source, sources)
 		if err != nil {
 			if r.Context().Err() != nil {
 				return
@@ -1585,7 +1645,26 @@ func (s *Server) handleSourceStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, SourceStatusResponse{Sources: statuses})
 }
 
-func (s *Server) sourceStatus(ctx context.Context, statusStore SourceStatusStore, source *store.Source) (SourceStatus, error) {
+// sourceScheduling restricts the singleton Messages job to its import target.
+func (s *Server) sourceScheduling(sourceType, identifier string, sources []*store.Source) sourceScheduleClassification {
+	scheduling := classifySourceScheduling(sourceType, identifier)
+	if sourceType != "apple_messages" {
+		return scheduling
+	}
+	var messagesSources []*store.Source
+	for _, source := range sources {
+		if source.SourceType == "apple_messages" {
+			messagesSources = append(messagesSources, source)
+		}
+	}
+	selected := store.SelectImessageSource(messagesSources)
+	if selected != nil && selected.Identifier == identifier || selected == nil && identifier == "local" {
+		return scheduling
+	}
+	return sourceScheduleClassification{kind: sourceScheduleNonSchedulable}
+}
+
+func (s *Server) sourceStatus(ctx context.Context, statusStore SourceStatusStore, source *store.Source, sources []*store.Source) (SourceStatus, error) {
 	status := SourceStatus{
 		ID:         source.ID,
 		SourceType: source.SourceType,
@@ -1607,7 +1686,7 @@ func (s *Server) sourceStatus(ctx context.Context, statusStore SourceStatusStore
 	if err := s.hydrateSyncRunStatus(ctx, statusStore, status.ActiveSync); err != nil {
 		return SourceStatus{}, err
 	}
-	scheduling := classifySourceScheduling(source.SourceType, source.Identifier)
+	scheduling := s.sourceScheduling(source.SourceType, source.Identifier, sources)
 	schedulerRunning := false
 	if s.scheduler != nil {
 		switch scheduling.kind {
@@ -1625,7 +1704,7 @@ func (s *Server) sourceStatus(ctx context.Context, statusStore SourceStatusStore
 				if !scheduled.NextRun.IsZero() {
 					status.NextSyncAt = nullableTimePtr(scheduled.NextRun)
 				}
-				applySchedulerQueueState(&status, scheduled.Queued, scheduled.Pending, scheduled.StartedAt)
+				applySchedulerQueueState(&status, scheduled.Queued, scheduled.Pending, scheduled.StartedAt, scheduled.QueuedAt)
 				break
 			}
 		case sourceScheduleNonSchedulable:
@@ -1681,13 +1760,16 @@ func (s *Server) applyGenericJobStatus(status *SourceStatus, jobName string) boo
 		if !job.NextRun.IsZero() {
 			status.NextSyncAt = nullableTimePtr(job.NextRun)
 		}
-		applySchedulerQueueState(status, job.Queued, job.Pending, job.StartedAt)
+		applySchedulerQueueState(status, job.Queued, job.Pending, job.StartedAt, job.QueuedAt)
 		return job.Running
 	}
 	return false
 }
 
-func applySchedulerQueueState(status *SourceStatus, queued, pending bool, startedAt time.Time) {
+func applySchedulerQueueState(status *SourceStatus, queued, pending bool, startedAt, queuedAt time.Time) {
+	if queued && !queuedAt.IsZero() {
+		status.SchedulerQueuedAt = nullableTimePtr(queuedAt)
+	}
 	status.SchedulerQueued = queued
 	status.SchedulerPending = pending
 	if !startedAt.IsZero() {
@@ -1771,7 +1853,22 @@ func (s *Server) handleTriggerSync(w http.ResponseWriter, r *http.Request) {
 	security, _ := securityFromRequest(r)
 	manual := security.auth.Mode == AuthModeSession || security.auth.Mode == AuthModeLoopback && requestOriginMatches(r, security.scheme, security.host)
 
-	scheduling := classifySourceScheduling(sourceType, account)
+	var sources []*store.Source
+	if sourceType == "apple_messages" {
+		statusStore, ok := s.store.(SourceStatusStore)
+		if !ok {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve source scheduling")
+			return
+		}
+		var err error
+		sources, err = statusStore.ListSourcesContext(r.Context(), sourceType)
+		if err != nil {
+			s.logger.Error("failed to select scheduled source", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve source scheduling")
+			return
+		}
+	}
+	scheduling := s.sourceScheduling(sourceType, account, sources)
 	switch scheduling.kind {
 	case sourceScheduleNonSchedulable:
 		writeError(w, http.StatusBadRequest, "source_not_schedulable", "Source type cannot be scheduled: "+sourceType)
@@ -2201,12 +2298,14 @@ type TotalStatsResponse struct {
 
 // SearchFastResponse represents fast search results with stats.
 type SearchFastResponse struct {
+	Warnings         []string            `json:"warnings,omitempty"`
 	IndexState       string              `json:"index_state,omitempty"`
 	Query            string              `json:"query"`
 	Messages         []MessageSummary    `json:"messages"`
 	TotalCount       int64               `json:"total_count"`
 	Stats            *TotalStatsResponse `json:"stats,omitzero" nullable:"false"`
 	AppliedSourceIDs []int64             `json:"applied_source_ids,omitempty"`
+	Hints            []query.SearchHint  `json:"hints,omitempty"`
 }
 
 type TextConversationRow struct {
@@ -2837,25 +2936,27 @@ func toMessageSummaryFromQuery(m query.MessageSummary) MessageSummary {
 		from = m.FromName
 	}
 	return MessageSummary{
-		ID:              m.ID,
-		SourceID:        m.SourceID,
-		SourceMessageID: m.SourceMessageID,
-		ConversationID:  m.ConversationID,
-		Subject:         m.Subject,
-		MessageType:     m.MessageType,
-		From:            from,
-		FromEmail:       m.FromEmail,
-		FromName:        m.FromName,
-		FromPhone:       m.FromPhone,
-		To:              formatQueryAddresses(m.To),
-		Cc:              formatQueryAddresses(m.Cc),
-		Bcc:             formatQueryAddresses(m.Bcc),
-		SentAt:          m.SentAt.UTC().Format(time.RFC3339),
-		DeletedAt:       formatDeletedAt(m.DeletedAt),
-		Snippet:         m.Snippet,
-		Labels:          labels,
-		HasAttach:       m.HasAttachments,
-		SizeBytes:       m.SizeEstimate,
+		ID:                m.ID,
+		SourceID:          m.SourceID,
+		SourceMessageID:   m.SourceMessageID,
+		RFC822MessageID:   m.RFC822MessageID,
+		ConversationID:    m.ConversationID,
+		Subject:           m.Subject,
+		MessageType:       m.MessageType,
+		From:              from,
+		FromEmail:         m.FromEmail,
+		FromName:          m.FromName,
+		FromPhone:         m.FromPhone,
+		To:                formatQueryAddresses(m.To),
+		Cc:                formatQueryAddresses(m.Cc),
+		Bcc:               formatQueryAddresses(m.Bcc),
+		SentAt:            m.SentAt.UTC().Format(time.RFC3339),
+		DeletedAt:         formatDeletedAt(m.DeletedAt),
+		Snippet:           m.Snippet,
+		Labels:            labels,
+		HasAttach:         m.HasAttachments,
+		HiddenTextPresent: m.HiddenTextPresent,
+		SizeBytes:         m.SizeEstimate,
 	}
 }
 
@@ -3060,6 +3161,9 @@ func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) 
 		summaries[i] = toMessageSummaryFromQuery(m)
 	}
 
+	if !s.maskMessageSummaries(w, r, summaries, nil) {
+		return
+	}
 	writeJSON(w, http.StatusOK, FilteredMessagesResponse{
 		IndexState:       agentIndexState(r),
 		Count:            len(summaries),
@@ -3362,7 +3466,28 @@ func (s *Server) handleGmailIDsByFilter(w http.ResponseWriter, r *http.Request) 
 	}
 	searchQuery := strings.TrimSpace(r.URL.Query().Get("q"))
 	searchMode := strings.TrimSpace(r.URL.Query().Get("search_mode"))
+	var maxResults *int64
+	if r.URL.Query().Has("max_results") && r.URL.Query().Get("max_results") == "" {
+		writeError(w, http.StatusBadRequest, "invalid_max_results", "max_results must be an integer")
+		return
+	}
+	if value, provided, err := queryInt64(r, "max_results"); err != nil {
+		s.rejectBadParam(w, err)
+		return
+	} else if provided {
+		if value < 1 || value > query.MaxDeletionTargetSearchResults {
+			writeError(w, http.StatusBadRequest, "invalid_max_results",
+				fmt.Sprintf("max_results must be between 1 and %d", query.MaxDeletionTargetSearchResults))
+			return
+		}
+		maxResults = &value
+	}
+	if maxResults != nil && (searchQuery == "" || searchMode == string(query.DeletionSearchAggregate)) {
+		writeError(w, http.StatusBadRequest, "invalid_max_results", "max_results requires q and a fast or deep search mode")
+		return
+	}
 	var targets []query.DeletionTarget
+	var matched int
 	if searchQuery == "" {
 		if searchMode != "" {
 			writeError(w, http.StatusBadRequest, "invalid_search", "search_mode requires q")
@@ -3377,6 +3502,17 @@ func (s *Server) handleGmailIDsByFilter(w http.ResponseWriter, r *http.Request) 
 		}
 		switch searchMode {
 		case string(query.DeletionSearchFast), string(query.DeletionSearchDeep):
+			if maxResults != nil {
+				resolver, ok := engine.(query.BoundedDeletionTargetSearchResolver)
+				if !ok {
+					writeError(w, http.StatusServiceUnavailable, "search_unavailable", "Bounded search-aware deletion resolution is not available")
+					return
+				}
+				targets, matched, err = resolver.GetDeletionTargetsBySearchBounded(
+					r.Context(), parsed, filter, query.DeletionSearchMode(searchMode), int(*maxResults),
+				)
+				break
+			}
 			resolver, ok := engine.(query.DeletionTargetSearchResolver)
 			if !ok {
 				writeError(w, http.StatusServiceUnavailable, "search_unavailable", "Search-aware deletion resolution is not available")
@@ -3419,7 +3555,12 @@ func (s *Server) handleGmailIDsByFilter(w http.ResponseWriter, r *http.Request) 
 	if targets == nil {
 		targets = []query.DeletionTarget{}
 	}
+	var matchedCount *int64
+	if maxResults != nil {
+		matchedCount = new(int64(matched))
+	}
 	writeJSON(w, http.StatusOK, GmailIDsResponse{
+		MatchedCount:     matchedCount,
 		GmailIDs:         deletion.SourceMessageIDs(targets),
 		Targets:          targets,
 		SearchQuery:      searchQuery,
@@ -3455,6 +3596,14 @@ func (s *Server) handleGetAttachment(w http.ResponseWriter, r *http.Request) {
 	if !s.agentObjectSourceAllowed(r, att.SourceID) {
 		writeError(w, http.StatusNotFound, "not_found", "Attachment not found")
 		return
+	}
+	withheld, ok := s.attachmentWithheld(w, r, []query.AttachmentInfo{*att})
+	if !ok {
+		return
+	}
+	if withheld {
+		att.Filename = verification.Masked
+		att.URL = ""
 	}
 
 	writeJSON(w, http.StatusOK, AttachmentInfo{
@@ -3502,13 +3651,12 @@ func (s *Server) handleGetAttachmentContent(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	att := &attachments[0]
-	releaseReadSnapshot(r)
 
 	var content io.ReadCloser
 	var contentLength int64
 	var err error
 	if s.blobStore != nil {
-		content, contentLength, err = s.blobStore.OpenStream(r.Context(), hash)
+		content, contentLength, err = s.blobStore.OpenStream(store.WithoutReadSnapshotContext(r.Context()), hash)
 	}
 	if s.blobStore == nil || errors.Is(err, os.ErrNotExist) {
 		content, contentLength, att, err = openLooseAttachmentCandidates(
@@ -3524,16 +3672,29 @@ func (s *Server) handleGetAttachmentContent(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to open attachment")
 		return
 	}
+	reader, withheld, apiErr := s.textAttachmentReader(w, r, content, attachments)
+	if reader == nil {
+		_ = content.Close()
+		if apiErr != nil {
+			writeAPIHTTPError(w, apiErr)
+		}
+		return
+	}
+	releaseReadSnapshot(r)
 	contentType := att.MimeType
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", contentDisposition(att.Filename))
+	filename := att.Filename
+	if withheld {
+		filename = verification.Masked
+	}
+	w.Header().Set("Content-Disposition", contentDisposition(filename))
 	w.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 
-	_, copyErr := io.Copy(w, content)
+	_, copyErr := io.Copy(w, reader)
 	if err := errors.Join(copyErr, content.Close()); err != nil {
 		// Status and headers are already committed, so only logging is possible.
 		s.logger.Error("failed to stream attachment", "error", err, "hash", hash)
@@ -3646,6 +3807,9 @@ func (s *Server) handleSearchByDomains(w http.ResponseWriter, r *http.Request) {
 		summaries[i] = toMessageSummaryFromQuery(m)
 	}
 
+	if !s.maskMessageSummaries(w, r, summaries, nil) {
+		return
+	}
 	writeJSON(w, http.StatusOK, FilteredMessagesResponse{
 		Count:    len(summaries),
 		HasMore:  result.HasMore,
@@ -3846,7 +4010,12 @@ func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 		summaries[i] = toMessageSummaryFromQuery(m)
 	}
 
+	if !s.maskMessageSummaries(w, r, summaries, nil) {
+		return
+	}
 	writeJSON(w, http.StatusOK, SearchFastResponse{
+		Hints:            result.Hints,
+		Warnings:         search.LiteralORWarnings(queryStr),
 		IndexState:       indexState,
 		Query:            queryStr,
 		Messages:         summaries,
@@ -3871,8 +4040,9 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "missing_query", "Query parameter 'q' is required")
 		return
 	}
+	const bodyScope = "body"
 	scope := r.URL.Query().Get("scope")
-	if scope != "" && scope != "body" {
+	if scope != "" && scope != bodyScope {
 		writeError(w, http.StatusBadRequest, "invalid_scope", "Invalid search scope. Must be 'body' or omitted")
 		return
 	}
@@ -3882,12 +4052,12 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		s.rejectBadParam(w, err)
 		return
 	}
-	q := search.ParseWithOR(queryStr, scope != "body")
+	q := search.ParseWithOR(queryStr, scope != bodyScope)
 	if err := q.Err(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 		return
 	}
-	if scope == "body" && len(q.TextTerms) == 0 {
+	if scope == bodyScope && len(q.TextTerms) == 0 {
 		writeError(w, http.StatusBadRequest, "missing_free_text",
 			"Body-scoped search requires at least one free-text term")
 		return
@@ -3901,7 +4071,7 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 	// Exact body-only search rejects view filters whose exact MessageFilter
 	// semantics cannot be preserved through search.Query. Generic Deep search
 	// below keeps the complete filter independent from user-entered operators.
-	if scope == "body" && (filter.Sender != "" || filter.SenderName != "" ||
+	if scope == bodyScope && (filter.Sender != "" || filter.SenderName != "" ||
 		filter.Recipient != "" || filter.RecipientName != "" ||
 		filter.Domain != "" || filter.Label != "" ||
 		filter.TimeRange.Period != "" || filter.HasEmptyTargets() ||
@@ -3928,7 +4098,7 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 	var messages []query.MessageSummary
 	var totalCount int64
 	var stats *query.TotalStats
-	if scope == "body" {
+	if scope == bodyScope {
 		merged := query.MergeFilterIntoQuery(q, filter)
 		if filter.HideDeletedFromSource {
 			merged.DeletionScope = search.DeletionScopeActive
@@ -3969,11 +4139,11 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		if s.writeIfContextError(w, err) {
 			return
 		}
-		if scope == "body" && errors.Is(err, query.ErrMessageBodySearchInvalidQuery) {
+		if scope == bodyScope && errors.Is(err, query.ErrMessageBodySearchInvalidQuery) {
 			writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 			return
 		}
-		if scope == "body" && (errors.Is(err, query.ErrMessageBodySearchUnavailable) ||
+		if scope == bodyScope && (errors.Is(err, query.ErrMessageBodySearchUnavailable) ||
 			errors.Is(err, query.ErrMessageBodySearchIndexStale)) {
 			writeError(w, http.StatusServiceUnavailable, "body_search_index_unavailable", err.Error())
 			return
@@ -3987,7 +4157,7 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		messages = messages[:limit]
 	}
-	if scope == "body" {
+	if scope == bodyScope {
 		if hasMore || (offset > 0 && len(messages) == 0) {
 			totalCount = -1
 		} else {
@@ -4002,14 +4172,22 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		summaries[i] = toMessageSummaryFromQuery(m)
 	}
 	var bodyContexts []BodySearchContext
-	if scope == "body" {
+	if scope == bodyScope {
 		bodyContexts = make([]BodySearchContext, len(messages))
 		for i, message := range messages {
 			bodyContexts[i] = toBodySearchContext(message)
 		}
 	}
 
+	var warnings []string
+	if scope != bodyScope {
+		warnings = search.LiteralORWarnings(queryStr)
+	}
+	if !s.maskMessageSummaries(w, r, summaries, bodyContexts) {
+		return
+	}
 	writeJSON(w, http.StatusOK, DeepSearchResponse{
+		Warnings:     warnings,
 		IndexState:   agentIndexState(r),
 		Query:        queryStr,
 		Scope:        scope,

@@ -78,7 +78,7 @@ func TestPeopleCodexCheckRejectsOverlappingSignIn(t *testing.T) {
 				SourceSince:    "2025-01-01", RequestTimeout: time.Minute,
 			})
 			require.NoError(err)
-			request := httptest.NewRequest(http.MethodPost, peopleInferenceSettingsPath+"/providers/subscription/check", nil)
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, peopleInferenceSettingsPath+"/providers/subscription/check", nil)
 			request.SetPathValue("name", "subscription")
 			_, configured, _, profile, ok := srv.peopleInferenceProfileForRequest(httptest.NewRecorder(), request, created.ETag)
 			require.True(ok)
@@ -280,7 +280,7 @@ func TestPeopleCodexLoginCancellationWaitsForCredentialCommitToStop(t *testing.T
 	select {
 	case err := <-result:
 		require.FailNow("cancellation returned before client stopped", err)
-	case <-time.After(20 * time.Millisecond): //nolint:kennlint // absence check: the client holds cancellation until finish closes
+	case <-time.After(20 * time.Millisecond): //nolint:kennlint // deadlinetest: absence check: the client holds cancellation until finish closes
 	}
 	close(client.finish)
 	require.NoError(<-result)

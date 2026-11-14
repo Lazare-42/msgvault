@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -658,7 +659,7 @@ func TestRunnerFailsClosedBeforeCredentialOrTransport(t *testing.T) {
 			request: func() peoplesweep.StructuredRequest {
 				request := baseRequest
 				request.Sources = []peoplesweep.SourceDescriptor{{
-					Class: peoplesweep.SourceDocumentText, ObservedOn: "2025-08-20",
+					Class: peoplesweep.SourceAttachmentOCR, ObservedOn: "2025-08-20",
 				}}
 				return request
 			}(),
@@ -1082,7 +1083,7 @@ func TestRunnerDoesNotTreatCallerProviderCheckAsSynthetic(t *testing.T) {
 
 	request := structuredTestRequest()
 	request.ProgramID = "provider-check"
-	request.Sources[0].Class = peoplesweep.SourceDocumentText
+	request.Sources[0].Class = peoplesweep.SourceAttachmentOCR
 	prepared, err := peoplesweep.NewPreparedStructuredRequest(request, []byte(`{"prepared":true}`))
 	requirements.NoError(err)
 
@@ -1094,18 +1095,20 @@ func TestRunnerDoesNotTreatCallerProviderCheckAsSynthetic(t *testing.T) {
 }
 
 func TestRunnerAppliesConfiguredRequestTimeout(t *testing.T) {
-	config := runnerTestConfig()
-	mutateActiveProvider(&config, func(provider *peoplesweep.ProviderConfig) {
-		provider.RequestTimeout = 20 * time.Millisecond
-	})
-	runner, err := peoplesweep.NewRunner(
-		config, &countingConsent{active: true}, testDriverRegistry(blockingTransport{}),
-		lookupCredentialResolver(func(string) (string, bool) { return "test-key", true }),
-	)
-	require.NoError(t, err)
+	synctest.Test(t, func(t *testing.T) {
+		config := runnerTestConfig()
+		mutateActiveProvider(&config, func(provider *peoplesweep.ProviderConfig) {
+			provider.RequestTimeout = 20 * time.Millisecond
+		})
+		runner, err := peoplesweep.NewRunner(
+			config, &countingConsent{active: true}, testDriverRegistry(blockingTransport{}),
+			lookupCredentialResolver(func(string) (string, bool) { return "test-key", true }),
+		)
+		require.NoError(t, err)
 
-	_, err = runner.RunStructured(t.Context(), structuredTestRequest())
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+		_, err = runner.RunStructured(t.Context(), structuredTestRequest())
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	})
 }
 
 func TestRunnerPreservesOnlyCompletedInvalidOutputMetadata(t *testing.T) {

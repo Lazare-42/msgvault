@@ -102,7 +102,7 @@ func newDeletionTestServer(t *testing.T, st MessageStore, engine query.Engine) *
 
 func postDeletions(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/deletions", bytes.NewBufferString(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/deletions", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	srv.Router().ServeHTTP(w, req)
@@ -649,27 +649,31 @@ func TestListDeletions(t *testing.T) {
 		deletion.StatusPending: {{
 			ID: "batch-1", Status: deletion.StatusPending, CreatedAt: now,
 			CreatedBy: "api", Description: "old mail", GmailIDs: []string{"gm-1", "gm-2"},
+			Filters: deletion.Filters{Account: "work@example.com"},
 		}},
 		deletion.StatusCancelled: {{
 			ID: "batch-2", Status: deletion.StatusCancelled, CreatedAt: now.Add(time.Hour),
 			CreatedBy: "tui", Description: "cancelled batch", GmailIDs: []string{"gm-3"},
+			Filters: deletion.Filters{Account: "personal@example.com"},
 		}},
 	}}
 	srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 
 	// All statuses, newest first.
 	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/deletions", nil))
+	srv.Router().ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/deletions", nil))
 	require.Equal(http.StatusOK, w.Code, "status (body: %s)", w.Body.String())
 	var resp ListDeletionsResponse
 	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode")
 	require.Len(resp.Manifests, 2)
 	assert.Equal("batch-2", resp.Manifests[0].ID, "newest first")
+	assert.Equal("personal@example.com", resp.Manifests[0].Account)
+	assert.Equal("work@example.com", resp.Manifests[1].Account)
 	assert.Equal(2, resp.Manifests[1].MessageCount)
 
 	// Filtered by status.
 	w = httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/deletions?status=pending", nil))
+	srv.Router().ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/deletions?status=pending", nil))
 	require.Equal(http.StatusOK, w.Code)
 	resp = ListDeletionsResponse{}
 	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode filtered")
@@ -678,7 +682,7 @@ func TestListDeletions(t *testing.T) {
 
 	// Invalid status.
 	w = httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/deletions?status=bogus", nil))
+	srv.Router().ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/deletions?status=bogus", nil))
 	assert.Equal(http.StatusBadRequest, w.Code)
 	assert.Contains(w.Body.String(), "invalid_status")
 }
@@ -701,7 +705,7 @@ func TestGetDeletionReturnsManifestLifecycleDetail(t *testing.T) {
 	srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 
 	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/deletions/batch-1", nil))
+	srv.Router().ServeHTTP(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/deletions/batch-1", nil))
 
 	requirements.Equal(http.StatusOK, w.Code, w.Body.String())
 	var detail DeletionManifestDetail
@@ -717,9 +721,9 @@ func TestGetDeletionReturnsManifestLifecycleDetail(t *testing.T) {
 	assertions.Equal([]string{"gm-2"}, detail.Execution.FailedIDs)
 }
 
-func deleteDeletion(srv *Server, id string) *httptest.ResponseRecorder {
+func deleteDeletion(ctx context.Context, srv *Server, id string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
-	srv.Router().ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/api/v1/deletions/"+id, nil))
+	srv.Router().ServeHTTP(w, httptest.NewRequestWithContext(ctx, http.MethodDelete, "/api/v1/deletions/"+id, nil))
 	return w
 }
 
@@ -731,7 +735,7 @@ func TestCancelDeletion(t *testing.T) {
 	st := &deletionMockStore{getStatus: deletion.StatusPending}
 	srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 
-	w := deleteDeletion(srv, "batch-1")
+	w := deleteDeletion(t.Context(), srv, "batch-1")
 	require.Equal(http.StatusOK, w.Code, "status (body: %s)", w.Body.String())
 	var resp CancelDeletionResponse
 	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode")
@@ -745,7 +749,7 @@ func TestCancelDeletionNotFound(t *testing.T) {
 	st := &deletionMockStore{getErr: fmt.Errorf("manifest batch-x: %w", deletion.ErrManifestNotFound)}
 	srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 
-	w := deleteDeletion(srv, "batch-x")
+	w := deleteDeletion(t.Context(), srv, "batch-x")
 	assert.Equal(t, http.StatusNotFound, w.Code)
 	assert.Contains(t, w.Body.String(), "not_found")
 	assert.Empty(t, st.cancelled)
@@ -757,7 +761,7 @@ func TestCancelDeletionNotCancellable(t *testing.T) {
 		st := &deletionMockStore{getStatus: status}
 		srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 
-		w := deleteDeletion(srv, "batch-1")
+		w := deleteDeletion(t.Context(), srv, "batch-1")
 		assert.Equal(t, http.StatusConflict, w.Code, "status %s", status)
 		assert.Contains(t, w.Body.String(), "not_cancellable", "status %s", status)
 		assert.Empty(t, st.cancelled, "status %s", status)
@@ -774,7 +778,7 @@ func TestCancelDeletionRejectsTraversalID(t *testing.T) {
 	// by Go's ServeMux before routing, so this uses an ID that reaches the
 	// handler (dots aren't path separators) but still fails validation
 	// (dots aren't in the allowed alphabet either).
-	w := deleteDeletion(srv, "bad..id")
+	w := deleteDeletion(t.Context(), srv, "bad..id")
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 	assert.Contains(t, w.Body.String(), "invalid_manifest_id")
 	assert.Empty(t, st.cancelled)

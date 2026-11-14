@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 )
 
 func TestDuckDBEngine_QuerySQL(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	builder := NewTestDataBuilder(t)
@@ -29,7 +29,7 @@ func TestDuckDBEngine_QuerySQL(t *testing.T) {
 	engine := builder.BuildEngine()
 	defer func() { _ = engine.Close() }()
 
-	ctx := context.Background()
+	ctx := t.Context()
 	result, err := engine.QuerySQL(ctx,
 		"SELECT from_email, message_count FROM v_senders")
 	require.NoError(err, "QuerySQL")
@@ -39,6 +39,7 @@ func TestDuckDBEngine_QuerySQL(t *testing.T) {
 }
 
 func TestRegisterViews_BaseViews(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	builder := NewTestDataBuilder(t)
@@ -71,7 +72,7 @@ func TestRegisterViews_BaseViews(t *testing.T) {
 	for _, table := range tables {
 		var count int
 		err := engine.db.QueryRowContext(
-			context.Background(),
+			t.Context(),
 			"SELECT COUNT(*) FROM "+table,
 		).Scan(&count)
 		require.NoError(err, "query %s", table)
@@ -81,7 +82,7 @@ func TestRegisterViews_BaseViews(t *testing.T) {
 	var subject, messageType string
 	var attachmentCount int
 	err := engine.db.QueryRowContext(
-		context.Background(),
+		t.Context(),
 		"SELECT id, subject, attachment_count, message_type FROM messages LIMIT 1",
 	).Scan(&id, &subject, &attachmentCount, &messageType)
 	require.NoError(err, "scan messages")
@@ -89,7 +90,7 @@ func TestRegisterViews_BaseViews(t *testing.T) {
 
 	var attachmentMetadata sql.NullString
 	err = engine.db.QueryRowContext(
-		context.Background(),
+		t.Context(),
 		"SELECT attachment_metadata FROM attachments LIMIT 1",
 	).Scan(&attachmentMetadata)
 	require.NoError(err, "legacy attachment cache must expose attachment_metadata")
@@ -97,6 +98,7 @@ func TestRegisterViews_BaseViews(t *testing.T) {
 }
 
 func TestRegisterViews_ListsCompatibility(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	listID := "<announce.example.test>"
 	builder := NewTestDataBuilder(t)
@@ -105,17 +107,18 @@ func TestRegisterViews_ListsCompatibility(t *testing.T) {
 	dir, cleanup := builder.Build()
 	defer cleanup()
 
-	engine, err := NewDuckDBEngine("", "", nil)
+	engine, err := NewDuckDBEngine(t.Context(), "", "", nil)
 	require.NoError(err)
 	defer func() { _ = engine.Close() }()
 
 	require.NoError(RegisterViews(t.Context(), engine.db, dir))
 	var got string
-	require.NoError(engine.db.QueryRow("SELECT list_id FROM messages").Scan(&got))
+	require.NoError(engine.db.QueryRowContext(t.Context(), "SELECT list_id FROM messages").Scan(&got))
 	assert.Equal(t, listID, got)
 }
 
 func TestRegisterViews_OldMessagesCacheDefaultsListIDToNull(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	builder := NewTestDataBuilder(t)
@@ -129,7 +132,7 @@ func TestRegisterViews_OldMessagesCacheDefaultsListIDToNull(t *testing.T) {
 
 	messageFile := filepath.Join(dir, "messages", "year=2024", "data.parquet")
 	oldMessageFile := filepath.Join(dir, "messages", "year=2024", "old.parquet")
-	_, err := engine.db.Exec(fmt.Sprintf(
+	_, err := engine.db.ExecContext(t.Context(), fmt.Sprintf(
 		"COPY (SELECT * EXCLUDE (list_id) FROM read_parquet('%s')) TO '%s' (FORMAT PARQUET)",
 		escapePath(messageFile), escapePath(oldMessageFile),
 	))
@@ -147,18 +150,19 @@ func TestRegisterViews_OldMessagesCacheDefaultsListIDToNull(t *testing.T) {
 
 	require.NoError(RegisterViews(t.Context(), engine.db, dir))
 	var listID sql.NullString
-	require.NoError(engine.db.QueryRow("SELECT list_id FROM messages").Scan(&listID))
+	require.NoError(engine.db.QueryRowContext(t.Context(), "SELECT list_id FROM messages").Scan(&listID))
 	assert.False(listID.Valid)
 
-	oldEngine, err := NewDuckDBEngine(dir, "", nil)
+	oldEngine, err := NewDuckDBEngine(t.Context(), dir, "", nil)
 	require.NoError(err)
 	defer func() { _ = oldEngine.Close() }()
-	rows, err := oldEngine.Aggregate(context.Background(), ViewLists, DefaultAggregateOptions())
+	rows, err := oldEngine.Aggregate(t.Context(), ViewLists, DefaultAggregateOptions())
 	require.NoError(err)
 	assert.Empty(rows)
 }
 
 func TestRegisterViews_ConvenienceViews(t *testing.T) {
+	t.Parallel()
 	builder := NewTestDataBuilder(t)
 	srcID := builder.AddSource("alice@example.com")
 	bob := builder.AddParticipant(
@@ -195,7 +199,7 @@ func TestRegisterViews_ConvenienceViews(t *testing.T) {
 	defer func() { _ = engine.Close() }()
 
 	require.NoError(t, RegisterViews(t.Context(), engine.db, dir), "RegisterViews")
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("v_messages", func(t *testing.T) {
 		assert := assert.New(t)
@@ -296,6 +300,7 @@ func TestRegisterViews_ConvenienceViews(t *testing.T) {
 // to the participant's current address. A legacy cache lacking both columns
 // reads as NULL for each.
 func TestRegisterViews_RecipientAddressColumns(t *testing.T) {
+	t.Parallel()
 	type addresses struct {
 		resolved sql.NullString
 		envelope sql.NullString
@@ -308,11 +313,13 @@ func TestRegisterViews_RecipientAddressColumns(t *testing.T) {
 		t.Cleanup(func() { _ = engine.Close() })
 		require.NoError(t, RegisterViews(t.Context(), engine.db, dir), "RegisterViews")
 
-		err := engine.db.QueryRowContext(context.Background(),
+		err := engine.db.QueryRowContext(
+			t.Context(),
 			`SELECT email_address, envelope_address FROM message_recipients WHERE recipient_type = 'from'`,
 		).Scan(&populated.resolved, &populated.envelope)
 		require.NoError(t, err, "scan populated row")
-		err = engine.db.QueryRowContext(context.Background(),
+		err = engine.db.QueryRowContext(
+			t.Context(),
 			`SELECT email_address, envelope_address FROM message_recipients WHERE recipient_type = 'to'`,
 		).Scan(&absent.resolved, &absent.envelope)
 		require.NoError(t, err, "scan absent row")
@@ -354,4 +361,21 @@ func TestRegisterViews_RecipientAddressColumns(t *testing.T) {
 		assert.Equal(t, addresses{}, populated, "legacy cache carries neither column")
 		assert.Equal(t, addresses{}, absent)
 	})
+}
+
+func TestVMessagesKeepUnnamedDirectSenderNamesEmpty(t *testing.T) {
+	builder := NewTestDataBuilder(t)
+	builder.AddSource("archive@example.com")
+	phone := builder.AddPhoneParticipant("+12025550123", "")
+	email := builder.AddParticipant("sender@example.com", "example.com", "")
+	ids := []int64{
+		builder.AddMessage(MessageOpt{SenderID: &phone}),
+		builder.AddMessage(MessageOpt{SenderID: &email}),
+	}
+	engine := builder.BuildEngine()
+	for _, id := range ids {
+		var fromName string
+		require.NoError(t, engine.db.QueryRowContext(t.Context(), "SELECT from_name FROM v_messages WHERE id = ?", id).Scan(&fromName))
+		assert.Empty(t, fromName, "other readers keep an empty name for unnamed direct senders")
+	}
 }

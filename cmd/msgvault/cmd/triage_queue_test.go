@@ -94,7 +94,7 @@ func TestExecuteTriageMovesReportsConfirmedMovesOnly(t *testing.T) {
 	}
 
 	moved, noops, moveErrors := executeTriageMoves(
-		context.Background(), client, msgs, "INBOX", "Queue")
+		t.Context(), client, msgs, "INBOX", "Queue")
 
 	assert.Equal(t, []int64{101, 104}, moved)
 	assert.Equal(t, 1, noops)

@@ -69,6 +69,7 @@ type CardDAVController struct {
 	googleAuthorizations        map[string]cardDAVGoogleAuthorization
 	googleTokens                googleAccessTokens
 	saveMu                      sync.Mutex
+	iCloudSyncMu                sync.Mutex
 	cfg                         *config.Config
 	store                       *store.Store
 	service                     CardDAVOperations
@@ -240,7 +241,7 @@ func (c *CardDAVController) loadStartupService(logger *slog.Logger) error {
 		logger.Warn("CardDAV authorization configuration is unavailable; repair the account settings", "error", err)
 		return nil
 	}
-	c.service = service
+	c.service = c.runtimeForCredential(service, credential, configured)
 	return nil
 }
 
@@ -257,6 +258,9 @@ func newCardDAVService(st *store.Store, configured config.CardDAVConfig, passwor
 	client, err := carddav.NewClient(options)
 	if err != nil {
 		return nil, err
+	}
+	if _, partition := carddav.ICloudPartitionOrigin(configured.BaseURL); partition || carddav.IsICloudDiscoveryURL(configured.BaseURL) {
+		return carddav.NewICloudService(st, client), nil
 	}
 	return carddav.NewService(st, client), nil
 }
@@ -415,13 +419,17 @@ func (c *CardDAVController) Test(ctx context.Context, req CardDAVAccountRequest)
 	if err := validateCardDAVAccountRequest(req); err != nil {
 		return CardDAVAccountResponse{}, err
 	}
-	credential, err := c.credentialForRequest(ctx, req)
-	if err != nil {
-		return CardDAVAccountResponse{}, err
-	}
 	configured, err := c.currentCardDAVConfig()
 	if err != nil {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVStorage, err)
+	}
+	req, prepared, err := c.prepareICloudRequest(ctx, req, configured, 0, 0)
+	if err != nil {
+		return CardDAVAccountResponse{}, err
+	}
+	credential, err := c.credentialForRequest(ctx, req)
+	if err != nil {
+		return CardDAVAccountResponse{}, err
 	}
 	configured.BaseURL, configured.Username = req.BaseURL, req.Username
 	service, err := c.serviceForCredential(credential, configured)
@@ -429,7 +437,12 @@ func (c *CardDAVController) Test(ctx context.Context, req CardDAVAccountRequest)
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVValidation, err)
 	}
 	// Testing is deliberately non-persistent.
-	discovery, err := service.DiscoverConnection(ctx, req.BaseURL)
+	var discovery carddav.Discovery
+	if prepared != nil {
+		discovery = *prepared
+	} else {
+		discovery, err = service.DiscoverConnection(ctx, req.BaseURL)
+	}
 	if err != nil {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVUpstream, err)
 	}
@@ -444,6 +457,10 @@ func (c *CardDAVController) Save(ctx context.Context, req CardDAVAccountRequest)
 		}
 		return selected.Save(ctx, req)
 	}
+	return c.save(ctx, req)
+}
+
+func (c *CardDAVController) save(ctx context.Context, req CardDAVAccountRequest) (CardDAVAccountResponse, error) {
 	c.saveLock().Lock()
 	defer c.saveLock().Unlock()
 	defer func() { c.createdConfigTable = false }()
@@ -456,6 +473,10 @@ func (c *CardDAVController) Save(ctx context.Context, req CardDAVAccountRequest)
 	current, err := c.currentCardDAVConfig()
 	if err != nil {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVStorage, err)
+	}
+	req, prepared, err := c.prepareICloudRequest(ctx, req, current, 0, 0)
+	if err != nil {
+		return CardDAVAccountResponse{}, err
 	}
 	next := config.CardDAVConfig{
 		Provider: req.Provider, OAuthApp: req.OAuthApp, BaseURL: req.BaseURL, Username: req.Username, Enabled: *req.Enabled, Schedule: req.Schedule,
@@ -478,6 +499,9 @@ func (c *CardDAVController) Save(ctx context.Context, req CardDAVAccountRequest)
 	if err != nil {
 		return CardDAVAccountResponse{}, err
 	}
+	if prepared != nil {
+		credential.ICloud = true
+	}
 	account, err := c.store.GetCardDAVAccountByNameContext(ctx, c.connection())
 	if err != nil {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVStorage, err)
@@ -499,7 +523,7 @@ func (c *CardDAVController) Save(ctx context.Context, req CardDAVAccountRequest)
 	} else if previousCredentialErr != nil && !errors.Is(previousCredentialErr, os.ErrNotExist) {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVStorage, previousCredentialErr)
 	}
-	credentialsChanged := !hadPreviousCredential || previousCredential.Password != credential.Password || previousCredential.Google != credential.Google || previousCredential.Microsoft != credential.Microsoft || previousCredential.OAuthApp != credential.OAuthApp ||
+	credentialsChanged := !hadPreviousCredential || previousCredential.Password != credential.Password || previousCredential.Google != credential.Google || previousCredential.Microsoft != credential.Microsoft || previousCredential.ICloud != credential.ICloud || previousCredential.OAuthApp != credential.OAuthApp ||
 		previousCredential.BaseURL != req.BaseURL || previousCredential.Username != req.Username
 	if err := c.store.ValidateCardDAVConnectionChangeContext(
 		ctx, req.BaseURL, req.Username, credentialsChanged, c.connection(),
@@ -515,7 +539,12 @@ func (c *CardDAVController) Save(ctx context.Context, req CardDAVAccountRequest)
 	if err != nil {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVValidation, err)
 	}
-	discovery, err := service.DiscoverConnection(ctx, req.BaseURL)
+	var discovery carddav.Discovery
+	if prepared != nil {
+		discovery = *prepared
+	} else {
+		discovery, err = service.DiscoverConnection(ctx, req.BaseURL)
+	}
 	if err != nil {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVUpstream, err)
 	}
@@ -569,7 +598,7 @@ func (c *CardDAVController) Save(ctx context.Context, req CardDAVAccountRequest)
 		)
 	}
 	c.configLock().Lock()
-	c.service = c.scopedCandidate(service, generation)
+	c.service = c.runtimeForCredential(service, credential, next)
 	c.configLock().Unlock()
 	if err := c.reconcileCurrentSchedule(ctx); err != nil {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVStorage, fmt.Errorf("reconcile CardDAV schedule: %w", err))
@@ -592,6 +621,7 @@ func (c *CardDAVController) saveCardDAVConfigOnly(
 		}
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVStorage, err, rollbackConfigErr)
 	}
+	c.refreshICloudRuntimeSnapshot(next)
 	if err := c.reconcileCurrentSchedule(ctx); err != nil {
 		return CardDAVAccountResponse{}, errors.Join(errCardDAVStorage,
 			fmt.Errorf("reconcile CardDAV schedule: %w", err))
@@ -834,6 +864,8 @@ type CardDAVStatusResponse struct {
 	Enabled              bool                  `json:"enabled"`
 	Scheduled            bool                  `json:"scheduled"`
 	Schedule             string                `json:"schedule"`
+	SchedulerRunning     bool                  `json:"scheduler_running"`
+	QueuedAt             *time.Time            `json:"queued_at,omitempty"`
 	NextScheduledAt      *time.Time            `json:"next_scheduled_at,omitempty"`
 	RepairReason         string                `json:"repair_reason,omitempty" enum:"account_missing,credential_missing,credential_mismatch,credential_unavailable,google_authorization_required,microsoft_authorization_required,runtime_unavailable"`
 	Account              *CardDAVStatusAccount `json:"account,omitzero" nullable:"false"`
@@ -1093,28 +1125,38 @@ func (s *Server) handleCardDAVStatus(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	if s.scheduler != nil && s.scheduler.IsRunning() {
-		jobs := map[string]bool{}
-		if present {
-			jobs[CardDAVJobNameForConnection(name)] = true
-		} else {
-			jobs[CardDAVJobName] = true
-			for _, connection := range s.cardDAV.connectionNames() {
-				jobs[CardDAVJobNameForConnection(connection)] = true
-			}
-		}
-		for _, job := range s.scheduler.JobStatus() {
-			if !jobs[job.Name] {
-				continue
-			}
-			status.Scheduled = true
-			if !job.NextRun.IsZero() && (status.NextScheduledAt == nil || job.NextRun.Before(*status.NextScheduledAt)) {
-				next := job.NextRun
-				status.NextScheduledAt = &next
-			}
+	statuses := map[string]*CardDAVStatusResponse{}
+	if present {
+		statuses[CardDAVJobNameForConnection(name)] = &status
+	} else {
+		statuses[CardDAVJobName] = &status
+		for _, connection := range s.cardDAV.connectionNames() {
+			statuses[CardDAVJobNameForConnection(connection)] = &status
 		}
 	}
+	s.applyCardDAVSchedules(statuses)
 	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) applyCardDAVSchedules(statuses map[string]*CardDAVStatusResponse) {
+	if s.scheduler == nil || !s.scheduler.IsRunning() {
+		return
+	}
+	for _, job := range s.scheduler.JobStatus() {
+		status := statuses[job.Name]
+		if status == nil {
+			continue
+		}
+		status.Scheduled = true
+		status.SchedulerRunning = status.SchedulerRunning || job.Running
+		if job.Queued && !job.QueuedAt.IsZero() && (status.QueuedAt == nil || job.QueuedAt.Before(*status.QueuedAt)) {
+			status.QueuedAt = new(job.QueuedAt)
+		}
+		if !job.NextRun.IsZero() && (status.NextScheduledAt == nil || job.NextRun.Before(*status.NextScheduledAt)) {
+			next := job.NextRun
+			status.NextScheduledAt = &next
+		}
+	}
 }
 
 func (s *Server) handleCardDAVRuns(w http.ResponseWriter, r *http.Request) {
@@ -1306,6 +1348,9 @@ func (s *Server) writeCardDAVAccountError(
 		setCardDAVRetryAfterHeader(w, statusErr.RetryAfter)
 		writeError(w, http.StatusServiceUnavailable, "carddav_retry_after", message)
 	case errors.Is(err, errCardDAVUpstream):
+		if diagnostic, ok := errors.AsType[*carddav.DiscoveryOriginError](err); ok {
+			message = diagnostic.Error()
+		}
 		writeError(w, http.StatusBadGateway, "carddav_upstream_failed", message)
 	default:
 		writeError(w, http.StatusInternalServerError, "carddav_storage_failed", message)
@@ -1318,6 +1363,8 @@ func (s *Server) writeCardDAVOperationError(
 	var statusErr *carddav.StatusError
 	var networkErr net.Error
 	switch {
+	case errors.Is(err, carddav.ErrICloudReconnectRequired):
+		writeError(w, http.StatusConflict, "carddav_icloud_reconnect_required", carddav.ErrICloudReconnectRequired.Error())
 	case errors.Is(err, carddav.ErrGoogleAuthorizationRequired):
 		writeError(w, http.StatusBadGateway, "google_authorization_required", "Check the selected OAuth app's client settings. Connect Google in CardDAV settings, or run msgvault carddav authorize-google with your account email and OAuth app, then try again")
 	case errors.Is(err, carddav.ErrMicrosoftAuthorizationRequired):

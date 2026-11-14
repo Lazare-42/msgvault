@@ -1,13 +1,39 @@
+import { MEDIA } from '@kenn-io/kit-ui';
+import type { ComponentProps } from 'svelte';
 import { startTelemetryReporting, stopTelemetryReporting } from '../../telemetry/actions';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createCaptureClient } from '../../telemetry/capture.test-support';
+import { visualReadinessKey } from '../../search/visual-ready.svelte';
+import { IntegrationReadiness } from '../../kata/kata-ready.svelte';
 import FilesWorkspace from './FilesWorkspace.svelte';
 
 const telemetryEvents: Array<{ event: string; properties: { search_type: string } }> = [];
 beforeEach(() => { telemetryEvents.length = 0; });
 const createAPIClient = (fetchFn: typeof fetch) => createCaptureClient(fetchFn, telemetryEvents);
+
+function renderReady(props: ComponentProps<typeof FilesWorkspace>) {
+  const readiness = new IntegrationReadiness(async () => true);
+  const view = render(FilesWorkspace, { props, context: new Map([[visualReadinessKey, readiness]]) });
+  return view;
+}
+
+it('offers setup with the visual search toggle hidden while visual search is not ready', async () => {
+  const onConfigureVisualSearch = vi.fn();
+  const readiness = new IntegrationReadiness(async () => undefined);
+  render(FilesWorkspace, { props: {
+    client: createAPIClient(async () => Response.json(response())),
+    predicate: { filters: [], presentation: 'table' },
+    sort: { field: 'occurred_at', direction: 'desc' },
+    onConfigureVisualSearch
+  }, context: new Map([[visualReadinessKey, readiness]]) });
+  await screen.findByText('fixture.pdf');
+  expect(screen.queryByRole('switch', { name: 'Visual search' })).toBeNull();
+  await fireEvent.click(screen.getByRole('button', { name: 'Set up' }));
+  expect(onConfigureVisualSearch).toHaveBeenCalledOnce();
+  readiness.dispose();
+});
 
 function response() {
   return {
@@ -17,7 +43,7 @@ function response() {
       source_identifier: 'archive@example.com', containing_title: 'Containing item',
       filename: 'fixture.pdf', mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 2048,
       participant_labels: ['Alice Example'], participant_domains: ['example.com'],
-      content_state: 'local_content', content_available: true
+      content_state: 'unverified', content_available: null as boolean | null
     }],
     total_count: 1, cache_revision: 'cache-files', search_provenance: {}
   };
@@ -52,12 +78,31 @@ function installResizeObservers() {
 }
 
 describe('FilesWorkspace', () => {
+  it.each([
+    { label: 'sender', sender: 'Zoe Sender', expected: 'Zoe Sender' },
+    { label: 'roster without a sender', sender: undefined, expected: 'Alice Recipient, Zoe Sender' }
+  ])('shows the $label on a phone', async ({ sender, expected }) => {
+    const originalMatchMedia = window.matchMedia;
+    const media = vi.spyOn(window, 'matchMedia').mockImplementation(query => ({ ...originalMatchMedia(query), matches: query === MEDIA.compact }));
+    try {
+      const result = response();
+      const client = createAPIClient(async () => Response.json({
+        ...result,
+        files: [{ ...result.files[0], participant_labels: ['Alice Recipient', 'Zoe Sender'], participant_domains: [], ...(sender ? { sender_label: sender } : {}) }]
+      }));
+      const rendered = renderReady({ client, predicate: { filters: [], presentation: 'table' }, sort: { field: 'occurred_at', direction: 'desc' } });
+      await waitFor(() => expect(rendered.container.querySelector('.phone-sender')?.textContent).toBe(expected));
+    } finally {
+      media.mockRestore();
+    }
+  });
+
   it('reports each rejected image selection once as a search failure', async () => {
     const events = telemetryEvents;
     const client = createAPIClient(async () => Response.json(response()));
-    render(FilesWorkspace, { client, predicate: { filters: [], presentation: 'table' }, sort: { field: 'occurred_at', direction: 'desc' } });
+    renderReady({ client, predicate: { filters: [], presentation: 'table' }, sort: { field: 'occurred_at', direction: 'desc' } });
     await screen.findByText('fixture.pdf');
-    await fireEvent.click(screen.getByRole('switch', { name: 'Visual search' }));
+    await fireEvent.click(await screen.findByRole('switch', { name: 'Visual search' }));
     await waitFor(() => expect(screen.getByRole('grid', { name: 'Files results' }).getAttribute('aria-busy')).toBe('false'));
     const file = new File(['synthetic'], 'query.png', { type: 'image/png' });
     Object.defineProperty(file, 'size', { value: 21 * 1024 * 1024 });
@@ -74,7 +119,7 @@ describe('FilesWorkspace', () => {
       return Response.json(kind === 'nonempty' ? response() : { ...response(), files: [], total_count: 0 });
     });
     const client = createAPIClient(fetchFn);
-    const rendered = render(FilesWorkspace, {
+    const rendered = renderReady({
       client,
       predicate: { query: kind === 'image' || kind === 'visual' ? '' : 'missing', search_mode: 'full_text', filters: [], presentation: 'table' },
       sort: { field: 'occurred_at', direction: 'desc' },
@@ -82,7 +127,7 @@ describe('FilesWorkspace', () => {
     });
     await waitFor(() => expect(screen.getByRole('grid', { name: 'Files results' }).getAttribute('aria-busy')).toBe('false'));
     if (kind === 'visual') {
-      await fireEvent.click(screen.getByRole('switch', { name: 'Visual search' }));
+      await fireEvent.click(await screen.findByRole('switch', { name: 'Visual search' }));
       const query = screen.getByRole('searchbox', { name: 'Search attachment pixels' });
       await fireEvent.input(query, { target: { value: 'blue sky' } });
       await waitFor(() => expect(events.some((event) => event.event === 'search_run')).toBe(true));
@@ -90,7 +135,7 @@ describe('FilesWorkspace', () => {
       await fireEvent.keyDown(query, { key: 'Enter' });
     }
     if (kind === 'image') {
-      await fireEvent.click(screen.getByRole('switch', { name: 'Visual search' }));
+      await fireEvent.click(await screen.findByRole('switch', { name: 'Visual search' }));
       await fireEvent.change(screen.getByLabelText('Query image'), { target: { files: [new File(['synthetic'], 'query.png', { type: 'image/png' })] } });
       await waitFor(() => expect(events.some((event) => event.event === 'search_empty')).toBe(true));
     }
@@ -114,7 +159,7 @@ describe('FilesWorkspace', () => {
     });
     const client = createAPIClient(fetchFn);
     const daily = vi.spyOn(startTelemetryReporting(client), 'reportDaily');
-    const rendered = render(FilesWorkspace, {
+    const rendered = renderReady({
       client, predicate: { query: kind === 'text' || kind === 'combined' ? 'needle' : '', search_mode: 'full_text', filters: [], presentation: 'table' },
       sort: { field: 'occurred_at', direction: 'desc' },
     });
@@ -134,7 +179,7 @@ describe('FilesWorkspace', () => {
       stopTelemetryReporting(client);
       return;
     }
-    await fireEvent.click(screen.getByRole('switch', { name: 'Visual search' }));
+    await fireEvent.click(await screen.findByRole('switch', { name: 'Visual search' }));
     await waitFor(() => expect(screen.getByRole('grid', { name: 'Files results' }).getAttribute('aria-busy')).toBe('false'));
     if (kind === 'combined') await waitFor(() => expect(daily.mock.calls.map(([key]) => key)).toEqual(['search_run:text', 'search_run:text']));
     events.length = 0;
@@ -213,17 +258,49 @@ describe('FilesWorkspace', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
-  it('owns headers and virtual rows in one focusable grid', async () => {
-    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(response()));
+  it('shows mailbox and source type labels in file rows', async () => {
+    const result = response();
+    const first = result.files[0]!;
+    first.source_type = 'imap';
+    first.source_identifier = 'imaps://work@example.com@imap.example.com:993';
+    result.files.push({ ...first, id: 8, key: 'file:8', source_type: 'slack', source_identifier: 'https://chat.example.com/archive' });
+    result.total_count = 2;
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(result));
     render(FilesWorkspace, {
       client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' },
       sort: { field: 'occurred_at', direction: 'desc' }
     });
 
     const grid = await screen.findByRole('grid', { name: 'Files results' });
+    expect(await within(grid).findByRole('gridcell', { name: 'work@example.com' })).toBeDefined();
+    expect(await within(grid).findByRole('gridcell', { name: 'Slack' })).toBeDefined();
+  });
+
+  it.each([
+    { scope: undefined, peopleColumn: '5', label: 'all files' },
+    { scope: { kind: 'person' as const, id: 1 }, peopleColumn: '6', label: 'person files' }
+  ])('keeps cell column positions for $label', async ({ scope, peopleColumn }) => {
+    render(FilesWorkspace, {
+      client: createAPIClient(async () => Response.json(response())), predicate: { filters: [], presentation: 'table' },
+      identityScope: scope, sort: { field: 'occurred_at', direction: 'desc' }
+    });
+    const row = await screen.findByRole('row', { name: /fixture.pdf/ });
+    expect(within(row).getByRole('gridcell', { name: '2 KB' }).getAttribute('aria-colindex')).toBe('4');
+    expect(row.querySelector('.cell--people')?.getAttribute('aria-colindex')).toBe(peopleColumn);
+  });
+
+  it('keeps headers and virtual rows in one focusable grid', async () => {
+    render(FilesWorkspace, {
+      client: createAPIClient(async () => Response.json(response())), predicate: { filters: [], presentation: 'table' },
+      sort: { field: 'occurred_at', direction: 'desc' }
+    });
+
+    const grid = await screen.findByRole('grid', { name: 'Files results' });
     expect(screen.getAllByRole('grid')).toHaveLength(1);
     expect(grid.contains(screen.getByRole('columnheader', { name: 'Filename' }))).toBe(true);
-    expect(grid.contains(await screen.findByRole('row', { name: /fixture.pdf/ }))).toBe(true);
+    const rows = await screen.findAllByRole('row', { name: /fixture.pdf/ });
+    expect(rows).toHaveLength(1);
+    expect(grid.contains(rows[0])).toBe(true);
   });
 
   it('retries a building analytical cache and renders files when it becomes ready', async () => {
@@ -466,7 +543,7 @@ describe('FilesWorkspace', () => {
 
     await fireEvent.click(screen.getByRole('button', { name: 'Open photo.png' }));
     expect(await screen.findByRole('dialog', { name: 'View photo.png' })).toBeDefined();
-    expect(screen.getByRole('button', { name: 'Open containing item' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Open message' })).toBeDefined();
   });
 
   it('observes the grid and header when a Media view becomes Files', async () => {
@@ -590,7 +667,7 @@ describe('FilesWorkspace', () => {
   });
 
   it('loads bounded cursor pages until a durable selected file is restored', async () => {
-    document.documentElement.style.removeProperty('--row-height');
+    document.documentElement.style.removeProperty('--table-short-row-height');
     const frames = new Map<number, FrameRequestCallback>();
     let nextFrame = 1;
     vi.stubGlobal('requestAnimationFrame', vi.fn((callback: FrameRequestCallback) => {
@@ -637,7 +714,7 @@ describe('FilesWorkspace', () => {
     expect(onRestorationComplete).not.toHaveBeenCalled();
     expect(grid.getAttribute('aria-activedescendant')).toBeNull();
 
-    document.documentElement.style.setProperty('--row-height', '36px');
+    document.documentElement.style.setProperty('--table-short-row-height', '36px');
     const [frame, callback] = [...frames.entries()][0]!;
     frames.delete(frame);
     callback(performance.now());
@@ -699,11 +776,12 @@ describe('FilesWorkspace', () => {
     await screen.findByRole('row', { name: /fixture.pdf/ });
     grid.focus();
     await fireEvent.keyDown(grid, { key: 'Enter' });
-    expect(onSelectedKey).toHaveBeenCalledWith('file:7');
+    expect(onSelectedKey).toHaveBeenCalledWith('file:7', undefined);
     expect(await screen.findByRole('dialog', { name: 'View fixture.pdf' })).toBeDefined();
-    await fireEvent.click(screen.getByRole('button', { name: 'Open containing item' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Open message' }));
     expect(onOpenItem).toHaveBeenCalledWith('message:11');
-    await fireEvent.click(screen.getByRole('button', { name: 'Open containing conversation' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'More file actions' }));
+    await fireEvent.click(screen.getByRole('menuitem', { name: 'Open conversation' }));
     expect(onOpenConversation).toHaveBeenCalledWith('message:11', 11, 21);
     await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
   });
@@ -749,7 +827,7 @@ describe('FilesWorkspace', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(screen.getByText('Opening file…')).toBeDefined();
-    expect(screen.queryByRole('button', { name: 'Open containing item' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Open message' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Download fixture.pdf' })).toBeNull();
   });
 
@@ -1180,49 +1258,23 @@ describe('FilesWorkspace', () => {
       });
     }
 
-    async function typeMenuItems(): Promise<string[]> {
-      await fireEvent.click(await screen.findByRole('button', { name: 'Type' }));
-      const labels = ['Images', 'PDFs', 'Audio', 'Video', 'Text', 'Documents', 'Archives', 'Other'];
-      return labels.filter((label) => screen.queryByRole('button', { name: label }) !== null);
+    function typeCheckboxLabels(): string[] {
+      return ['Images', 'PDFs', 'Audio', 'Video', 'Text', 'Documents', 'Archives', 'Other'].filter(label => screen.queryByRole('checkbox', { name: label }) !== null);
     }
-
-    it('filters by type from a Type menu that says which types are included', async () => {
-      const onMIMEFamiliesChange = vi.fn();
-      renderFiles({ onMIMEFamiliesChange });
-      await screen.findByText('fixture.pdf');
-
-      expect(screen.queryByRole('checkbox', { name: 'pdf' })).toBeNull();
-      expect(await typeMenuItems())
-        .toEqual(['Images', 'PDFs', 'Audio', 'Video', 'Text', 'Documents', 'Archives', 'Other']);
-      expect(screen.getByRole('button', { name: 'Type' }).textContent).toContain('All types');
-      const pdfs = screen.getByRole('button', { name: 'PDFs' });
-      expect(describedBy(pdfs)).toBeUndefined();
-      expect(describedBy(screen.getByRole('button', { name: 'Images' }))).toBeUndefined();
-      await fireEvent.click(pdfs);
-      expect(onMIMEFamiliesChange).toHaveBeenCalledWith(['pdf']);
-    });
-
-    it('marks selected types as included', async () => {
-      renderFiles({ mimeFamilies: ['pdf'] });
-      await typeMenuItems();
-      expect(screen.getByRole('button', { name: 'Type' }).textContent).not.toContain('All types');
-      expect(describedBy(screen.getByRole('button', { name: 'PDFs' }))).toBe('Included');
-      expect(describedBy(screen.getByRole('button', { name: 'Images' }))).toBe('Not included');
-    });
 
     it.each([
       ['media', ['Images', 'Video']],
       ['files', ['PDFs', 'Audio', 'Text', 'Documents', 'Archives', 'Other']]
-    ] as const)('limits a person %s Type menu to its own families', async (personPresentation, expected) => {
+    ] as const)('limits a person %s Type checkboxes to its own families', async (personPresentation, expected) => {
       renderFiles({ identityScope: { kind: 'person', id: 1 }, personPresentation });
-      expect(await typeMenuItems()).toEqual(expected);
+      expect(typeCheckboxLabels()).toEqual(expected);
     });
 
-    it('keeps the fusion score out of the row text and names a missing file plainly', async () => {
+    it('keeps the fusion score out of the row text and labels unchecked content', async () => {
       const base = response();
       const fetchFn = vi.fn<typeof fetch>(async () => Response.json({
         ...base,
-        files: [{ ...base.files[0]!, content_state: 'missing_blob', search_explain: { rrf: 0.0123 } }]
+        files: [{ ...base.files[0]!, content_state: 'unverified', search_explain: { rrf: 0.0123 } }]
       }));
       render(FilesWorkspace, {
         client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' },
@@ -1232,8 +1284,7 @@ describe('FilesWorkspace', () => {
       expect(row.textContent).not.toContain('RRF');
       expect(within(row).getByText('fixture.pdf').closest('[role="gridcell"]')?.getAttribute('title'))
         .toBe('Match score 0.0123');
-      expect(within(row).getByText('File missing')).toBeDefined();
-      expect(row.textContent).not.toContain('Missing blob');
+      expect(within(row).getByText('Not checked')).toBeDefined();
     });
 
     it('shows a readable type and keeps the raw MIME type in the title', async () => {
@@ -1275,9 +1326,140 @@ describe('FilesWorkspace', () => {
       expect(await screen.findByRole('region', { name: 'Files' })).toBeDefined();
     });
   });
+
+  it('reports embedded filename edits and appends Type choices to current families', async () => {
+    const client = createAPIClient(async () => Response.json(personResponse()));
+    const onFilenameQueryChange = vi.fn(), onMIMEFamiliesChange = vi.fn();
+    const view = render(FilesWorkspace, { client, embedded: true, identityScope: { kind: 'person', id: 42 }, personPresentation: 'files', predicate: { filters: [] }, sort: { field: 'occurred_at', direction: 'desc' }, filenameQuery: 'old', mimeFamilies: ['pdf', 'text'], onFilenameQueryChange, onMIMEFamiliesChange });
+    await screen.findByText('fixture.pdf');
+    expect(screen.getByText('Filename', { selector: 'label > span' })).toBeDefined();
+    expect((screen.getByRole('searchbox', { name: 'Filter filename' }) as HTMLInputElement).placeholder).toBe('');
+    await fireEvent.input(screen.getByRole('searchbox', { name: 'Filter filename' }), { target: { value: 'budget' } });
+    expect(onFilenameQueryChange).toHaveBeenCalledWith('budget');
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'Audio' }));
+    expect(onMIMEFamiliesChange).toHaveBeenCalledWith(['pdf', 'text', 'audio']);
+    await fireEvent.click(screen.getByRole('checkbox', { name: 'PDFs' }));
+    expect(onMIMEFamiliesChange).toHaveBeenCalledWith(['text']);
+    await view.rerender({ mimeFamilies: ['pdf'] });
+    expect((screen.getByRole('checkbox', { name: 'PDFs' }) as HTMLInputElement).disabled).toBe(true);
+  });
 });
 
-function describedBy(element: HTMLElement): string | undefined {
-  const id = element.getAttribute('aria-describedby');
-  return id ? document.getElementById(id)?.textContent?.trim() : undefined;
-}
+it.each([false, true])('handles a pending page when stepping back: %s', async (stepBack) => {
+  const first = response().files[0]!;
+  const rows = Array.from({ length: 8 }, (_, i) => ({ ...first, id: 7 + i, key: `file:${7 + i}`, filename: `file-${i}.txt` }));
+  let release: (value: Response) => void = () => {};
+  const nextPage = new Promise<Response>((resolve) => { release = resolve; });
+  let cursorCalls = 0;
+  const onSelectedKey = vi.fn();
+  const onActiveKey = vi.fn();
+  const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    if (new URL(request.url).pathname.endsWith('/files/search')) {
+      const body = await request.clone().json();
+      if (body.cursor) { cursorCalls++; return nextPage; }
+      return Response.json({ ...response(), files: rows, total_count: 9, next_cursor: 'page-2' });
+    }
+    return Response.json({ ...first, content_state: 'metadata_only' });
+  });
+  renderReady({ client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' }, sort: { field: 'occurred_at', direction: 'desc' }, onSelectedKey, onActiveKey });
+  const grid = await screen.findByRole('grid', { name: 'Files results' });
+  await screen.findByText('file-0.txt');
+  await fireEvent.keyDown(grid, { key: 'Enter' });
+  expect(screen.getByRole('button', { name: 'Previous file' }).hasAttribute('disabled')).toBe(true);
+  for (let i = 1; i < 8; i++) {
+    await fireEvent.click(screen.getByRole('button', { name: 'Next file' }));
+    await waitFor(() => expect(onSelectedKey).toHaveBeenLastCalledWith(`file:${7 + i}`, { replace: true }));
+  }
+  expect(cursorCalls).toBe(1);
+  await fireEvent.click(screen.getByRole('button', { name: 'Next file' }));
+  expect(onSelectedKey).toHaveBeenLastCalledWith('file:14', { replace: true });
+  if (stepBack) {
+    await fireEvent.click(screen.getByRole('button', { name: 'Previous file' }));
+    await screen.findByRole('dialog', { name: 'View file-6.txt' });
+  }
+  release(Response.json({ ...response(), files: [{ ...first, id: 15, key: 'file:15', filename: 'page-two.txt' }], total_count: 9 }));
+  if (stepBack) {
+    await waitFor(() => expect(screen.getByText('page-two.txt')).toBeDefined());
+    expect(onActiveKey).toHaveBeenLastCalledWith('file:13');
+    await fireEvent.click(screen.getByRole('button', { name: 'Close file viewer' }));
+    await fireEvent.keyDown(grid, { key: 'Enter' });
+    expect(await screen.findByRole('dialog', { name: 'View file-6.txt' })).toBeDefined();
+  } else {
+    await waitFor(() => expect(onSelectedKey).toHaveBeenLastCalledWith('file:15', { replace: true }));
+  }
+  expect(cursorCalls).toBe(1);
+});
+it('leaves recovery with the list and keeps the boundary notice after Previous', async () => {
+  const first = response().files[0]!;
+  const second = { ...first, id: 8, key: 'file:8', filename: 'second.txt' };
+  const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    if (new URL(request.url).pathname.endsWith('/files/search')) {
+      const body = await request.json();
+      if (body.cursor) return Response.json({ message: 'Page unavailable' }, { status: 503 });
+      return Response.json({ ...response(), files: [first, second], total_count: 3, next_cursor: 'page-2' });
+    }
+    return Response.json({ ...(new URL(request.url).pathname.endsWith('/8') ? second : first), content_state: 'metadata_only' });
+  });
+  renderReady({ client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' }, sort: { field: 'occurred_at', direction: 'desc' } });
+  const grid = await screen.findByRole('grid', { name: 'Files results' });
+  await screen.findByText('fixture.pdf');
+  await fireEvent.scroll(grid);
+  await screen.findByRole('alert');
+  await fireEvent.keyDown(grid, { key: 'Enter' });
+  let dialog = await screen.findByRole('dialog', { name: 'View fixture.pdf' });
+  expect(within(dialog).queryByRole('alert')).toBeNull();
+  await fireEvent.click(within(dialog).getByRole('button', { name: 'Next file' }));
+  dialog = await screen.findByRole('dialog', { name: 'View second.txt' });
+  expect(within(dialog).getByRole('alert').textContent).toBe('Page unavailable');
+  expect(within(dialog).getByRole('button', { name: 'Next file' }).hasAttribute('disabled')).toBe(true);
+  await fireEvent.click(within(dialog).getByRole('button', { name: 'Previous file' }));
+  dialog = await screen.findByRole('dialog', { name: 'View fixture.pdf' });
+  expect(within(dialog).queryByRole('alert')).toBeNull();
+  await fireEvent.click(within(dialog).getByRole('button', { name: 'Next file' }));
+  dialog = await screen.findByRole('dialog', { name: 'View second.txt' });
+  expect(within(dialog).getByRole('alert').textContent).toBe('Page unavailable');
+
+});
+
+it('steps after a pending page when the URL controls the current file', async () => {
+  const first = response().files[0]!;
+  const second = { ...first, id: 8, key: 'file:8', filename: 'next.txt' };
+  let release: (response: Response) => void = () => {};
+  let cursorCalls = 0;
+  const pending = new Promise<Response>((resolve) => release = resolve);
+  const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+    const request = input instanceof Request ? input : new Request(input, init);
+    if (new URL(request.url).pathname.endsWith('/files/search')) {
+      const body = await request.json();
+      if (body.cursor) { cursorCalls++; return pending; }
+      return Response.json({ ...response(), total_count: 2, next_cursor: 'page-2' });
+    }
+    return Response.json({ ...(new URL(request.url).pathname.endsWith('/8') ? second : first), content_state: 'metadata_only' });
+  });
+  const onSelectedKey = vi.fn();
+  renderReady({ client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' }, sort: { field: 'occurred_at', direction: 'desc' }, selectedKey: 'file:7', activeKey: 'file:8', restorationEpoch: 1, onSelectedKey });
+  const dialog = await screen.findByRole('dialog', { name: 'View fixture.pdf' });
+  await fireEvent.click(within(dialog).getByRole('button', { name: 'Next file' }));
+  release(Response.json({ ...response(), files: [second], total_count: 2 }));
+  expect(await screen.findByRole('dialog', { name: 'View next.txt' })).toBeDefined();
+  expect(onSelectedKey).toHaveBeenCalledWith('file:8', { replace: true });
+  expect(cursorCalls).toBe(1);
+});
+
+it('returns focus to the last file viewed in the media gallery', async () => {
+  const first = { ...personResponse().files[0]!, filename: 'first.png', mime_type: 'image/png', mime_family: 'image', content_state: 'metadata_only', content_available: false };
+  const second = { ...first, id: 8, key: 'file:8', filename: 'second.png' };
+  const fetchFn = vi.fn<typeof fetch>(async (input) => {
+    const path = new URL(input instanceof Request ? input.url : String(input), document.baseURI).pathname;
+    if (path.endsWith('/files/search')) return Response.json({ ...personResponse(), files: [first, second], total_count: 2 });
+    return Response.json({ ...(path.endsWith('/8') ? second : first), content_state: 'metadata_only' });
+  });
+  render(FilesWorkspace, { client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' }, identityScope: { kind: 'person', id: 1 }, personPresentation: 'media', sort: { field: 'occurred_at', direction: 'desc' } });
+  await fireEvent.click(await screen.findByRole('button', { name: 'Open first.png' }));
+  await fireEvent.click(screen.getByRole('button', { name: 'Next file' }));
+  await screen.findByRole('dialog', { name: 'View second.png' });
+  await fireEvent.click(screen.getByRole('button', { name: 'Close file viewer' }));
+  await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Open second.png' })));
+});

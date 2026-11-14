@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createAPIClient } from '../api/client';
 import type { FileMetadata, FileSearchRow } from './models';
 import { createExploreAPI } from './api';
+import { sourceGroup } from './fixtures.test-support';
 
 type RequiredNonNullableString<T, K extends keyof T> =
   {} extends Pick<T, K> ? false : null extends T[K] ? false : T[K] extends string ? true : false;
@@ -61,7 +62,7 @@ describe('ExploreAPI routing', () => {
     });
   });
 
-  it('passes cursors and cancellation through the session-aware entry request', async () => {
+  it.each([{ scope: undefined, path: '/api/v1/explore' }, { scope: { kind: 'person', id: 42 }, path: '/api/v1/participants/42/timeline' }, { scope: { kind: 'domain', domain: 'example.net' }, path: '/api/v1/domains/example.net/timeline' }] as const)('passes cursors and cancellation through $path requests', async ({ scope, path }) => {
     const requests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
@@ -75,12 +76,12 @@ describe('ExploreAPI routing', () => {
       });
     });
     const controller = new AbortController();
-    const api = createExploreAPI(createAPIClient(fetchFn));
+    const api = createExploreAPI(createAPIClient(fetchFn), scope);
 
     await api.explore({ filters: [], presentation: 'table', limit: 500, cursor: 'page-1' }, controller.signal);
 
     expect(requests).toHaveLength(1);
-    expect(new URL(requests[0]!.url).pathname).toBe('/api/v1/explore');
+    expect(new URL(requests[0]!.url).pathname).toBe(path);
     controller.abort();
     expect(requests[0]!.signal.aborted).toBe(true);
     await expect(requests[0]!.json()).resolves.toMatchObject({ cursor: 'page-1', limit: 500 });
@@ -92,7 +93,7 @@ describe('ExploreAPI routing', () => {
       const request = input instanceof Request ? input : new Request(input);
       requests.push(request);
       return Response.json({
-        rows: [{ key: '7', label: 'Example source', count: 12, estimated_bytes: 42, latest_at: '2026-07-18T12:00:00Z' }],
+        rows: [sourceGroup],
         total_count: 1,
         cache_revision: 'cache-1',
         search_provenance: {}
@@ -119,8 +120,35 @@ describe('ExploreAPI routing', () => {
       grouping: ['source'],
       presentation: 'table',
       limit: 500,
-      cursor: 'groups-2'
+      cursor: 'groups-2',
+      timezone: expect.any(String)
     });
+  });
+
+  it('sets group timezones and newest-first calendar sorting', async () => {
+    vi.stubEnv('TZ', 'America/Chicago');
+    try {
+      const requests: Request[] = [];
+      const api = createExploreAPI(createAPIClient(async (input) => {
+        requests.push(input as Request);
+        return Response.json({ rows: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {} });
+      }));
+      await api.groups({ limit: 1 }, 'day');
+      await api.groups({ limit: 1 }, 'month');
+      await api.groups({ limit: 1, timezone: 'Europe/London' }, 'day');
+      expect(await requests[0]!.json()).not.toHaveProperty('timezone');
+      expect(await requests[1]!.json()).toMatchObject({ timezone: 'America/Chicago' });
+      expect(await requests[2]!.json()).toMatchObject({ timezone: 'Europe/London' });
+      for (const dimension of ['month', 'year', 'participant'] as const) {
+        await api.groups({ limit: 1 }, dimension);
+        await api.fileGroups({ limit: 1 }, '', [], dimension);
+        const grouped = requests.splice(3);
+        expect(grouped).toHaveLength(2);
+        for (const request of grouped) {
+          expect((await request.json()).sort).toEqual(dimension === 'participant' ? undefined : [{ field: 'key', direction: 'desc' }]);
+        }
+      }
+    } finally { vi.unstubAllEnvs(); }
   });
 
   it('routes grouped Files exclusively through the file population with file constraints', async () => {
@@ -147,6 +175,19 @@ describe('ExploreAPI routing', () => {
       predicate: { filters: [{ dimension: 'source', values: ['7'] }], presentation: 'table', limit: 500 },
       filename_query: 'invoice', mime_families: ['pdf'], grouping: ['participant'], limit: 500
     });
+  });
+
+  it('preserves full-text warnings in entry and grouped results', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({
+      rows: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {},
+      warnings: ['OR was matched as a literal word; use " | " between alternatives.']
+    }));
+    const api = createExploreAPI(createAPIClient(fetchFn));
+    const predicate = { query: 'alpha OR beta', search_mode: 'full_text' as const, filters: [], presentation: 'table' as const, limit: 500 };
+    const entries = await api.explore(predicate);
+    const groups = await api.groups(predicate, 'source');
+    expect(entries.status === 'ready' && entries.result.warnings).toHaveLength(1);
+    expect(groups.status === 'ready' && groups.result.warnings).toHaveLength(1);
   });
 
   it('preserves the declared active-only deletion scope for entry and grouped results', async () => {

@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-10-06"
+last_edited: "2026-10-29"
 title: CardDAV Contacts
 description: Bring address-book contacts into msgvault, publish selected profiles, and resolve competing edits.
 ---
@@ -14,7 +14,7 @@ connections. Publishing, unpublishing, and choosing the local side of a conflict
 
 ## Connect an address book
 
-In the Web UI, open **Settings → CardDAV account** to test and save a connection.
+In the Web UI, open **Settings → Contacts** to test and save a connection.
 Select an existing connection or choose **Add connection** for another account.
 The CLI can discover the same accounts:
 
@@ -69,9 +69,35 @@ account API cannot grant private network access. After changing this local
 policy, restart the daemon or test and save the account again. Keep the config
 file readable only by the daemon's operator.
 
+## iCloud Contacts
+
+Connect with your Apple Account email and an app-specific password:
+
+```bash
+msgvault add-carddav --icloud you@example.com --schedule "*/30 * * * *"
+```
+
+The command prompts for the app-specific password. In the Web UI, use
+`https://contacts.icloud.com/` as the server URL with the same email and password.
+Msgvault discovers Apple's contacts partition and saves that partition as the
+connection's credential origin. Only HTTPS Apple contacts partitions on port
+443 can be selected by this bootstrap; other servers keep same-origin discovery.
+
+Before syncing an iCloud connection, msgvault checks the saved partition. If
+that host is unavailable, it rediscovers through Apple's published URL.
+If Apple has moved the account, msgvault keeps the saved connection and asks
+you to reconnect with `add-carddav --icloud`. Review address-book choices,
+published contacts and conflicts first. Reconnecting replaces the previous
+connection and can retire imported contact identities. A failed preflight
+returns an error without starting a sync run, so the latest sync-history row
+can remain an earlier successful run.
+
+Reconnect connections previously configured with a partition URL using
+`--icloud` to enable partition rediscovery.
+
 ## Google Contacts
 
-Select **Google Contacts** under **Settings → CardDAV account → Provider**.
+Select **Google Contacts** under **Settings → Contacts → Provider**.
 Enter your Google account email and, if needed, the name of an OAuth app from
 `[oauth.apps]`. Google supplies the discovery URL; no password is needed.
 The contacts account and OAuth app are independent of your mail accounts.
@@ -169,7 +195,7 @@ deleted without a conflict; the contact stays in Outlook's Deleted Items.
 To sign in without saving a connection, run
 `msgvault carddav authorize-microsoft you@example.com`. Then save the
 connection with the **Microsoft 365 or Outlook.com** provider in
-**Settings → CardDAV account**. An existing connection keeps its schedule.
+**Settings → Contacts**. An existing connection keeps its schedule.
 
 Graph stores fewer fields than vCard. msgvault maps names, nickname, email
 addresses, phone numbers, organization, job title, postal addresses, a
@@ -257,12 +283,13 @@ unqualified sync fails as unavailable.
 
 Settings shows the selected connection's status, books and history, and its
 sync buttons run that connection. Switching connections clears unsaved account
-fields, passwords and pending test or sign-in results. Operations shows all
-connections' attributed runs and offers aggregate sync. Its action is disabled
-while any CardDAV run is active. Schedules, retry gates and run leases are
+fields, passwords and pending test or sign-in results. The sidebar status dot's
+**Past runs…** menu shows all connections' attributed runs; filter Kind to
+**CardDAV sync**. **Settings → Overview → Contacts → Sync now** runs an
+aggregate sync and is disabled while any CardDAV run is active. Schedules, retry gates and run leases are
 independent per connection.
 
-To publish a person, open their saved profile in **Directory** and turn on
+To publish a person, open their saved profile in **People**, choose **More actions → Publish to address book**, and turn on
 **Publish person to CardDAV**. A contact UID identifies that published person
 across syncs. Later profile changes are reconciled to the write target.
 Turning publication off removes the remote card while retaining the local
@@ -338,7 +365,7 @@ without publishing or resolving the conflict. Then run
 `POST /api/v1/carddav/conflicts/{id}/resolve` and `{"choice":"keep_local"}`.
 
 The preview route is the one CardDAV response that returns a raw vCard, and
-it can include Private Notes. The Directory UI directs you to the CLI review
+it can include Private Notes. The person’s **Publish to address book** action directs you to the CLI review
 commands when approval is required.
 
 ### Recover a connection removed from config

@@ -310,7 +310,7 @@ func (c *Client) selectBatchMailbox(
 	items []batchFetchItem,
 	results []gmailapi.RawMessageBatchResult,
 ) (bool, error) {
-	err := c.selectMailbox(mailbox)
+	err := c.selectMailbox(ctx, mailbox)
 	if err == nil {
 		return true, nil
 	}
@@ -319,7 +319,7 @@ func (c *Client) selectBatchMailbox(
 		if reconErr := c.reconnect(ctx); reconErr != nil {
 			return false, fmt.Errorf("reconnect failed fetching mailbox %q: %w", mailbox, reconErr)
 		}
-		err = c.selectMailbox(mailbox)
+		err = c.selectMailbox(ctx, mailbox)
 		if err == nil {
 			return true, nil
 		}
@@ -341,7 +341,7 @@ func (c *Client) fetchChunk(
 	uidSet imap.UIDSet,
 	fetchOpts *imap.FetchOptions,
 ) (msgs []*imapclient.FetchMessageBuffer, fatal bool, err error) {
-	msgs, err = c.conn.Fetch(uidSet, fetchOpts).Collect()
+	msgs, err = c.fetchCommand(ctx, uidSet, fetchOpts)
 	if err == nil {
 		return msgs, false, nil
 	}
@@ -353,11 +353,11 @@ func (c *Client) fetchChunk(
 	if reconErr := c.reconnect(ctx); reconErr != nil {
 		return nil, true, fmt.Errorf("reconnect failed fetching chunk in mailbox %q: %w", mailbox, reconErr)
 	}
-	if selErr := c.selectMailbox(mailbox); selErr != nil {
+	if selErr := c.selectMailbox(ctx, mailbox); selErr != nil {
 		c.logger.Warn("mailbox reselect failed after reconnect", "mailbox", mailbox, "error", selErr)
 		return nil, true, selErr
 	}
-	msgs, err = c.conn.Fetch(uidSet, fetchOpts).Collect()
+	msgs, err = c.fetchCommand(ctx, uidSet, fetchOpts)
 	if err != nil {
 		c.logger.Warn("UID FETCH failed after reconnect", "mailbox", mailbox, "error", err)
 		return nil, false, fmt.Errorf("UID FETCH after reconnect in mailbox %q: %w", mailbox, err)
@@ -465,7 +465,7 @@ func (c *Client) fetchMailboxBatch(
 				return fatalErr
 			}
 		}
-		c.markOmittedOutcome(mailbox, omitted,
+		c.markOmittedOutcome(ctx, mailbox, omitted,
 			func(item batchFetchItem, err error) { results[item.idx].Err = err })
 	}
 	return nil
@@ -531,6 +531,7 @@ func (c *Client) recheckOmittedRaw(
 // rather than an absence, which holds the commit back instead of acting on a
 // guess.
 func (c *Client) confirmOmittedPresent(
+	ctx context.Context,
 	mailbox string, omitted []imap.UID,
 ) (map[imap.UID]bool, error) {
 	present := make(map[imap.UID]bool, len(omitted))
@@ -542,8 +543,7 @@ func (c *Client) confirmOmittedPresent(
 	for _, uid := range omitted {
 		uidSet.AddNum(uid)
 	}
-	searchData, err := c.conn.UIDSearch(
-		&imap.SearchCriteria{UID: []imap.UIDSet{uidSet}}, nil).Wait()
+	searchData, err := c.searchCommand(ctx, &imap.SearchCriteria{UID: []imap.UIDSet{uidSet}})
 	if err != nil {
 		c.logger.Warn("could not confirm UIDs missing from a FETCH response",
 			"mailbox", mailbox, "uids", len(omitted), "error", err)
@@ -562,6 +562,7 @@ func (c *Client) confirmOmittedPresent(
 // UIDs no FETCH response returned, and forgets the membership observed during
 // enumeration for the ones the mailbox no longer reports.
 func (c *Client) markOmittedOutcome(
+	ctx context.Context,
 	mailbox string,
 	omitted []batchFetchItem,
 	setErr func(item batchFetchItem, err error),
@@ -570,7 +571,7 @@ func (c *Client) markOmittedOutcome(
 	for i, item := range omitted {
 		uids[i] = item.uid
 	}
-	present, searchErr := c.confirmOmittedPresent(mailbox, uids)
+	present, searchErr := c.confirmOmittedPresent(ctx, mailbox, uids)
 	for _, item := range omitted {
 		switch {
 		case searchErr != nil:
@@ -715,7 +716,7 @@ func (c *Client) selectLabelBatchMailbox(
 	items []batchFetchItem,
 	results []gmailapi.MessageLabelsBatchResult,
 ) (bool, error) {
-	err := c.selectMailbox(mailbox)
+	err := c.selectMailbox(ctx, mailbox)
 	if err == nil {
 		return true, nil
 	}
@@ -725,7 +726,7 @@ func (c *Client) selectLabelBatchMailbox(
 		if reconErr := c.reconnect(ctx); reconErr != nil {
 			return false, fmt.Errorf("reconnect failed fetching labels from mailbox %q: %w", mailbox, reconErr)
 		}
-		err = c.selectMailbox(mailbox)
+		err = c.selectMailbox(ctx, mailbox)
 		if err == nil {
 			return true, nil
 		}
@@ -779,7 +780,7 @@ func (c *Client) fetchMailboxLabelBatch(
 				return fatalErr
 			}
 		}
-		c.markOmittedOutcome(mailbox, omitted,
+		c.markOmittedOutcome(ctx, mailbox, omitted,
 			func(item batchFetchItem, err error) { results[item.idx].Err = err })
 	}
 	return nil

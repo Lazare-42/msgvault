@@ -105,11 +105,11 @@ func configureDocbankAttachmentJob(
 		if destination == "" {
 			return nil
 		}
-		client, err := docbankmedia.NewClient(strings.TrimRight(strings.TrimSpace(cfg.URL), "/"), cfg.ResolveAPIKey)
+		client, err := docbankmedia.NewClient(strings.TrimRight(strings.TrimSpace(cfg.URL), "/"), cfg.ResolveAPIKey, docbankmedia.WithTrustPrivateNetwork(cfg.TrustPrivateNetwork))
 		if err != nil {
 			return err
 		}
-		options := beeper.AttachmentMirrorOptions{URL: cfg.URL, Folder: cfg.MirrorFolder(), AttachmentsDir: attachmentsDir}
+		options := beeper.AttachmentMirrorOptions{URL: cfg.URL, Folder: cfg.MirrorFolder(), AttachmentsDir: attachmentsDir, DocumentProfile: cfg.DocumentProfile}
 		mirror := beeper.NewAttachmentMirror(st, blobs, client, destination, options).
 			WithOperationGate(beeperMediaGate(gate, docbankAttachmentGateLabel))
 		return sched.AddJob(scheduler.Job{
@@ -198,7 +198,7 @@ func addBeeperMediaRoute(
 func docbankMediaClient(
 	ctx context.Context, st *store.Store, cfg config.DocbankIntegrationConfig,
 ) (*docbankmedia.Client, string, error) {
-	client, err := docbankmedia.NewClient(cfg.URL, cfg.ResolveAPIKey)
+	client, err := docbankmedia.NewClient(cfg.URL, cfg.ResolveAPIKey, docbankmedia.WithTrustPrivateNetwork(cfg.TrustPrivateNetwork))
 	if err != nil {
 		return nil, "", err
 	}
@@ -232,7 +232,7 @@ func docbankAttachmentDestinationKey(endpoint, archiveUID, folder string) string
 	return "attachments:" + hex.EncodeToString(digest[:])
 }
 
-func newDocbankAttachmentReader(ctx context.Context, st *store.Store, cfg config.DocbankIntegrationConfig) (*api.DocbankAttachmentReader, error) {
+func newDocbankAttachmentReader(ctx context.Context, st *store.Store, cfg config.DocbankIntegrationConfig, client *docbankmedia.Client) (*api.DocbankAttachmentReader, error) {
 	if !cfg.Enabled || !cfg.AttachmentUploadConsent {
 		return nil, nil //nolint:nilnil // a nil reader means attachment mirroring is off; callers branch on it
 	}
@@ -240,7 +240,7 @@ func newDocbankAttachmentReader(ctx context.Context, st *store.Store, cfg config
 	if err != nil {
 		return nil, err
 	}
-	return &api.DocbankAttachmentReader{Store: st, Destination: destination, Folder: cfg.MirrorFolder()}, nil
+	return &api.DocbankAttachmentReader{Store: st, Client: client, Destination: destination, Folder: cfg.MirrorFolder(), SearchProfile: cfg.AttachmentSearchProfile}, nil
 }
 
 func docbankAttachmentDestination(ctx context.Context, st *store.Store, cfg config.DocbankIntegrationConfig) (string, error) {

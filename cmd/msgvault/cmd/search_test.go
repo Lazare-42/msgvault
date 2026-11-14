@@ -292,6 +292,42 @@ func TestSearchCmd_MessageTypeFlagForwardsToRemoteMode(t *testing.T) {
 	assert.Equal(t, "lunch", gotQuery, "remote query should keep search terms")
 }
 
+func TestSearchCmd_MessageTypeFlagAcceptsImportedTypes(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	defer resetSearchFlags()
+
+	var gotType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotType = r.URL.Query().Get("message_type")
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(json.NewEncoder(w).Encode(map[string]any{"results": []map[string]any{}}), "write response")
+	}))
+	defer srv.Close()
+
+	run := func(messageType string) error {
+		resetSearchFlags()
+		cfg := &config.Config{}
+		cfg.Remote.URL = srv.URL
+		cfg.Remote.AllowInsecure = true
+		root := newTestRootCmd()
+		root.SetContext(testInvocationContext(t.Context(), cfg, invocationOptions{}))
+		root.AddCommand(searchCmd)
+		root.SetArgs([]string{"search", "--message-type", messageType, "release"})
+		return root.Execute()
+	}
+
+	// A type no list in msgvault knows: imports choose their own.
+	require.NoError(run("bookmark"), "an imported type should be forwarded")
+	assert.Equal("bookmark", gotType, "message_type query")
+
+	gotType = ""
+	err := run("Feed-Item")
+	require.Error(err, "a malformed type should fail before the request")
+	assert.Contains(err.Error(), `invalid --message-type: "Feed-Item"`)
+	assert.Empty(gotType, "no request for a malformed type")
+}
+
 func TestSearchCmd_DeletionScopeForwardsToRemoteFTS(t *testing.T) {
 	cfg := testConfigValue()
 	useLocal := false
@@ -405,6 +441,7 @@ func TestSearchCmd_FTSUsesLocalDaemonHTTPAndPreservesJSONOutput(t *testing.T) {
 
 	assert.Equal(1, int(searchRequests.Load()), "search endpoint calls")
 	assert.Contains(out, `"subject": "Lunch"`, "JSON output should preserve local result shape")
+	assert.Contains(out, `"hidden_text_present": true`)
 	assert.NotContains(out, `"total"`, "local JSON search output is a bare result array")
 }
 
@@ -500,6 +537,7 @@ func searchHTTPDaemon(t *testing.T) (*httptest.Server, *atomic.Int32) {
 				"conversation_id": 7,
 				"subject": "Lunch",
 				"snippet": "see you there",
+				"hidden_text_present": true,
 				"from_email": "alice@example.com",
 				"sent_at": "2024-01-02T03:04:05Z",
 				"size_estimate": 123,
@@ -532,7 +570,7 @@ func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
 		{
 			name:       "unverified check warns",
 			indexState: "unverified",
-			wantNote:   "could not be verified for this request; results may be incomplete. Search again to retry the check, or run rebuild-fts.",
+			wantNote:   "couldn't check the text-search index, so results may miss messages. Search again or run msgvault rebuild-fts.",
 		},
 		{
 			name:       "building warns about rebuilding or awaiting rebuild",
@@ -633,9 +671,9 @@ func TestSearchCmd_AccountFlagWithoutQuery(t *testing.T) {
 	require.NoError(err, "create source 1")
 	src2, err := s.GetOrCreateSource("gmail", "bob@example.com")
 	require.NoError(err, "create source 2")
-	conv1, err := s.EnsureConversation(src1.ID, "c1", "")
+	conv1, err := s.EnsureConversation(t.Context(), src1.ID, "c1", "")
 	require.NoError(err, "create conv 1")
-	conv2, err := s.EnsureConversation(src2.ID, "c2", "")
+	conv2, err := s.EnsureConversation(t.Context(), src2.ID, "c2", "")
 	require.NoError(err, "create conv 2")
 	_, err = s.UpsertMessage(&store.Message{
 		SourceID: src1.ID, ConversationID: conv1,
@@ -701,7 +739,7 @@ func TestSearchCmd_MessageTypeFlagScopesResults(t *testing.T) {
 	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	src, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
-	emailConv, err := s.EnsureConversation(src.ID, "email-thread", "")
+	emailConv, err := s.EnsureConversation(t.Context(), src.ID, "email-thread", "")
 	require.NoError(err, "create email conversation")
 	calendarConv, err := s.EnsureConversationWithType(src.ID, "calendar-thread", "calendar_event", "")
 	require.NoError(err, "create calendar conversation")
@@ -793,7 +831,7 @@ func TestSearchCmd_AccountFlagDoesNotLeakAcrossInvocations(t *testing.T) {
 	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	src, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
-	conv, err := s.EnsureConversation(src.ID, "c1", "")
+	conv, err := s.EnsureConversation(t.Context(), src.ID, "c1", "")
 	require.NoError(err, "create conv")
 	_, err = s.UpsertMessage(&store.Message{
 		SourceID: src.ID, ConversationID: conv,
@@ -894,9 +932,9 @@ func TestSearchCmd_CollectionFlagScopesResults(t *testing.T) {
 	require.NoError(err, "create source 1")
 	src2, err := s.GetOrCreateSource("gmail", "bob@example.com")
 	require.NoError(err, "create source 2")
-	conv1, err := s.EnsureConversation(src1.ID, "c1", "")
+	conv1, err := s.EnsureConversation(t.Context(), src1.ID, "c1", "")
 	require.NoError(err, "create conv 1")
-	conv2, err := s.EnsureConversation(src2.ID, "c2", "")
+	conv2, err := s.EnsureConversation(t.Context(), src2.ID, "c2", "")
 	require.NoError(err, "create conv 2")
 	_, err = s.UpsertMessage(&store.Message{
 		SourceID: src1.ID, ConversationID: conv1,
@@ -1056,6 +1094,20 @@ func TestOutputSearchResultsJSONShowsDeletedFromSourceOnlyWhenPresent(t *testing
 	require.Len(got, 2)
 	assert.Equal("2026-08-17T18:19:46Z", got[0]["deleted_from_source_at"])
 	assert.NotContains(got[1], "deleted_from_source_at")
+}
+
+func TestOutputSearchResultsJSONHiddenTextPresent(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	done := captureStdout(t)
+	require.NoError(outputSearchResultsJSON([]query.MessageSummary{
+		{ID: 1, HiddenTextPresent: true},
+		{ID: 2},
+	}))
+	var rows []map[string]any
+	require.NoError(json.Unmarshal([]byte(done()), &rows))
+	require.Len(rows, 2)
+	assert.Equal(true, rows[0]["hidden_text_present"])
+	assert.Equal(false, rows[1]["hidden_text_present"])
 }
 
 // Zero-match searches in --json mode must emit a valid empty JSON

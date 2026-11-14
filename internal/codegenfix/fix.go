@@ -128,6 +128,11 @@ func RewriteGeneratedValidators(source []byte) ([]byte, error) {
 	}
 	// Required strings a response may send empty keep presence but lose their non-empty check.
 	for _, target := range [][3]string{
+		{"Attendee", "Email", "a"},
+		{"Attendee", "DisplayName", "a"},
+		{"CalendarOccurrence", "StartDate", "c"},
+		{"CalendarOccurrence", "EndDate", "c"},
+		{"CalendarOccurrence", "Subject", "c"},
 		{"ExploreCacheUnavailableResponse", "RecoveryAction", "e"},
 		{"Evidence", "Excerpt", "e"},
 		{"ContactCandidate", "DisplayName", "c"},
@@ -136,6 +141,9 @@ func RewriteGeneratedValidators(source []byte) ([]byte, error) {
 		{"MessagingRoute", "NetworkLabel", "m"},
 		{"MessagingRoute", "ProviderChatID", "m"},
 		{"PersonMessagingRoutesPage", "AliasReason", "p"},
+		{"LoopCounterparty", "DisplayName", "l"},
+		{"LoopCounterparty", "Address", "l"},
+		{"LoopItem", "Summary", "l"},
 	} {
 		typeName, field, receiver := target[0], target[1], target[2]
 		shapeErr := fmt.Errorf("generated %s.%s validator shape changed", typeName, field)
@@ -155,7 +163,11 @@ func RewriteGeneratedValidators(source []byte) ([]byte, error) {
 			rewritten := bytes.Replace(validator, required, nil, 1)
 			result = append(append(append([]byte(nil), result[:start]...), rewritten...), result[end:]...)
 		case 0:
-			if !regexp.MustCompile(`\b` + field + `\s+string\b`).Match(result) {
+			// Types without other validators check required fields through struct tags.
+			tagged := regexp.MustCompile(`(?m)(^type ` + typeName + ` struct \{\n(?:\t[^\n]*\n)*?\t` + field + `\s+string\s+` + "`" + `json:"[^"]+")\s+validate:"required"` + "`")
+			if loc := tagged.FindSubmatchIndex(result); loc != nil {
+				result = append(append(append([]byte(nil), result[:loc[3]]...), '`'), result[loc[1]:]...)
+			} else if !regexp.MustCompile(`\b` + field + `\s+string\b`).Match(result) {
 				return nil, shapeErr
 			}
 		default:

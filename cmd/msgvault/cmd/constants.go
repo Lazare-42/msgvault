@@ -14,6 +14,7 @@ const (
 	sourceTypeBeeper         = "beeper"
 	sourceTypeMatrix         = "matrix"
 	sourceTypeSlack          = "slack"
+	sourceTypeInline         = "inline"
 	sourceTypeSlackdump      = "slackdump"
 	sourceTypeGranola        = "granola"
 	sourceTypeCircleback     = "circleback"
@@ -22,6 +23,7 @@ const (
 	sourceTypeTwilio         = "twilio"
 	sourceTypeMuesli         = "muesli"
 	sourceTypeTwenty         = "twenty"
+	sourceTypeAppleMessages  = "apple_messages"
 )
 
 // Analytics dataset / SQLite table names: the Parquet subdirectory under

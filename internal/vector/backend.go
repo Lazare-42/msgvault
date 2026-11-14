@@ -5,6 +5,7 @@ import (
 	"errors"
 	"time"
 
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/search"
 )
 
@@ -15,6 +16,50 @@ type GenerationID int64
 // inputs. Providers may partially complete only a leading document prefix.
 type DocumentInput struct {
 	Chunks []string
+}
+
+// DocumentEmbedder embeds documents in one or more provider requests and
+// returns the completed leading document prefix with any error.
+type DocumentEmbedder interface {
+	EmbedDocuments(ctx context.Context, documents []DocumentInput) ([][][]float32, error)
+}
+
+// DocumentRequestEmbedder reports each packed request before dispatch and after completion.
+type DocumentRequestEmbedder interface {
+	DocumentEmbedder
+	EmbedDocumentRequests(ctx context.Context, documents []DocumentInput, started func(first, count int), completed DocumentRequestFunc) error
+}
+
+// DocumentRequestFunc receives one completed provider request: the index of
+// its first document and its documents' vectors. An error stops the requests
+// that remain.
+type DocumentRequestFunc func(first int, vectors [][][]float32) error
+
+// EmbedDocumentRequests calls started before dispatch, then passes each response to completed
+// before the next request is sent, so the caller can save it first. A
+// provider that does not expose its requests reports its completed prefix once.
+func EmbedDocumentRequests(
+	ctx context.Context, embedder DocumentEmbedder, documents []DocumentInput, started func(first, count int), completed DocumentRequestFunc,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if jobctx.PreemptionRequested(ctx) {
+		return jobctx.ErrYieldedToWaiter
+	}
+	if requests, ok := embedder.(DocumentRequestEmbedder); ok {
+		return requests.EmbedDocumentRequests(ctx, documents, started, completed)
+	}
+	if started != nil {
+		started(0, len(documents))
+	}
+	vectors, err := embedder.EmbedDocuments(ctx, documents)
+	if len(vectors) > 0 {
+		if completedErr := completed(0, vectors); completedErr != nil {
+			return errors.Join(completedErr, err)
+		}
+	}
+	return err
 }
 
 // SourceBasis identifies the source text used for chunk offsets.
@@ -172,17 +217,12 @@ type Chunk struct {
 }
 
 // Filter carries the structured filters pushed into both signal CTEs
-// in hybrid search. Values are pre-resolved to IDs at the Go layer
-// (addresses → participant IDs, labels → label IDs) so backend code
-// only deals in integers.
+// in hybrid search. Sender terms remain values; recipient addresses and labels
+// resolve to IDs at the Go layer.
 //
-// Semantics match the existing SQLite search path (internal/store/api.go,
-// internal/query/sqlite.go): each repeated same-field operator becomes
-// its own AND'd EXISTS clause at the message level, so a query like
-// `from:alice from:bob` requires the message to have one `from`
-// participant matching "alice" AND another (or the same) matching
-// "bob". Within a group, IDs are OR'd (any matching participant
-// satisfies the group); across groups they are AND'd.
+// SenderTerms require each from: value to match sender metadata. Other repeated
+// operators use independent message-level requirements; ID groups are OR within
+// each group and AND across groups.
 //
 //   - Sender/SenderExact/RecipientAny/To/Cc/Bcc/LabelGroups are AND-of-OR groups: each inner
 //     slice is one search-token resolution (substring → matching IDs).
@@ -209,7 +249,9 @@ type Filter struct {
 	MessageIDs         []int64   // exact bounded candidate population; empty = unrestricted
 	SourceIDs          []int64   // from [server/sources].identifier; empty = no source filter
 	ConversationIDs    []int64   // exact messages.conversation_id values; empty = unrestricted
-	SenderGroups       [][]int64 // one inner slice per `from:` token; AND across, OR within
+	SenderTerms        []string  // each normalized from: value; message and participant metadata
+	SenderDomain       string    // exact domain on a from row
+	SenderGroups       [][]int64 // structured domain selections; AND across, OR within
 	SenderExactGroups  [][]int64 // exact structured sender; from rows OR messages.sender_id
 	RecipientAnyGroups [][]int64 // exact structured recipient; to/cc/bcc rows are OR'd
 	ToGroups           [][]int64 // one inner slice per `to:` token; AND across, OR within
@@ -235,6 +277,8 @@ func (f Filter) IsEmpty() bool {
 	return len(f.AccountScopes) == 0 && len(f.MessageIDs) == 0 &&
 		len(f.SourceIDs) == 0 &&
 		len(f.ConversationIDs) == 0 &&
+		len(f.SenderTerms) == 0 &&
+		f.SenderDomain == "" &&
 		len(f.SenderGroups) == 0 &&
 		len(f.SenderExactGroups) == 0 &&
 		len(f.RecipientAnyGroups) == 0 &&
@@ -322,8 +366,17 @@ type Stats struct {
 	StorageBytes int64
 }
 
+// BuildScopeBackend can pin coverage gates to a new scope over shared storage.
+// The original backend retains ownership of the shared storage handle.
+type BuildScopeBackend interface {
+	Backend
+	WithBuildScope(scope BuildScope) Backend
+}
+
 // Backend is the minimum contract a vector store must implement.
 type Backend interface {
+	EmbeddingCheckpoints() EmbeddingCheckpoints
+
 	// CreateGeneration starts (or resumes) a building generation.
 	// fingerprint is stored verbatim on the row; pass
 	// Config.GenerationFingerprint() so a later config change (model,
@@ -408,7 +461,10 @@ type Backend interface {
 // SearchMetadata reports bounded-search behavior that cannot be inferred from
 // result length. Exact backends may omit this optional capability.
 type SearchMetadata struct {
-	PoolSaturated bool
+	// CandidatePoolOmitted reports an eligible identity outside the retained
+	// union after a retrieval method actually exceeded KPerSignal.
+	CandidatePoolOmitted bool
+	PoolSaturated        bool
 	// Accelerator identifies the SQLite retrieval path: vec1_ivf_opq,
 	// exact-filter, exact, or exact-fallback. Other backends leave it empty.
 	Accelerator string

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -11,6 +10,17 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/identityindex"
 )
+
+type identityCacheFixtureOptions struct {
+	unsentMessages string
+}
+
+func identityFixtureProjection(dataset string) string {
+	if dataset == "message_recipients" {
+		return "*, NULL::VARCHAR AS email_address, false AS is_relayed"
+	}
+	return "*"
+}
 
 // ensureIdentityCacheFixtureDatasets keeps hand-built API fixtures compatible
 // with the current cache contract by deriving the identity datasets from
@@ -22,20 +32,23 @@ func ensureIdentityCacheFixtureDatasets(
 	tb testing.TB,
 	db *sql.DB,
 	analyticsDir string,
+	options identityCacheFixtureOptions,
 ) {
 	tb.Helper()
 	personDisplayNamesDir := filepath.Join(analyticsDir, "person_display_names")
 	require.NoError(tb, os.MkdirAll(personDisplayNamesDir, 0o755), "create person_display_names fixture directory")
 	personDisplayNamesPath := filepath.ToSlash(filepath.Join(personDisplayNamesDir, "person_display_names.parquet"))
-	_, err := db.Exec(fmt.Sprintf(
+	_, err := db.ExecContext(tb.Context(), fmt.Sprintf(
 		"COPY (SELECT 0::BIGINT AS participant_id, 0::BIGINT AS person_id, ''::VARCHAR AS display_name WHERE false) TO '%s' (FORMAT PARQUET)",
 		personDisplayNamesPath,
 	))
 	require.NoError(tb, err, "write empty person_display_names fixture dataset")
-	_, err = identityindex.Build(context.Background(), db, identityindex.BuildOptions{
+	buildOptions := identityindex.BuildOptions{
 		Mode:           identityindex.ModeFull,
 		StagedBaseRoot: analyticsDir,
 		OutputRoot:     analyticsDir,
-	})
+		UnsentMessages: options.unsentMessages,
+	}
+	_, err = identityindex.Build(tb.Context(), db, buildOptions)
 	require.NoError(tb, err, "derive identity fixture datasets")
 }

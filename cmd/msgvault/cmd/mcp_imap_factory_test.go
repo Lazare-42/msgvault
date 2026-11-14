@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"io"
@@ -32,7 +31,7 @@ func startMemIMAPServer(t *testing.T, username, password string) int {
 	require.NoError(t, user.Create("Drafts", nil))
 	memServer.AddUser(user)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
 	server := imapserver.New(&imapserver.Options{
@@ -83,7 +82,7 @@ func TestBuildIMAPAPIClient(t *testing.T) {
 		require.NoError(t, err)
 		defer func() { assert.NoError(t, client.Close()) }()
 
-		labels, err := client.ListLabels(context.Background())
+		labels, err := client.ListLabels(t.Context())
 		require.NoError(t, err)
 		names := make([]string, 0, len(labels))
 		for _, l := range labels {

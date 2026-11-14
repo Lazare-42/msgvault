@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -10,6 +9,7 @@ import (
 )
 
 func TestIdentityActivityPreservesNonChatConversationEdgeSemantics(t *testing.T) {
+	t.Parallel()
 	requirementsForTest := require.New(t)
 	builder := NewTestDataBuilder(t)
 	sourceID := builder.AddSourceWithType("archive@example.com", "gmail")
@@ -36,18 +36,18 @@ func TestIdentityActivityPreservesNonChatConversationEdgeSemantics(t *testing.T)
 		}},
 		Page: PageSpec{Limit: 25},
 	}
-	people, err := engine.SearchPeople(context.Background(), request)
+	people, err := engine.SearchPeople(t.Context(), request)
 	requirementsForTest.NoError(err)
 	requirementsForTest.Len(people.Rows, 1)
 	assert.Equal(t, direct, people.Rows[0].ID,
 		"conversation membership qualifies the fact filter but not non-chat people fan-out")
 	engine.identityCandidateFastPathDisabled = true
-	logicalPeople, err := engine.SearchPeople(context.Background(), request)
+	logicalPeople, err := engine.SearchPeople(t.Context(), request)
 	requirementsForTest.NoError(err)
 	assert.Equal(t, logicalPeople, people)
 	engine.identityCandidateFastPathDisabled = false
 
-	domains, err := engine.SearchDomains(context.Background(), DomainSearchRequest{
+	domains, err := engine.SearchDomains(t.Context(), DomainSearchRequest{
 		Explore: ExploreRequest{Context: Context{
 			ParticipantIDs: []int64{conversationOnly},
 		}},
@@ -63,6 +63,7 @@ func TestIdentityActivityPreservesNonChatConversationEdgeSemantics(t *testing.T)
 }
 
 func TestUnfilteredIdentityIndexMatchesLegacyPeopleAndDomains(t *testing.T) {
+	t.Parallel()
 	requirementsForTest := require.New(t)
 	builder := NewTestDataBuilder(t)
 	mailSource := builder.AddSourceWithType("archive-a@example.com", "gmail")
@@ -89,13 +90,14 @@ func TestUnfilteredIdentityIndexMatchesLegacyPeopleAndDomains(t *testing.T) {
 		Sort: SortSpec{Field: "display_label", Direction: "asc"},
 		Page: PageSpec{Limit: 25},
 	}
-	gotPeople, err := engine.SearchPeople(context.Background(), peopleRequest)
+	gotPeople, err := engine.SearchPeople(t.Context(), peopleRequest)
 	requirementsForTest.NoError(err)
 	wantPeople, err := engine.searchPeopleLegacy(
-		context.Background(),
+		t.Context(),
 		peopleRequest,
 		nil,
 		nil,
+		false,
 	)
 	requirementsForTest.NoError(err)
 	assert.Equal(t, wantPeople, gotPeople)
@@ -104,10 +106,10 @@ func TestUnfilteredIdentityIndexMatchesLegacyPeopleAndDomains(t *testing.T) {
 		Sort: SortSpec{Field: "display_label", Direction: "asc"},
 		Page: PageSpec{Limit: 25},
 	}
-	gotDomains, err := engine.SearchDomains(context.Background(), domainRequest)
+	gotDomains, err := engine.SearchDomains(t.Context(), domainRequest)
 	requirementsForTest.NoError(err)
 	wantDomains, err := engine.searchDomainsLegacy(
-		context.Background(),
+		t.Context(),
 		domainRequest,
 		"",
 	)
@@ -116,6 +118,7 @@ func TestUnfilteredIdentityIndexMatchesLegacyPeopleAndDomains(t *testing.T) {
 }
 
 func TestSourceOnlyPeopleRollupFastPathMatchesLogicalReduction(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	builder := NewTestDataBuilder(t)
@@ -159,10 +162,10 @@ func TestSourceOnlyPeopleRollupFastPathMatchesLogicalReduction(t *testing.T) {
 		Sort: SortSpec{Field: "display_label", Direction: "asc"},
 		Page: PageSpec{Limit: 25},
 	}
-	fast, err := engine.SearchPeople(context.Background(), request)
+	fast, err := engine.SearchPeople(t.Context(), request)
 	requirements.NoError(err)
 	engine.sourceRollupFastPathDisabled = true
-	logical, err := engine.SearchPeople(context.Background(), request)
+	logical, err := engine.SearchPeople(t.Context(), request)
 	requirements.NoError(err)
 
 	assertions.Equal(logical, fast)
@@ -175,6 +178,7 @@ func TestSourceOnlyPeopleRollupFastPathMatchesLogicalReduction(t *testing.T) {
 }
 
 func TestIdentityActivityAppliesFactFilters(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	builder := NewTestDataBuilder(t)
@@ -221,7 +225,7 @@ func TestIdentityActivityAppliesFactFilters(t *testing.T) {
 	)
 	engine := builder.BuildEngine()
 
-	response, err := engine.SearchPeople(context.Background(), PersonSearchRequest{
+	response, err := engine.SearchPeople(t.Context(), PersonSearchRequest{
 		Explore: ExploreRequest{
 			Context: Context{
 				SourceIDs:    []int64{selectedSource},
@@ -249,6 +253,7 @@ func TestIdentityActivityAppliesFactFilters(t *testing.T) {
 }
 
 func TestIdentityActivityDeletionScopesMatchLegacyPeopleAndDomains(t *testing.T) {
+	t.Parallel()
 	requirementsForTest := require.New(t)
 	builder := NewTestDataBuilder(t)
 	sourceID := builder.AddSourceWithType("archive@example.com", "gmail")
@@ -291,6 +296,7 @@ func TestIdentityActivityDeletionScopesMatchLegacyPeopleAndDomains(t *testing.T)
 			peopleRequest,
 			nil,
 			nil,
+			false,
 		)
 		requirementsForTest.NoError(err)
 		assert.Equal(t, wantPeople, gotPeople, deletion)
@@ -313,6 +319,7 @@ func TestIdentityActivityDeletionScopesMatchLegacyPeopleAndDomains(t *testing.T)
 }
 
 func TestIdentityActivityDateFiltersBindUTCWallClock(t *testing.T) {
+	t.Parallel()
 	assertionsForTest := assert.New(t)
 	zone := time.FixedZone("fixture-offset", -4*60*60)
 	after := time.Date(2026, 7, 20, 9, 30, 0, 0, zone)
@@ -327,6 +334,7 @@ func TestIdentityActivityDateFiltersBindUTCWallClock(t *testing.T) {
 }
 
 func TestIdentityCandidateNarrowingRetainsScalarFilters(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	builder := NewTestDataBuilder(t)
@@ -354,7 +362,7 @@ func TestIdentityCandidateNarrowingRetainsScalarFilters(t *testing.T) {
 		Deletion:       DeletionActive,
 	}}
 	narrowed, err := engine.narrowIdentityFactCandidates(
-		context.Background(),
+		t.Context(),
 		request,
 	)
 	requirements.NoError(err)
@@ -366,6 +374,7 @@ func TestIdentityCandidateNarrowingRetainsScalarFilters(t *testing.T) {
 }
 
 func TestIdentityCandidateNarrowingSaturationFallsBackExactly(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	builder := NewTestDataBuilder(t)
@@ -391,17 +400,17 @@ func TestIdentityCandidateNarrowingSaturationFallsBackExactly(t *testing.T) {
 	}
 
 	narrowed, err := engine.narrowIdentityFactCandidates(
-		context.Background(),
+		t.Context(),
 		request.Explore,
 	)
 	require.NoError(err)
 	assert.Nil(narrowed.Search.CandidateMessageIDs)
 	assert.Equal(request.Explore.Context.ParticipantIDs, narrowed.Context.ParticipantIDs)
 
-	saturatedFallback, err := engine.SearchPeople(context.Background(), request)
+	saturatedFallback, err := engine.SearchPeople(t.Context(), request)
 	require.NoError(err)
 	engine.identityCandidateFastPathDisabled = true
-	generic, err := engine.SearchPeople(context.Background(), request)
+	generic, err := engine.SearchPeople(t.Context(), request)
 	require.NoError(err)
 	assert.Equal(generic, saturatedFallback)
 }

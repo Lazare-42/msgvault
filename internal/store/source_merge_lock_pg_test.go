@@ -15,7 +15,8 @@ func TestMergeSourcesWithTwoPostgresConnections(t *testing.T) {
 	for _, dryRun := range []bool{true, false} {
 		t.Run(fmt.Sprintf("dry_run_%t", dryRun), func(t *testing.T) {
 			require := require.New(t)
-			st := newPGStoreInternal(t, skipUnlessPostgresInternal(t))
+			skipUnlessPostgresInternal(t)
+			st := newPGStoreInternal(t)
 			from, err := st.GetOrCreateSource("gmail", "history@example.test")
 			require.NoError(err)
 			into, err := st.GetOrCreateSource("gmail", "live@example.test")
@@ -51,10 +52,10 @@ func TestMergeSourcesWithTwoPostgresConnections(t *testing.T) {
 
 // waitForPostgresBlocker observes a real lock wait, not a scheduling delay.
 // Both cancellation and removal regressions use it to establish their race.
-func waitForPostgresBlocker(t *testing.T, db *sql.DB, blocker int) int {
-	t.Helper()
-	require := require.New(t)
-	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+func waitForPostgresBlocker(tb testing.TB, db *sql.DB, blocker int) int {
+	tb.Helper()
+	require := require.New(tb)
+	ctx, cancel := context.WithTimeout(tb.Context(), 10*time.Second)
 	defer cancel()
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -79,7 +80,8 @@ func TestSourceExecutionLifecycleCheckHonorsCancellation(t *testing.T) {
 		t.Run(fmt.Sprintf("merge_%t", merge), func(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
-			st := newPGStoreInternal(t, skipUnlessPostgresInternal(t))
+			skipUnlessPostgresInternal(t)
+			st := newPGStoreInternal(t)
 			from, err := st.GetOrCreateSource("gmail", "history@example.test")
 			require.NoError(err)
 			into, err := st.GetOrCreateSource("gmail", "live@example.test")
@@ -88,8 +90,8 @@ func TestSourceExecutionLifecycleCheckHonorsCancellation(t *testing.T) {
 			require.NoError(err)
 			defer func() { _ = blocker.Rollback() }()
 			var blockerPID int
-			require.NoError(blocker.QueryRow(`SELECT pg_backend_pid()`).Scan(&blockerPID))
-			_, err = blocker.Exec(`LOCK TABLE source_settings IN ACCESS EXCLUSIVE MODE`)
+			require.NoError(blocker.QueryRowContext(t.Context(), `SELECT pg_backend_pid()`).Scan(&blockerPID))
+			_, err = blocker.ExecContext(t.Context(), `LOCK TABLE source_settings IN ACCESS EXCLUSIVE MODE`)
 			require.NoError(err)
 			ctx, cancel := context.WithCancel(t.Context())
 			defer cancel()
@@ -130,7 +132,8 @@ func TestRemoveSourceRechecksMergeHistoryAfterIdentityLock(t *testing.T) {
 		t.Run(fmt.Sprintf("destination_%t", removeDestination), func(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
-			st := newPGStoreInternal(t, skipUnlessPostgresInternal(t))
+			skipUnlessPostgresInternal(t)
+			st := newPGStoreInternal(t)
 			from, err := st.GetOrCreateSource("gmail", "history@example.test")
 			require.NoError(err)
 			into, err := st.GetOrCreateSource("gmail", "live@example.test")
@@ -139,8 +142,8 @@ func TestRemoveSourceRechecksMergeHistoryAfterIdentityLock(t *testing.T) {
 			require.NoError(err)
 			defer func() { _ = blocker.Rollback() }()
 			var blockerPID int
-			require.NoError(blocker.QueryRow(`SELECT pg_backend_pid()`).Scan(&blockerPID))
-			_, err = blocker.Exec(`UPDATE source_maintenance_lock SET singleton = singleton WHERE singleton = 1`)
+			require.NoError(blocker.QueryRowContext(t.Context(), `SELECT pg_backend_pid()`).Scan(&blockerPID))
+			_, err = blocker.ExecContext(t.Context(), `UPDATE source_maintenance_lock SET singleton = singleton WHERE singleton = 1`)
 			require.NoError(err)
 			ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 			defer cancel()
@@ -173,13 +176,14 @@ func TestRemoveSourceRechecksMergeHistoryAfterIdentityLock(t *testing.T) {
 func TestExistingSourceLookupDoesNotWaitForMaintenance(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	st := newPGStoreInternal(t, skipUnlessPostgresInternal(t))
+	skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t)
 	source, err := st.GetOrCreateSource("gmail", "existing@example.test")
 	require.NoError(err)
 	blocker, err := st.DB().BeginTx(t.Context(), nil)
 	require.NoError(err)
 	defer func() { _ = blocker.Rollback() }()
-	_, err = blocker.Exec(`UPDATE source_maintenance_lock SET singleton = singleton WHERE singleton = 1`)
+	_, err = blocker.ExecContext(t.Context(), `UPDATE source_maintenance_lock SET singleton = singleton WHERE singleton = 1`)
 	require.NoError(err)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()

@@ -1,11 +1,40 @@
 package identityindex
 
-import "fmt"
+import (
+	"fmt"
+
+	"go.kenn.io/msgvault/internal/calevent"
+)
+
+// RoomDomainSQL matches a normalized domain against calendar resource domains.
+func RoomDomainSQL(col string) string {
+	return fmt.Sprintf("(%s = '%s' OR ends_with(%s, '.%s'))", col, calevent.RoomDomain, col, calevent.RoomDomain)
+}
+
+// CanonicalParticipantsSQL resolves participants through their identity clusters.
+// Its arguments are trusted SQL relations from the cache builder or query engine.
+func CanonicalParticipantsSQL(participants, clusters string) string {
+	return fmt.Sprintf(`SELECT p.id::BIGINT AS participant_id,
+	       coalesce(c.canonical_id, p.id)::BIGINT AS canonical_id,
+	       lower(coalesce(p.domain, ''))::VARCHAR AS participant_domain
+	FROM %s p LEFT JOIN %s c ON c.participant_id = p.id
+	WHERE NOT %s OR c.canonical_id IN (SELECT hc.canonical_id FROM %s h JOIN %s hc ON hc.participant_id = h.id WHERE NOT %s)`, participants, clusters, RoomDomainSQL("lower(coalesce(p.domain, ''))"), participants, clusters, RoomDomainSQL("lower(coalesce(h.domain, ''))"))
+}
+
+// OwnerCanonicalsSQL projects confirmed owners through a canonical participant relation.
+// Callers deduplicate the result where they combine or join owner sets.
+func OwnerCanonicalsSQL(owners, canon string) string {
+	return fmt.Sprintf(`SELECT c.canonical_id FROM %s o
+	JOIN %s c ON c.participant_id = o.participant_id`, owners, canon)
+}
 
 // buildSparseRelationshipActivitySQL writes message facts once and keeps only
 // direct canonical edges beside them. Conversation membership stays in the
 // conversation_participants base dataset, where it is stored once per thread.
-func buildSparseRelationshipActivitySQL(path func(string) string, messages string, occurredYear int64) string {
+func buildSparseRelationshipActivitySQL(path func(string) string, messages, recipients string, occurredYear int64, unsentMessages string) string {
+	if unsentMessages == "" {
+		unsentMessages = "(SELECT NULL::BIGINT AS message_id WHERE false)"
+	}
 	return fmt.Sprintf(`
 WITH message_facts AS (
 	SELECT m.id::BIGINT AS message_id, m.conversation_id::BIGINT AS conversation_id,
@@ -16,36 +45,36 @@ WITH message_facts AS (
 	       m.is_from_me::BOOLEAN AS is_from_me, m.attachment_count::INTEGER AS attachment_count,
 	       coalesce(m.has_attachments::BOOLEAN, false) AS has_attachments,
 	       (m.deleted_from_source_at IS NOT NULL) AS deleted_from_source,
+	       (u.message_id IS NOT NULL) AS unsent,
 	       year(m.sent_at)::SMALLINT AS occurred_year,
 	       m.sender_id::BIGINT AS sender_id,
 	       m.owner_participant_id::BIGINT AS owner_participant_id
 	FROM %s m
 	JOIN read_parquet('%s') s ON s.id = m.source_id
 	LEFT JOIN read_parquet('%s') c ON c.id = m.conversation_id
+	LEFT JOIN %s u ON u.message_id = m.id
 	WHERE year(m.sent_at) = %d
 ), canon AS (
-	SELECT p.id::BIGINT AS participant_id,
-	       coalesce(c.canonical_id, p.id)::BIGINT AS canonical_id,
-	       lower(coalesce(p.domain, ''))::VARCHAR AS participant_domain
-	FROM read_parquet('%s') p
-	LEFT JOIN read_parquet('%s') c ON c.participant_id = p.id
+	%s
 ), owner_canon AS (
-	SELECT DISTINCT c.canonical_id
-	FROM read_parquet('%s') o
-	JOIN canon c ON c.participant_id = o.participant_id
+	SELECT DISTINCT canonical_id FROM (%s)
 ), direct_edges AS (
 	SELECT mr.message_id::BIGINT AS message_id, mr.participant_id::BIGINT AS participant_id,
 	       (mr.recipient_type = 'from' AND mr.participant_id = m.owner_participant_id) AS is_sender,
 	       (mr.recipient_type = 'from' AND mr.participant_id = m.owner_participant_id) AS is_owner_sender,
 	       (mr.recipient_type = 'from') AS is_author
-	FROM read_parquet('%s') mr JOIN message_facts m ON m.message_id = mr.message_id
+	FROM %s mr JOIN message_facts m ON m.message_id = mr.message_id
 	UNION ALL
 	SELECT m.message_id, m.sender_id, true,
 	       coalesce(m.sender_id = m.owner_participant_id, false), true
 	FROM message_facts m WHERE m.sender_id IS NOT NULL
+), relay_domains AS (
+	SELECT message_id, %s AS relay_domain FROM %s mr
+	WHERE mr.recipient_type = 'from' AND mr.is_relayed
 ), direct_canon AS (
-	SELECT e.*, c.canonical_id, c.participant_domain
+	SELECT e.*, c.canonical_id, CASE WHEN e.is_author THEN coalesce(r.relay_domain, c.participant_domain) ELSE c.participant_domain END AS participant_domain
 	FROM direct_edges e LEFT JOIN canon c USING (participant_id)
+	LEFT JOIN relay_domains r USING (message_id)
 ), direct_agg AS (
 	SELECT message_id, canonical_id, participant_domain,
 	       bool_or(is_sender) AS is_sender,
@@ -57,7 +86,7 @@ WITH message_facts AS (
 SELECT m.message_id, m.conversation_id, m.source_id, m.source_type,
        m.occurred_at, m.message_type, m.conversation_type, m.entry_kind,
        m.is_chat, m.is_from_me, m.attachment_count, m.has_attachments,
-       m.deleted_from_source, d.canonical_id, d.participant_domain,
+       m.deleted_from_source, m.unsent, d.canonical_id, d.participant_domain,
        true AS is_direct, false AS is_conversation_member,
        d.is_sender, d.is_author,
        (o.canonical_id IS NOT NULL OR (m.is_from_me AND d.is_owner_sender)) AS is_owner,
@@ -68,7 +97,7 @@ UNION ALL
 SELECT m.message_id, m.conversation_id, m.source_id, m.source_type,
        m.occurred_at, m.message_type, m.conversation_type, m.entry_kind,
        m.is_chat, m.is_from_me, m.attachment_count, m.has_attachments,
-       m.deleted_from_source, NULL::BIGINT AS canonical_id,
+       m.deleted_from_source, m.unsent, NULL::BIGINT AS canonical_id,
        NULL::VARCHAR AS participant_domain,
        EXISTS (SELECT 1 FROM direct_canon d
                WHERE d.message_id = m.message_id AND d.canonical_id IS NULL) AS is_direct,
@@ -77,9 +106,10 @@ SELECT m.message_id, m.conversation_id, m.source_id, m.source_type,
 FROM message_facts m`, EntryKindSQL("m.message_type"),
 		IsChatSQL("m.message_type", "coalesce(c.conversation_type, '')"),
 		messages, quoteSQLString(path("sources")),
-		quoteSQLString(path("conversations")), occurredYear,
-		quoteSQLString(path("participants")), quoteSQLString(path("participant_clusters")),
-		quoteSQLString(path("owner_participants")), quoteSQLString(path("message_recipients")))
+		quoteSQLString(path("conversations")), unsentMessages, occurredYear,
+		CanonicalParticipantsSQL(fmt.Sprintf("read_parquet('%s')", quoteSQLString(path("participants"))), fmt.Sprintf("read_parquet('%s')", quoteSQLString(path("participant_clusters")))),
+		OwnerCanonicalsSQL(fmt.Sprintf("read_parquet('%s')", quoteSQLString(path("owner_participants"))), "canon"), recipients,
+		SenderEnvelopeDomainExpr("mr.email_address"), recipients)
 }
 
 // ExpandedActivityRelation restores the logical edge relation on demand from
@@ -106,7 +136,7 @@ func expandedActivityRelation(sparse, roster, participants, clusters, owners str
 		memberCTEs = `, chat_anchors AS (
 	SELECT source_id, conversation_id,
 	       arg_max(message_id, struct_pack(at := occurred_at, id := message_id)) AS message_id
-	FROM facts WHERE is_chat GROUP BY source_id, conversation_id
+	FROM facts WHERE is_chat AND NOT unsent GROUP BY source_id, conversation_id
 ), roster_facts AS NOT MATERIALIZED (
 	SELECT f.*, (
 		NOT f.is_chat OR lower(f.conversation_type) = 'direct_chat'
@@ -131,13 +161,9 @@ WITH raw_activity AS NOT MATERIALIZED (SELECT * FROM %[1]s),
 facts AS NOT MATERIALIZED (SELECT * FROM raw_activity WHERE canonical_id IS NULL),
 direct AS NOT MATERIALIZED (SELECT * FROM raw_activity WHERE canonical_id IS NOT NULL),
 canon AS NOT MATERIALIZED (
-	SELECT p.id::BIGINT AS participant_id,
-	       coalesce(c.canonical_id, p.id)::BIGINT AS canonical_id,
-	       lower(coalesce(p.domain, ''))::VARCHAR AS participant_domain
-	FROM %[3]s p LEFT JOIN %[4]s c ON c.participant_id = p.id
+	%[3]s
 ), owner_canon AS NOT MATERIALIZED (
-	SELECT DISTINCT c.canonical_id FROM %[5]s o
-	JOIN canon c ON c.participant_id = o.participant_id
+	SELECT DISTINCT canonical_id FROM (%[4]s)
 ), members AS NOT MATERIALIZED (
 	SELECT DISTINCT cp.conversation_id::BIGINT AS conversation_id,
 	       c.canonical_id, c.participant_domain,
@@ -145,17 +171,17 @@ canon AS NOT MATERIALIZED (
 	FROM %[2]s cp
 	LEFT JOIN canon c ON c.participant_id = cp.participant_id
 	LEFT JOIN owner_canon o ON o.canonical_id = c.canonical_id
-)%[6]s
+)%[5]s
 SELECT f.message_id, f.conversation_id, f.source_id, f.source_type,
        f.occurred_at, f.message_type, f.conversation_type, f.entry_kind,
        f.is_chat, f.is_from_me, f.attachment_count, f.has_attachments,
-       f.deleted_from_source, cm.canonical_id, cm.participant_domain,
+       f.deleted_from_source, f.unsent, cm.canonical_id, cm.participant_domain,
        coalesce(d.is_direct, false) AS is_direct,
        true AS is_conversation_member, coalesce(d.is_sender, false) AS is_sender,
        coalesce(d.is_author, false) AS is_author,
        (cm.is_owner OR coalesce(d.is_owner, false)) AS is_owner,
        f.occurred_year
-FROM facts f JOIN expanded_members cm ON cm.conversation_id = f.conversation_id%[7]s
+FROM facts f JOIN expanded_members cm ON cm.conversation_id = f.conversation_id%[6]s
 LEFT JOIN direct d ON d.message_id = f.message_id
                   AND d.occurred_year = f.occurred_year
                   AND d.canonical_id = cm.canonical_id
@@ -165,12 +191,12 @@ UNION ALL
 SELECT d.message_id, d.conversation_id, d.source_id, d.source_type,
        d.occurred_at, d.message_type, d.conversation_type, d.entry_kind,
        d.is_chat, d.is_from_me, d.attachment_count, d.has_attachments,
-       d.deleted_from_source, d.canonical_id, d.participant_domain,
+       d.deleted_from_source, d.unsent, d.canonical_id, d.participant_domain,
        d.is_direct, false AS is_conversation_member,
        d.is_sender, d.is_author, d.is_owner, d.occurred_year
 FROM direct d
 WHERE NOT EXISTS (
-	SELECT 1 FROM expanded_members cm WHERE cm.conversation_id = d.conversation_id%[8]s
+	SELECT 1 FROM expanded_members cm WHERE cm.conversation_id = d.conversation_id%[7]s
 	AND cm.canonical_id = d.canonical_id
 	AND cm.participant_domain = d.participant_domain
 )
@@ -178,7 +204,7 @@ UNION ALL
 SELECT f.message_id, f.conversation_id, f.source_id, f.source_type,
        f.occurred_at, f.message_type, f.conversation_type, f.entry_kind,
        f.is_chat, f.is_from_me, f.attachment_count, f.has_attachments,
-       f.deleted_from_source, NULL::BIGINT AS canonical_id,
+       f.deleted_from_source, f.unsent, NULL::BIGINT AS canonical_id,
        NULL::VARCHAR AS participant_domain,
        false AS is_direct, false AS is_conversation_member,
        false AS is_sender, false AS is_author, false AS is_owner,
@@ -189,7 +215,32 @@ WHERE f.is_direct
               WHERE cm.conversation_id = f.conversation_id AND cm.canonical_id IS NULL)
    OR (NOT EXISTS (SELECT 1 FROM direct d WHERE d.message_id = f.message_id)
 	       AND NOT EXISTS (SELECT 1 FROM expanded_members cm
-	                       WHERE cm.conversation_id = f.conversation_id%[7]s
+	                       WHERE cm.conversation_id = f.conversation_id%[6]s
 	                         AND cm.canonical_id IS NOT NULL))
-)`, sparse, roster, participants, clusters, owners, memberCTEs, factMemberKey, directMemberKey)
+)`, sparse, roster, CanonicalParticipantsSQL(participants, clusters), OwnerCanonicalsSQL(owners, "canon"), memberCTEs, factMemberKey, directMemberKey)
+}
+
+// SenderAddressExpr selects the relay address for relayed From rows.
+func SenderAddressExpr(recipient, participant string) string {
+	return "COALESCE(CASE WHEN " + recipient + ".is_relayed THEN " + recipient + ".email_address END, " + participant + ".email_address)"
+}
+
+// SenderAddressMatchExpr keeps relay and participant address lookups separate.
+func SenderAddressMatchExpr(recipient, participant string) string {
+	return "((" + recipient + ".is_relayed AND LOWER(" + recipient + ".email_address) = ?) OR (NOT " + recipient + ".is_relayed AND (" + participant + ".email_address = ? OR " + participant + ".phone_number = ?)))"
+}
+
+// SenderDomainExpr selects the relay domain for relayed From rows.
+func SenderDomainExpr(recipient, participant string) string {
+	return "COALESCE(" + SenderEnvelopeDomainExpr("CASE WHEN "+recipient+".is_relayed THEN "+recipient+".email_address END") + ", " + participant + ".domain)"
+}
+
+// RelayAddressSubquery selects a message's relayed From address.
+func RelayAddressSubquery(messageID, recipients string) string {
+	return "(SELECT mr_relay.email_address FROM " + recipients + " mr_relay WHERE mr_relay.message_id = " + messageID + " AND mr_relay.recipient_type = 'from' AND mr_relay.is_relayed LIMIT 1)"
+}
+
+// RelayAbsentExpr prevents a linked author from replacing the relay sender.
+func RelayAbsentExpr(messageID, recipients string) string {
+	return "NOT EXISTS (SELECT 1 FROM " + recipients + " mr_guard WHERE mr_guard.message_id = " + messageID + " AND mr_guard.recipient_type = 'from' AND mr_guard.is_relayed)"
 }

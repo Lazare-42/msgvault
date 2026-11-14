@@ -4,6 +4,7 @@ package mcp
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -18,16 +19,18 @@ import (
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/sqlobserve"
+	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
 func seedMetadataSearch(t *testing.T, db *sql.DB) {
 	t.Helper()
 	schema, err := os.ReadFile("../store/schema.sql")
 	require.NoError(t, err)
-	_, err = db.Exec(string(schema))
+	_, err = db.ExecContext(t.Context(), string(schema))
 	require.NoError(t, err)
-	_, err = db.Exec(`INSERT INTO sources (id,source_type,identifier) VALUES (1,'gmail','reader@example.test');
+	_, err = db.ExecContext(t.Context(), `INSERT INTO sources (id,source_type,identifier) VALUES (1,'gmail','reader@example.test');
  INSERT INTO conversations (id,source_id,source_conversation_id,conversation_type) VALUES (1,1,'thread','email_thread');
  INSERT INTO messages (id,conversation_id,source_id,source_message_id,message_type,sent_at,subject,snippet) VALUES
  (1,1,1,'one','email','2024-01-01','first note','preview'),
@@ -36,15 +39,39 @@ func seedMetadataSearch(t *testing.T, db *sql.DB) {
 	require.NoError(t, err)
 }
 
+// metadataDaemon serves engine over HTTP.
 func metadataDaemon(t *testing.T, engine query.Engine, requests *atomic.Int32) *daemonclient.Engine {
 	t.Helper()
-	server := api.NewServerWithOptions(api.ServerOptions{
+	return metadataDaemonWithPeer(t, engine, requests, nil, "")
+}
+
+func metadataDaemonWithPeer(
+	t *testing.T,
+	engine query.Engine,
+	fastRequests, boundedDeletionRequests *atomic.Int32,
+	remoteAddr string,
+	st ...*store.Store,
+) *daemonclient.Engine {
+	t.Helper()
+	opts := api.ServerOptions{
 		Config: &config.Config{Server: config.ServerConfig{APIKey: "synthetic-owner-key"}},
 		Engine: engine, Logger: slog.New(slog.DiscardHandler),
-	})
+	}
+	if len(st) > 0 {
+		opts.Store = st[0]
+	}
+	server := api.NewServerWithOptions(opts)
 	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/v1/search/fast" {
-			requests.Add(1)
+		if r.URL.Path == "/api/v1/search/fast" && fastRequests != nil {
+			fastRequests.Add(1)
+		}
+		if r.URL.Path == "/api/v1/messages/gmail-ids" && r.URL.Query().Get("max_results") != "" && boundedDeletionRequests != nil {
+			boundedDeletionRequests.Add(1)
+		}
+		if remoteAddr != "" {
+			request := r.Clone(r.Context())
+			request.RemoteAddr = remoteAddr
+			r = request
 		}
 		server.Router().ServeHTTP(w, r)
 	}))
@@ -108,7 +135,7 @@ func TestSearchByDomainsPagesThroughDaemon(t *testing.T) {
 	const total = 1501
 	db, _ := sqlobserve.Open(t, nil)
 	seedMetadataSearch(t, db)
-	_, err := db.Exec(`WITH RECURSIVE n(i) AS (SELECT 4 UNION ALL SELECT i+1 FROM n WHERE i < ?)
+	_, err := db.ExecContext(t.Context(), `WITH RECURSIVE n(i) AS (SELECT 4 UNION ALL SELECT i+1 FROM n WHERE i < ?)
  INSERT INTO messages (id,conversation_id,source_id,source_message_id,message_type,sent_at,subject,snippet)
  SELECT i,1,1,'m'||i,'email',datetime('2024-02-01', '+'||i||' seconds'),'note '||i,'preview' FROM n;
  INSERT INTO participants (id,email_address,domain) VALUES (1,'peer@example.com','example.com');
@@ -146,4 +173,92 @@ func TestSearchByDomainsPagesThroughDaemon(t *testing.T) {
 		want[i] = int64(total - 1000 - i)
 	}
 	assert.Equal(t, want, got, "newest first, each message once")
+}
+
+func TestStageDeletionThroughRemoteDaemonStagesEveryMatchWithOneBoundedSearchRequest(t *testing.T) {
+	req := require.New(t)
+	f := storetest.New(t)
+	st := f.Store
+	tx, err := st.DB().BeginTx(t.Context(), nil)
+	req.NoError(err)
+	t.Cleanup(func() { _ = tx.Rollback() })
+	persist := func(key, subject, body string) {
+		var id int64
+		req.NoError(tx.QueryRowContext(t.Context(), st.Rebind(`INSERT INTO messages (conversation_id, source_id, source_message_id, message_type, subject) VALUES (?, ?, ?, 'email', ?) RETURNING id`), f.ConvID, f.Source.ID, key, subject).Scan(&id))
+		_, err = tx.ExecContext(t.Context(), st.Rebind(`INSERT INTO message_bodies (message_id, body_text) VALUES (?, ?)`), id, body)
+		req.NoError(err)
+	}
+	var metadataIDs, bodyIDs []string
+	for i := range 600 {
+		id := fmt.Sprintf("meta-%03d", i)
+		persist(id, "selectionmarker", "filler")
+		metadataIDs = append(metadataIDs, id)
+	}
+	for i := range 150 {
+		id := fmt.Sprintf("body-%03d", i)
+		persist(id, "plain", "bodyneedle")
+		bodyIDs = append(bodyIDs, id)
+	}
+	req.NoError(tx.Commit())
+	indexed, err := st.BackfillFTS(nil)
+	req.NoError(err)
+	req.Equal(int64(750), indexed)
+	var requests atomic.Int32
+	var boundedRequests atomic.Int32
+	daemon := metadataDaemonWithPeer(t, query.NewEngine(st.DB(), st.IsPostgreSQL()), &requests,
+		&boundedRequests, "203.0.113.9:4242", st)
+
+	stage := func(t *testing.T, args map[string]any) (*captureDeletionManifestSaver, stageDeletionResponse) {
+		t.Helper()
+		saver := &captureDeletionManifestSaver{}
+		h := &handlers{engine: daemon, manifestSaver: saver}
+		result := runTool[stageDeletionResponse](t, "stage_deletion", h.stageDeletion, args)
+		require.NotNil(t, saver.manifest)
+		return saver, result
+	}
+
+	t.Run("metadata matches stage with one bounded request", func(t *testing.T) {
+		assert := assert.New(t)
+		before := boundedRequests.Load()
+		saver, result := stage(t, map[string]any{"query": "subject:selectionmarker"})
+		assert.ElementsMatch(metadataIDs, saver.manifest.GmailIDs)
+		assert.Equal(600, result.MessageCount)
+		assert.Equal(before+1, boundedRequests.Load())
+		assert.Zero(requests.Load(), "bounded staging must not call paginated fast search")
+	})
+	t.Run("full-text fallback stages with a second bounded request", func(t *testing.T) {
+		assert := assert.New(t)
+		before := boundedRequests.Load()
+		saver, result := stage(t, map[string]any{"query": "bodyneedle"})
+		assert.ElementsMatch(bodyIDs, saver.manifest.GmailIDs)
+		assert.Equal(150, result.MessageCount)
+		assert.Equal(before+2, boundedRequests.Load())
+		assert.Zero(requests.Load(), "bounded staging must not call paginated fast search")
+	})
+}
+
+func TestSearchMetadataSenderSearchRoundTrip(t *testing.T) {
+	db, _ := sqlobserve.Open(t, nil)
+	seedMetadataSearch(t, db)
+	_, err := db.ExecContext(t.Context(), `INSERT INTO participants(id,email_address,display_name) VALUES(1,'alex@example.com','Alex Kim');
+ INSERT INTO message_recipients(message_id,participant_id,recipient_type) VALUES(1,1,'from');`)
+	require.NoError(t, err)
+	var requests atomic.Int32
+	h := newTestHandlers(metadataDaemon(t, query.NewSQLiteEngine(db), &requests))
+	for _, tool := range []struct {
+		name    string
+		handler toolHandler
+	}{
+		{ToolSearchMetadata, h.searchMetadata},
+		{ToolSearchMessages, h.searchMessages},
+	} {
+		t.Run(tool.name, func(t *testing.T) {
+			response := runTool[paginatedSearchMessages](t, tool.name, tool.handler, map[string]any{"query": "from:alex"})
+			var ids []int64
+			for _, row := range response.Data {
+				ids = append(ids, row.ID)
+			}
+			assert.Equal(t, []int64{1}, ids)
+		})
+	}
 }

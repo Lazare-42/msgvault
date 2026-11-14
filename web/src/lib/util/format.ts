@@ -1,3 +1,7 @@
+export function messageCount(count: number): string {
+  return `${count.toLocaleString()} ${count === 1 ? 'message' : 'messages'}`;
+}
+
 export function formatOffset(ms: number): string {
   const seconds = Math.floor(ms / 1000);
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
@@ -41,4 +45,9 @@ export function formatRelativeTime(value: string, now: Date = new Date()): strin
     if (Math.abs(difference) >= size) return format.format(Math.round(difference / size), unit);
   }
   return format.format(0, 'second');
+}
+
+export function formatDate(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(date);
 }

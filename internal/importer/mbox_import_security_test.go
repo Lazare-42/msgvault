@@ -16,6 +16,7 @@ import (
 )
 
 func TestStoreAttachmentPreservesMIMEOccurrenceEvidence(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
 	tmp := t.TempDir()
@@ -23,7 +24,7 @@ func TestStoreAttachmentPreservesMIMEOccurrenceEvidence(t *testing.T) {
 
 	src, err := st.GetOrCreateSource("mbox", "me@example.com")
 	require.NoError(err)
-	convID, err := st.EnsureConversation(src.ID, "thread-role", "Thread")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "thread-role", "Thread")
 	require.NoError(err)
 	msgID, err := st.UpsertMessage(&store.Message{
 		ConversationID: convID, SourceID: src.ID,
@@ -43,10 +44,10 @@ func TestStoreAttachmentPreservesMIMEOccurrenceEvidence(t *testing.T) {
 			ContentID: "signature-1", PartKey: "mime:2",
 		},
 	} {
-		require.NoError(storeAttachment(st, attachmentsDir, msgID, att, false))
+		require.NoError(storeAttachment(t.Context(), st, attachmentsDir, msgID, att, false))
 	}
 
-	rows, err := st.DB().Query(`
+	rows, err := st.DB().QueryContext(t.Context(), `
 		SELECT attachment_role, role_source, source_part_key, COALESCE(content_id, '')
 		FROM attachments WHERE message_id = ? ORDER BY source_part_key`, msgID)
 	require.NoError(err)
@@ -66,6 +67,7 @@ func TestStoreAttachmentPreservesMIMEOccurrenceEvidence(t *testing.T) {
 }
 
 func TestStoreAttachment_StatError_DoesNotUpsertRow(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	if runtime.GOOS == "windows" {
 		t.Skip("requires symlink support")
@@ -78,7 +80,7 @@ func TestStoreAttachment_StatError_DoesNotUpsertRow(t *testing.T) {
 
 	src, err := st.GetOrCreateSource("mbox", "me@example.com")
 	require.NoError(err, "get/create source")
-	convID, err := st.EnsureConversation(src.ID, "thread1", "Thread")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "thread1", "Thread")
 	require.NoError(err, "ensure conversation")
 	msgID, err := st.UpsertMessage(&store.Message{
 		ConversationID:  convID,
@@ -108,10 +110,10 @@ func TestStoreAttachment_StatError_DoesNotUpsertRow(t *testing.T) {
 		Size:        len(content),
 	}
 
-	require.Error(storeAttachment(st, attachmentsDir, msgID, att, false))
+	require.Error(storeAttachment(t.Context(), st, attachmentsDir, msgID, att, false))
 
 	var count int
-	err = st.DB().QueryRow(`SELECT COUNT(*) FROM attachments WHERE message_id = ?`, msgID).Scan(&count)
+	err = st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments WHERE message_id = ?`, msgID).Scan(&count)
 	require.NoError(err, "count attachments")
 	assert.Equal(t, 0, count)
 }

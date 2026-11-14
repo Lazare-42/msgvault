@@ -33,6 +33,7 @@ import type {
   PersonIdentifier as GeneratedPersonIdentifier,
   PersonSummary as GeneratedPersonSummary,
   SearchProvenance as GeneratedSearchProvenance,
+  SavedViewStateEnvelopeGroupingItem,
   SourceIdentitiesResponse as GeneratedSourceIdentitiesResponse,
   SourceIdentityResponse as GeneratedSourceIdentityResponse,
 } from '../api/generated/models';
@@ -55,6 +56,10 @@ export type PersonFileSearchRow = GeneratedPersonFileSearchRow;
 export type PersonFileProvenance = GeneratedPersonFileProvenance;
 export type PersonFileDirection = NonNullable<PersonFileSearchRequest['directions']>[number];
 export interface FileViewerTarget {
+  occurred_at?: FileSearchRow['occurred_at'];
+  containing_title?: FileSearchRow['containing_title'];
+  participant_labels?: FileSearchRow['participant_labels'];
+  mime_family?: FileSearchRow['mime_family'];
   id: FileSearchRow['id'];
   key?: FileSearchRow['key'];
   entry_key?: FileSearchRow['entry_key'];
@@ -70,7 +75,8 @@ export type FileSearchSort = {
   direction: 'asc' | 'desc';
 };
 export type FileMIMEFamily = 'image' | 'pdf' | 'audio' | 'video' | 'text' | 'document' | 'archive' | 'other';
-export type ExploreGroupDimension = GeneratedExploreGroupDimension;
+export type ExploreGroupDimension = SavedViewStateEnvelopeGroupingItem;
+export type ExploreRequestGroupDimension = GeneratedExploreGroupDimension;
 export type ExploreGroupRow = GeneratedExploreGroupRow;
 export type ExploreGroupsResponse = GeneratedExploreGroupsHTTPResponse;
 export type ExplorePredicate = GeneratedExploreHTTPRequest;
@@ -78,7 +84,7 @@ export type ExplorePredicate = GeneratedExploreHTTPRequest;
  * Predicate for the groups listing: the shared explore predicate plus the
  * groups-only exact-key filter (see ExploreGroupsHTTPRequest.group_key).
  */
-export type ExploreGroupsPredicate = ExplorePredicate & Pick<GeneratedExploreGroupsHTTPRequest, 'group_key'>;
+export type ExploreGroupsPredicate = ExplorePredicate & Pick<GeneratedExploreGroupsHTTPRequest, 'group_key' | 'sent_only' | 'timezone'>;
 export type ExploreResponse = GeneratedExploreHTTPResponse;
 export type ExploreSearchMode = NonNullable<ExplorePredicate['search_mode']>;
 export type OperationStatusAuthority = Exclude<
@@ -101,21 +107,15 @@ export type IdentitySearchSort = GeneratedIdentitySearchSort;
 
 export type ExploreWorkspace =
   | 'everything'
-  | 'directory'
-  | 'directory_review'
   | 'files'
-  | 'operations'
   | 'relationships'
-  | 'saved_views'
   | 'sources'
   | 'deletions'
   | 'settings';
 export type OperationKind = GeneratedOperationKind;
 export type OperationLane = GeneratedOperationLane;
 export type OperationState = GeneratedOperationState;
-export type DirectoryReviewKind = 'identity' | 'fact' | 'relationship';
 export type IdentityReviewState = 'candidate' | 'conflict' | 'accepted' | 'rejected';
-export type RelationshipReviewState = 'pending' | 'accepted' | 'rejected';
 export type RelationshipFacet = 'people' | 'domains';
 export type ExploreColumn = 'kind' | 'people' | 'title' | 'excerpt' | 'time' | 'attachments' | 'size';
 
@@ -139,9 +139,7 @@ export interface ExploreURLState {
   directoryLastContactBefore: string;
   directorySort: 'name' | 'last_contact_desc' | 'last_contact_asc';
   directoryPersonID: number | null;
-  reviewKind: DirectoryReviewKind;
   identityState: IdentityReviewState;
-  relationshipReviewState: RelationshipReviewState;
   query: string;
   searchMode: ExploreSearchMode;
   filters: ExploreFilter[];
@@ -161,6 +159,10 @@ export interface ExploreURLState {
   relationshipTarget: string | null;
   relationshipShowAll: boolean;
   relationshipFiles: boolean;
+  relationshipSaved: boolean;
+  peopleDuplicates: boolean;
+  relationshipSort: 'closest' | 'recent' | 'name' | 'last_contact_asc';
+  operationHistory: boolean;
   operationLane: '' | OperationLane;
   operationKind: '' | OperationKind;
   operationState: '' | OperationState;
@@ -234,6 +236,7 @@ export function sameFilterID(a: string | undefined, b: string | undefined): bool
 }
 
 export interface ExploreResult {
+  warnings?: string[];
   rows: EntryRow[];
   totalCount?: number;
   cacheRevision: string;
@@ -246,7 +249,11 @@ export interface ExploreResult {
   nextCursor?: string;
 }
 
+export type ExploreGroupOverview = NonNullable<ExploreGroupsResponse['overview']>;
+
 export interface ExploreGroupResult {
+  overview?: ExploreGroupOverview;
+  warnings?: string[];
   rows: ExploreGroupRow[];
   totalCount: number;
   cacheRevision: string;

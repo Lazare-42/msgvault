@@ -101,25 +101,27 @@ func generatedMessageToAPIMessage(m generated.MessageSummary) store.APIMessage {
 		}
 	}
 	return store.APIMessage{
-		ID:              m.ID,
-		SourceID:        int64Value(m.SourceID),
-		SourceMessageID: stringValue(m.SourceMessageID),
-		ConversationID:  int64Value(m.ConversationID),
-		Subject:         m.Subject,
-		MessageType:     stringValue(m.MessageType),
-		From:            m.From,
-		FromEmail:       stringValue(m.FromEmail),
-		FromName:        stringValue(m.FromName),
-		FromPhone:       stringValue(m.FromPhone),
-		To:              m.To,
-		Cc:              m.Cc,
-		Bcc:             m.Bcc,
-		SentAt:          parseTime(m.SentAt),
-		DeletedAt:       deletedAt,
-		Snippet:         m.Snippet,
-		Labels:          m.Labels,
-		HasAttachments:  m.HasAttachments,
-		SizeEstimate:    m.SizeBytes,
+		ID:                m.ID,
+		SourceID:          int64Value(m.SourceID),
+		SourceMessageID:   stringValue(m.SourceMessageID),
+		RFC822MessageID:   stringValue(m.Rfc822MessageID),
+		ConversationID:    int64Value(m.ConversationID),
+		Subject:           m.Subject,
+		MessageType:       stringValue(m.MessageType),
+		From:              m.From,
+		FromEmail:         stringValue(m.FromEmail),
+		FromName:          stringValue(m.FromName),
+		FromPhone:         stringValue(m.FromPhone),
+		To:                m.To,
+		Cc:                m.Cc,
+		Bcc:               m.Bcc,
+		SentAt:            parseTime(m.SentAt),
+		DeletedAt:         deletedAt,
+		Snippet:           m.Snippet,
+		Labels:            m.Labels,
+		HasAttachments:    m.HasAttachments,
+		HiddenTextPresent: m.HiddenTextPresent,
+		SizeEstimate:      m.SizeBytes,
 	}
 }
 
@@ -149,37 +151,42 @@ func generatedDetailToAPIMessage(m *generated.MessageDetail) *store.APIMessage {
 		RelatedMessageID:  m.RelatedMessageID,
 		ConversationTitle: stringValue(m.ConversationTitle),
 
-		ID:              m.ID,
-		SourceID:        int64Value(m.SourceID),
-		SourceMessageID: stringValue(m.SourceMessageID),
-		RFC822MessageID: stringValue(m.Rfc822MessageID),
-		ConversationID:  int64Value(m.ConversationID),
-		Subject:         m.Subject,
-		MessageType:     stringValue(m.MessageType),
-		From:            m.From,
-		FromEmail:       stringValue(m.FromEmail),
-		FromName:        stringValue(m.FromName),
-		FromPhone:       stringValue(m.FromPhone),
-		To:              m.To,
-		Cc:              m.Cc,
-		Bcc:             m.Bcc,
-		SentAt:          parseTime(m.SentAt),
-		DeletedAt:       deletedAt,
-		Snippet:         m.Snippet,
-		Labels:          m.Labels,
-		HasAttachments:  m.HasAttachments,
-		SizeEstimate:    m.SizeBytes,
-		Body:            m.Body,
-		BodyHTML:        stringValue(m.BodyHTML),
-		Attachments:     apiAttachmentsFromGenerated(m.Attachments),
+		ID:                m.ID,
+		IsFromMe:          boolValue(m.IsFromMe),
+		SenderAuth:        senderAuthFromGenerated(m.SenderAuth),
+		Calendar:          calendarProjectionFromGenerated(m.Calendar),
+		SourceID:          int64Value(m.SourceID),
+		SourceMessageID:   stringValue(m.SourceMessageID),
+		RFC822MessageID:   stringValue(m.Rfc822MessageID),
+		ConversationID:    int64Value(m.ConversationID),
+		Subject:           m.Subject,
+		MessageType:       stringValue(m.MessageType),
+		From:              m.From,
+		FromEmail:         stringValue(m.FromEmail),
+		FromName:          stringValue(m.FromName),
+		FromPhone:         stringValue(m.FromPhone),
+		To:                m.To,
+		Cc:                m.Cc,
+		Bcc:               m.Bcc,
+		SentAt:            parseTime(m.SentAt),
+		DeletedAt:         deletedAt,
+		Snippet:           m.Snippet,
+		Labels:            m.Labels,
+		HasAttachments:    m.HasAttachments,
+		HiddenTextPresent: m.HiddenTextPresent,
+		SizeEstimate:      m.SizeBytes,
+		Body:              m.Body,
+		BodyHTML:          stringValue(m.BodyHTML),
+		Attachments:       apiAttachmentsFromGenerated(m.Attachments),
 	}
-	// The daemon sends body = text, falling back to HTML when there is no
-	// text part, plus body_html. Rebuild both so callers can tell them apart.
-	if m.BodyHTML != nil {
-		msg.BodyHTML = *m.BodyHTML
-	}
-	if m.Body != msg.BodyHTML {
-		msg.BodyText = m.Body
+	if m.BodyText != nil {
+		msg.BodyText = *m.BodyText
+	} else {
+		// Older daemons predate body_text and expose their best available
+		// body through body. Preserve that documented fallback. New daemons
+		// send body_text explicitly, including an empty value for HTML-only
+		// messages, so the branches remain distinguishable.
+		msg.BodyText = msg.Body
 	}
 	return msg
 }

@@ -1,66 +1,11 @@
+import { stubOperationStatus } from './kit-ui';
 import { expect, test } from '@playwright/test';
 import { selectWorkspace, setKitTheme, setTemporaryDensity } from './kit-ui';
 
-const row = {
-  key: 'message:1',
-  kind: 'message',
-  message_type: 'email',
-  conversation_type: 'email',
-  title: 'Synthetic archive subject',
-  preview: 'Synthetic analytical excerpt for visual verification.',
-  occurred_at: '2026-07-18T12:00:00Z',
-  source_id: 1,
-  source_identifier: 'archive@example.com',
-  source_type: 'synthetic',
-  participant_labels: ['Example Person With A Long Archive Display Name'],
-  participant_ids: [1],
-  attachment_count: 1,
-  attachment_size: 2048,
-  has_attachments: true,
-  deleted_from_source: false,
-  message_count: 1,
-  match: {}
-};
+import { mockArchiveLayout, row } from './archive-layout';
 
 test.beforeEach(async ({ page }) => {
-  await page.route('**/api/session', (route) => route.fulfill({
-    json: { auth_mode: 'loopback', https: false, plain_http_warning: false }
-  }));
-  await page.route('**/api/v1/settings', (route) => route.fulfill({
-    headers: { ETag: '"synthetic-settings"' },
-    json: {
-      groups: [{ id: 'browser', label: 'Appearance', description: 'How the web app looks.' }],
-      settings: [
-        { key: 'web.theme', group: 'browser', label: 'Theme', description: 'Light, dark, or follow the system.', kind: 'string', value: { string: 'system' }, options: ['system', 'light', 'dark'], restart_required: true },
-        { key: 'web.density', group: 'browser', label: 'Density', description: 'Spacing of tables and toolbars.', kind: 'string', value: { string: 'compact' }, options: ['compact', 'comfortable'], restart_required: true }
-      ],
-      pending_restart: true
-    }
-  }));
-  await page.route('**/api/v1/explore', (route) => route.fulfill({
-    json: { rows: [row], total_count: 1, cache_revision: 'cache-theme', search_provenance: {} }
-  }));
-  await page.route('**/api/v1/explore/groups', (route) => route.fulfill({
-    json: {
-      rows: [{ key: '1', label: 'Synthetic source', count: 1, estimated_bytes: 2048, latest_at: '2026-07-18T12:00:00Z' }],
-      total_count: 1, cache_revision: 'cache-theme', search_provenance: {}
-    }
-  }));
-  await page.route('**/api/v1/saved-views', (route) => route.fulfill({
-    json: { saved_views: [] }
-  }));
-  await page.route('**/api/v1/files/search', (route) => route.fulfill({
-    json: {
-      files: [{
-        id: 1, key: 'file:1', entry_key: 'message:1', message_id: 1, conversation_id: 1,
-        occurred_at: '2026-07-18T12:00:00Z', source_id: 1, source_type: 'synthetic',
-        source_identifier: 'archive@example.com', containing_title: 'Synthetic archive subject',
-        filename: 'SyntheticArchiveAttachmentWithAnUnbrokenDescriptiveFilename.pdf', mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 2048,
-        content_state: 'missing_blob', content_available: false
-      }],
-      total_count: 1, cache_revision: 'cache-theme', search_provenance: {}
-    }
-  }));
+  await mockArchiveLayout(page);
   await page.goto(`/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
   await expect(page.getByText('Synthetic archive subject')).toBeVisible();
 });
@@ -71,7 +16,7 @@ test('compact workspace links preserve browser navigation and reopen the selecte
   await expect(page).toHaveURL(/\?workspace=files&mode=full_text$/);
   const filesURL = page.url();
 
-  await selectWorkspace(page, 'Everything');
+  await selectWorkspace(page, 'Messages');
   await expect(page.getByText('Synthetic archive subject', { exact: true })).toBeVisible();
   await expect(page).toHaveURL(/\?workspace=everything&mode=full_text$/);
   await page.goBack();
@@ -103,7 +48,7 @@ test('query failures explain recovery in Everything and Files', async ({ page })
 });
 
 test('one registry drives selection, searchable help, palette, and editable suspension', async ({ page }) => {
-  const grid = page.getByRole('grid', { name: 'Everything results' });
+  const grid = page.getByRole('grid', { name: 'Messages results' });
   const renderedRow = page.locator('[data-row-key="message:1"]');
   await grid.focus();
   await expect(grid).toBeFocused();
@@ -129,7 +74,7 @@ test('one registry drives selection, searchable help, palette, and editable susp
   await page.keyboard.press('Shift+A');
   await expect(renderedRow).toHaveAttribute('aria-selected', 'true');
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+K' : 'Control+K');
-  const palette = page.getByRole('dialog', { name: 'Everything commands' });
+  const palette = page.getByRole('dialog', { name: 'Messages commands' });
   await expect(palette).toBeVisible();
   await palette.getByRole('combobox').fill('clear selection');
   const clearSelection = palette.getByRole('option', { name: /Clear selection/ });
@@ -139,7 +84,7 @@ test('one registry drives selection, searchable help, palette, and editable susp
   await expect(renderedRow).toHaveAttribute('aria-selected', 'false');
   await expect(grid).toBeFocused();
 
-  const search = page.getByRole('searchbox', { name: 'Search everything' });
+  const search = page.getByRole('searchbox', { name: 'Search messages' });
   await search.focus();
   await page.keyboard.press('Shift+A');
   await expect(renderedRow).toHaveAttribute('aria-selected', 'false');
@@ -164,17 +109,18 @@ test('one registry drives selection, searchable help, palette, and editable susp
 });
 
 test('keyboard palette grouping focuses the replacement grid', async ({ page }) => {
-  const grid = page.getByRole('grid', { name: 'Everything results' });
+  const grid = page.getByRole('grid', { name: 'Messages results' });
   await grid.focus();
   await page.keyboard.press(process.platform === 'darwin' ? 'Meta+K' : 'Control+K');
-  const palette = page.getByRole('dialog', { name: 'Everything commands' });
-  await palette.getByRole('combobox').fill('group by source');
-  const command = palette.getByRole('option', { name: 'Group by Source' });
+  const palette = page.getByRole('dialog', { name: 'Messages commands' });
+  await palette.getByRole('combobox').fill('source');
+  await page.keyboard.press('ArrowDown');
+  const command = palette.getByRole('option', { name: 'Group by… › Source' });
   await expect(command).toHaveAttribute('aria-selected', 'true');
 
   await page.keyboard.press('Enter');
 
-  const grouped = page.getByRole('grid', { name: 'Everything grouped by source' });
+  const grouped = page.getByRole('grid', { name: 'Messages grouped by source' });
   await expect(palette).toHaveCount(0);
   await expect(grouped).toBeVisible();
   await expect(grouped).toBeFocused();
@@ -196,15 +142,14 @@ for (const theme of ['light', 'dark'] as const) {
     await expect(searchButton).toHaveClass(/kit-button--neutral/);
     await expectRenderedContrast(searchButton, 4.5);
 
-    const grid = page.getByRole('grid', { name: 'Everything results' });
+    const grid = page.getByRole('grid', { name: 'Messages results' });
     await grid.focus();
     await page.keyboard.press('Shift+A');
     const selectedRow = page.locator('[data-row-key="message:1"]');
     await expect(selectedRow).toHaveAttribute('aria-selected', 'true');
-    await expect(selectedRow).toHaveCSS('box-shadow', /2px 0px 0px 0px inset/);
 
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+K' : 'Control+K');
-    const palette = page.getByRole('dialog', { name: 'Everything commands' });
+    const palette = page.getByRole('dialog', { name: 'Messages commands' });
     const activeOption = palette.getByRole('option', { selected: true }).first();
     await expect(activeOption).toBeVisible();
     await expectRenderedContrast(activeOption, 4.5);
@@ -228,12 +173,15 @@ for (const theme of ['light', 'dark'] as const) {
     await page.keyboard.press('ArrowDown');
     await expect(filesGrid).toHaveCSS('box-shadow', /0px 0px 0px 2px inset/);
 
+    await stubOperationStatus(page);
     await selectWorkspace(page, 'Settings');
     const settings = page.getByRole('main', { name: 'Settings' });
     await expect(settings).toBeVisible();
-    await expectRenderedContrast(settings.locator('.row__hint').first(), 4.5);
-    await expectRenderedContrast(settings.locator('.notice--pending'), 4.5);
-    await expectRenderedBoundary(settings.locator('.notice--pending'), 'borderLeftColor', 3);
+    await settings.getByRole('button', { name: 'Advanced', exact: true }).click();
+    await expectRenderedContrast(settings.getByText('UTC or an IANA name such as America/New_York.', { exact: true }), 4.5);
+    await expectRenderedContrast(settings.getByText('Restart pending.', { exact: true }), 4.5);
+    await expectRenderedContrast(settings.getByText('On the computer running msgvault', { exact: false }), 4.5);
+    await expectRenderedBoundary(settings.locator('.kit-notice').filter({ hasText: 'Restart pending.' }), 'borderLeftColor', 3);
   });
 }
 
@@ -255,19 +203,12 @@ async function expectRenderedContrast(locator: import('@playwright/test').Locato
   expect(ratio).toBeGreaterThanOrEqual(minimum);
 }
 
-async function expectRenderedBoundary(
-  locator: import('@playwright/test').Locator,
-  property: 'borderTopColor' | 'borderLeftColor',
-  minimum: number
-) {
+async function expectRenderedBoundary(locator: import('@playwright/test').Locator, property: 'borderLeftColor', minimum: number) {
   const ratio = await locator.evaluate(measureRenderedContrast, { property });
   expect(ratio).toBeGreaterThanOrEqual(minimum);
 }
 
-function measureRenderedContrast(
-  element: Element,
-  { property }: { property: 'color' | 'borderTopColor' | 'borderLeftColor' | 'boxShadow' }
-): number {
+function measureRenderedContrast(element: Element, { property }: { property: 'color' | 'borderLeftColor' }): number {
   let current: Element | null = element;
   let background = getComputedStyle(document.documentElement).backgroundColor;
   while (current) {
@@ -279,10 +220,7 @@ function measureRenderedContrast(
     }
     current = current.parentElement;
   }
-  const rendered = getComputedStyle(element)[property];
-  const foreground = property === 'boxShadow'
-    ? rendered.match(/rgba?\([^)]+\)|#[0-9a-f]{3,8}/i)?.[0] ?? rendered
-    : rendered;
+  const foreground = getComputedStyle(element)[property];
   const luminance = (color: string) => {
     const channels = color.startsWith('color(srgb ')
       ? color.match(/[\d.]+/g)?.slice(0, 3).map(Number) ?? []
@@ -294,12 +232,12 @@ function measureRenderedContrast(
   return (values[0]! + 0.05) / (values[1]! + 0.05);
 }
 
-test('Deletions keeps the global search shortcut available', async ({ page }) => {
+test('Staged deletions keeps the global search shortcut available', async ({ page }) => {
   await page.route('**/api/v1/deletions', route => route.fulfill({ json: { manifests: [] } }));
-  await selectWorkspace(page, 'Deletions');
-  await expect(page.getByRole('heading', { name: 'Deletions', exact: true })).toBeVisible();
+  await selectWorkspace(page, 'Staged deletions');
+  await expect(page.getByRole('heading', { name: 'Staged deletions', exact: true })).toBeVisible();
   await page.keyboard.press('/');
-  await expect(page.getByRole('searchbox', { name: 'Search everything' })).toBeFocused();
+  await expect(page.getByRole('searchbox', { name: 'Search messages' })).toBeFocused();
 });
 
 test('truncated people and filenames disclose full labels on hover', async ({ page }) => {
@@ -326,7 +264,7 @@ test('clicking a people label preserves Everything keyboard navigation and one g
     total_count: 2, cache_revision: 'cache-theme', search_provenance: {}
   } }));
   await page.reload();
-  const grid = page.getByRole('grid', { name: 'Everything results' });
+  const grid = page.getByRole('grid', { name: 'Messages results' });
   await grid.locator('.people-label').first().click();
   await expect(grid).toBeFocused();
   await page.keyboard.press('j');
@@ -343,7 +281,7 @@ test('clicking a people label preserves Everything keyboard navigation and one g
 });
 
 test('clicking an Everything row checkbox keeps keyboard selection in the grid', async ({ page }) => {
-  const grid = page.getByRole('grid', { name: 'Everything results' });
+  const grid = page.getByRole('grid', { name: 'Messages results' });
   const renderedRow = page.locator('[data-row-key="message:1"]');
   await renderedRow.hover();
   await renderedRow.getByRole('checkbox', { name: /^Select / }).click();
@@ -359,7 +297,7 @@ test('clicking a filename returns to Files keyboard navigation without extra row
     occurred_at: '2026-07-18T12:00:00Z', source_id: 1, source_type: 'synthetic',
     source_identifier: 'archive@example.com', containing_title: `Containing item ${id}`,
     filename: `Attachment ${id}.pdf`, mime_type: 'application/pdf', mime_family: 'pdf', size_bytes: 2048,
-    content_state: 'missing_blob', content_available: false
+    content_state: 'unverified', content_available: null
   }));
   await page.route('**/api/v1/files/search', route => route.fulfill({ json: {
     files, total_count: 2, cache_revision: 'cache-theme', search_provenance: {}

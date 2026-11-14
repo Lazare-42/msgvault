@@ -3,6 +3,7 @@ package beeper
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -32,7 +33,7 @@ func participantForBeeperUser(t *testing.T, st *store.Store, userID string) int6
 	require := require.New(t)
 
 	var participantID int64
-	require.NoError(st.DB().QueryRow(st.Rebind(
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(
 		`SELECT participant_id FROM participant_identifiers
 		 WHERE identifier_type = ?
 		   AND (identifier_value = ? OR identifier_value LIKE ?)`),
@@ -50,7 +51,7 @@ func observationValues(
 	require := require.New(t)
 
 	observations, err := st.ListParticipantObservationsContext(
-		context.Background(), participantID, true)
+		t.Context(), participantID, true)
 	require.NoError(err, "ListParticipantObservationsContext")
 	values := make(map[store.ContactAddressKind]string, len(observations))
 	for _, observation := range observations {
@@ -80,6 +81,7 @@ func observationChat(
 }
 
 func TestImportCapturesEveryObservedAddressForOneParticipant(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -97,12 +99,12 @@ func TestImportCapturesEveryObservedAddressForOneParticipant(t *testing.T) {
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
 
-	summary, err := imp.Import(context.Background(), ImportOptions{AccountID: "telegram", NoMedia: true})
+	summary, err := imp.Import(t.Context(), ImportOptions{AccountID: "telegram", NoMedia: true})
 	require.NoError(err, "Import")
 	assert.Positive(summary.ObservationsRecorded, "capture must report what it recorded")
 
 	participantID := participantForBeeperUser(t, st, "@telegram_alice:beeper.local")
-	observations, err := st.ListParticipantObservationsContext(context.Background(), participantID, true)
+	observations, err := st.ListParticipantObservationsContext(t.Context(), participantID, true)
 	require.NoError(err, "ListParticipantObservationsContext")
 	require.Len(observations, 3, "phone, email, and username all attach to one participant")
 
@@ -136,7 +138,7 @@ func observationOriginal(
 	t.Helper()
 	require := require.New(t)
 
-	observations, err := st.ListParticipantObservationsContext(context.Background(), participantID, true)
+	observations, err := st.ListParticipantObservationsContext(t.Context(), participantID, true)
 	require.NoError(err, "ListParticipantObservationsContext")
 	for _, observation := range observations {
 		if observation.AddressKind == kind {
@@ -148,6 +150,7 @@ func observationOriginal(
 }
 
 func TestImportRecordsAUsernameThePhoneServiceRejectsWithoutAService(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -167,11 +170,11 @@ func TestImportRecordsAUsernameThePhoneServiceRejectsWithoutAService(t *testing.
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
 
-	_, err := imp.Import(context.Background(), ImportOptions{AccountID: "whatsapp", NoMedia: true})
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: "whatsapp", NoMedia: true})
 	require.NoError(err, "Import")
 
 	participantID := participantForBeeperUser(t, st, "@15550100001:beeper.local")
-	observations, err := st.ListParticipantObservationsContext(context.Background(), participantID, true)
+	observations, err := st.ListParticipantObservationsContext(t.Context(), participantID, true)
 	require.NoError(err, "ListParticipantObservationsContext")
 	require.Len(observations, 2)
 
@@ -192,10 +195,11 @@ func TestImportRecordsAUsernameThePhoneServiceRejectsWithoutAService(t *testing.
 }
 
 func TestProviderIdentityEvidencePreservesExactValueForPhoneService(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	recorder := newObservationRecorder(st)
 	sourceID := newBeeperTestSource(t, st, "whatsapp")
 	firstID, err := st.EnsureParticipantByIdentifier(
@@ -239,6 +243,7 @@ func TestProviderIdentityEvidencePreservesExactValueForPhoneService(t *testing.T
 }
 
 func TestObservationDedupKeepsChangedProviderIdentity(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
@@ -275,6 +280,7 @@ func TestObservationDedupKeepsChangedProviderIdentity(t *testing.T) {
 }
 
 func TestImportUsesRequestedAccountForObservationIdentityScope(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeBeeper(t)
@@ -298,16 +304,16 @@ func TestImportUsesRequestedAccountForObservationIdentityScope(t *testing.T) {
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
 
-	_, err := imp.Import(context.Background(), ImportOptions{AccountID: "account-a", NoMedia: true})
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: "account-a", NoMedia: true})
 	require.NoError(err, "import account-a")
-	_, err = imp.Import(context.Background(), ImportOptions{AccountID: "account-b", NoMedia: true})
+	_, err = imp.Import(t.Context(), ImportOptions{AccountID: "account-b", NoMedia: true})
 	require.NoError(err, "import account-b")
 
 	left := participantForBeeperUser(t, st, "@telegram_account_a:beeper.local")
 	right := participantForBeeperUser(t, st, "@telegram_account_b:beeper.local")
-	leftObservations, err := st.ListParticipantObservationsContext(context.Background(), left, true)
+	leftObservations, err := st.ListParticipantObservationsContext(t.Context(), left, true)
 	require.NoError(err, "list account-a observations")
-	rightObservations, err := st.ListParticipantObservationsContext(context.Background(), right, true)
+	rightObservations, err := st.ListParticipantObservationsContext(t.Context(), right, true)
 	require.NoError(err, "list account-b observations")
 	require.Len(leftObservations, 1)
 	require.Len(rightObservations, 1)
@@ -320,6 +326,7 @@ func TestImportUsesRequestedAccountForObservationIdentityScope(t *testing.T) {
 }
 
 func TestImportRegistersUnknownBridgeAndPreservesObservedValues(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -335,16 +342,16 @@ func TestImportRegistersUnknownBridgeAndPreservesObservedValues(t *testing.T) {
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
 
-	_, err := imp.Import(context.Background(), ImportOptions{AccountID: "example-bridge", NoMedia: true})
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: "example-bridge", NoMedia: true})
 	require.NoError(err, "Import")
 
-	service, err := st.ResolveCommunicationServiceContext(context.Background(), "example-bridge")
+	service, err := st.ResolveCommunicationServiceContext(t.Context(), "example-bridge")
 	require.NoError(err, "the unknown bridge must have been registered")
 	assert.Equal("Example Bridge", service.DisplayLabel)
 	assert.False(service.IsSystem)
 
 	participantID := participantForBeeperUser(t, st, "@example-bridge_alice:beeper.local")
-	observations, err := st.ListParticipantObservationsContext(context.Background(), participantID, true)
+	observations, err := st.ListParticipantObservationsContext(t.Context(), participantID, true)
 	require.NoError(err, "ListParticipantObservationsContext")
 	require.Len(observations, 1)
 	assert.Equal("Alice.Example", observations[0].NormalizedValue,
@@ -355,6 +362,7 @@ func TestImportRegistersUnknownBridgeAndPreservesObservedValues(t *testing.T) {
 }
 
 func TestImportClassifiesTheBeeperIdentifierAnchor(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -366,10 +374,10 @@ func TestImportClassifiesTheBeeperIdentifierAnchor(t *testing.T) {
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
 
-	_, err := imp.Import(context.Background(), ImportOptions{AccountID: "slack", NoMedia: true})
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: "slack", NoMedia: true})
 	require.NoError(err, "Import")
 
-	slack, err := st.ResolveCommunicationServiceContext(context.Background(), "slack")
+	slack, err := st.ResolveCommunicationServiceContext(t.Context(), "slack")
 	require.NoError(err, "resolve slack")
 
 	var (
@@ -377,7 +385,7 @@ func TestImportClassifiesTheBeeperIdentifierAnchor(t *testing.T) {
 		scopeKind  *string
 		scopeValue *string
 	)
-	require.NoError(st.DB().QueryRow(st.Rebind(
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(
 		`SELECT service_id, scope_kind, scope_value FROM participant_identifiers
 		 WHERE identifier_type = ? AND identifier_value = ?`),
 		participantIdentifierType,
@@ -392,10 +400,11 @@ func TestImportClassifiesTheBeeperIdentifierAnchor(t *testing.T) {
 }
 
 func TestAnchorClassificationRetriesAfterStoreFailureInTheSameRecorder(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	recorder := newObservationRecorder(st)
 	userID := "@slack_retry:beeper.local"
 	participantID, err := st.EnsureParticipantByIdentifier(
@@ -423,7 +432,7 @@ func TestAnchorClassificationRetriesAfterStoreFailureInTheSameRecorder(t *testin
 		scopeKind sql.NullString
 		scope     sql.NullString
 	)
-	require.NoError(st.DB().QueryRow(st.Rebind(`SELECT service_id, scope_kind, scope_value
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`SELECT service_id, scope_kind, scope_value
 		FROM participant_identifiers
 		WHERE identifier_type = ? AND identifier_value = ?`),
 		participantIdentifierType, userID,
@@ -441,36 +450,38 @@ func installAnchorClassificationFailure(t *testing.T, st *store.Store) func() {
 	require := require.New(t)
 
 	if st.IsPostgreSQL() {
-		_, err := st.DB().Exec(`CREATE FUNCTION fail_beeper_anchor_classification()
+		_, err := st.DB().ExecContext(t.Context(), `CREATE FUNCTION fail_beeper_anchor_classification()
 			RETURNS trigger LANGUAGE plpgsql AS $$
 			BEGIN
 				RAISE EXCEPTION 'forced anchor classification failure';
 			END;
 			$$`)
 		require.NoError(err, "create PostgreSQL failure function")
-		_, err = st.DB().Exec(`CREATE TRIGGER fail_beeper_anchor_classification
+		_, err = st.DB().ExecContext(t.Context(), `CREATE TRIGGER fail_beeper_anchor_classification
 			BEFORE UPDATE OF service_id ON participant_identifiers
 			FOR EACH ROW EXECUTE FUNCTION fail_beeper_anchor_classification()`)
 		require.NoError(err, "create PostgreSQL failure trigger")
+		// Cleanup runs after t.Context() is canceled.
 		release := func() {
-			_, err := st.DB().Exec(`DROP TRIGGER IF EXISTS fail_beeper_anchor_classification
+			_, err := st.DB().ExecContext(context.WithoutCancel(t.Context()), `DROP TRIGGER IF EXISTS fail_beeper_anchor_classification
 				ON participant_identifiers`)
 			require.NoError(err, "drop PostgreSQL failure trigger")
-			_, err = st.DB().Exec(`DROP FUNCTION IF EXISTS fail_beeper_anchor_classification()`)
+			_, err = st.DB().ExecContext(context.WithoutCancel(t.Context()), `DROP FUNCTION IF EXISTS fail_beeper_anchor_classification()`)
 			require.NoError(err, "drop PostgreSQL failure function")
 		}
 		t.Cleanup(release)
 		return release
 	}
 
-	_, err := st.DB().Exec(`CREATE TRIGGER fail_beeper_anchor_classification
+	_, err := st.DB().ExecContext(t.Context(), `CREATE TRIGGER fail_beeper_anchor_classification
 		BEFORE UPDATE OF service_id ON participant_identifiers
 		FOR EACH ROW BEGIN
 			SELECT RAISE(ABORT, 'forced anchor classification failure');
 		END`)
 	require.NoError(err, "create SQLite failure trigger")
+	// Cleanup runs after t.Context() is canceled.
 	release := func() {
-		_, err := st.DB().Exec(`DROP TRIGGER IF EXISTS fail_beeper_anchor_classification`)
+		_, err := st.DB().ExecContext(context.WithoutCancel(t.Context()), `DROP TRIGGER IF EXISTS fail_beeper_anchor_classification`)
 		require.NoError(err, "drop SQLite failure trigger")
 	}
 	t.Cleanup(release)
@@ -478,6 +489,7 @@ func installAnchorClassificationFailure(t *testing.T, st *store.Store) func() {
 }
 
 func TestImportCaptureIsIdempotentAcrossRuns(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -491,7 +503,7 @@ func TestImportCaptureIsIdempotentAcrossRuns(t *testing.T) {
 	))
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	first, err := imp.Import(ctx, ImportOptions{AccountID: "telegram", NoMedia: true})
 	require.NoError(err, "first Import")
@@ -509,6 +521,7 @@ func TestImportCaptureIsIdempotentAcrossRuns(t *testing.T) {
 }
 
 func TestImportResetsRunLocalObservationDedupe(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -522,13 +535,13 @@ func TestImportResetsRunLocalObservationDedupe(t *testing.T) {
 	))
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	first, err := imp.Import(ctx, ImportOptions{AccountID: "telegram", NoMedia: true})
 	require.NoError(err, "first Import")
 	require.Equal(int64(3), first.ObservationsRecorded)
 
-	_, err = st.DB().Exec(`DELETE FROM participant_contact_observations`)
+	_, err = st.DB().ExecContext(t.Context(), `DELETE FROM participant_contact_observations`)
 	require.NoError(err, "remove observations between import runs")
 
 	second, err := imp.Import(ctx, ImportOptions{AccountID: "telegram", NoMedia: true})
@@ -538,6 +551,7 @@ func TestImportResetsRunLocalObservationDedupe(t *testing.T) {
 }
 
 func TestImportResetsRunLocalAnchorClassification(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeBeeper(t)
@@ -548,7 +562,7 @@ func TestImportResetsRunLocalAnchorClassification(t *testing.T) {
 	f.addChat(observationChat("facebook", "Facebook", userID, self, participant))
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := imp.Import(ctx, ImportOptions{AccountID: "telegram", NoMedia: true})
 	require.NoError(err, "import Telegram account")
@@ -558,7 +572,7 @@ func TestImportResetsRunLocalAnchorClassification(t *testing.T) {
 	require.NoError(err, "resolve Facebook")
 	readServiceID := func(accountID string) int64 {
 		var serviceID int64
-		require.NoError(st.DB().QueryRow(st.Rebind(
+		require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(
 			`SELECT service_id FROM participant_identifiers
 			 WHERE identifier_type = ? AND identifier_value = ?`),
 			participantIdentifierType, beeperidentity.Fallback(accountID, userID),
@@ -574,6 +588,7 @@ func TestImportResetsRunLocalAnchorClassification(t *testing.T) {
 }
 
 func TestImportUsesParticipantBridgePrefixBeforeOpaqueAccountFallback(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeBeeper(t)
@@ -590,7 +605,7 @@ func TestImportUsesParticipantBridgePrefixBeforeOpaqueAccountFallback(t *testing
 	))
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := imp.Import(ctx, ImportOptions{AccountID: "acct-opaque-7", NoMedia: true})
 	require.NoError(err, "import unknown bridge")
@@ -611,6 +626,7 @@ func TestImportUsesParticipantBridgePrefixBeforeOpaqueAccountFallback(t *testing
 }
 
 func TestImportUsesEachParticipantsOwnBridgePrefix(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeBeeper(t)
@@ -627,7 +643,7 @@ func TestImportUsesEachParticipantsOwnBridgePrefix(t *testing.T) {
 	))
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := imp.Import(ctx, ImportOptions{AccountID: "acct-opaque-9", NoMedia: true})
 	require.NoError(err, "import mixed-prefix chat")
@@ -645,6 +661,7 @@ func TestImportUsesEachParticipantsOwnBridgePrefix(t *testing.T) {
 }
 
 func TestImportDoesNotGuessChatPrefixWhenParticipantsDisagree(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeBeeper(t)
@@ -665,7 +682,7 @@ func TestImportDoesNotGuessChatPrefixWhenParticipantsDisagree(t *testing.T) {
 	))
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := imp.Import(ctx, ImportOptions{AccountID: "acct-opaque-10", NoMedia: true})
 	require.NoError(err, "import mixed-prefix chat")
@@ -685,6 +702,7 @@ func TestImportDoesNotGuessChatPrefixWhenParticipantsDisagree(t *testing.T) {
 }
 
 func TestImportDoesNotUsePrefixConsensusFromIncompleteParticipants(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeBeeper(t)
@@ -702,7 +720,7 @@ func TestImportDoesNotUsePrefixConsensusFromIncompleteParticipants(t *testing.T)
 	f.setChatGetFailure("!partial-prefix:beeper.local", true)
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := imp.Import(ctx, ImportOptions{AccountID: "acct-partial-prefix", NoMedia: true})
 	require.ErrorContains(err, "partial Beeper sync")
@@ -721,6 +739,7 @@ func TestImportDoesNotUsePrefixConsensusFromIncompleteParticipants(t *testing.T)
 }
 
 func TestObservationDedupeKeyIncludesParticipantAndSource(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name            string
 		differentSource bool
@@ -733,7 +752,7 @@ func TestObservationDedupeKeyIncludesParticipantAndSource(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
 			st := testutil.NewTestStore(t)
-			ctx := context.Background()
+			ctx := t.Context()
 			recorder := newObservationRecorder(st)
 			firstParticipant, err := st.EnsureParticipantByIdentifier(
 				participantIdentifierType, "@telegram_first:beeper.local", "First Person")
@@ -767,6 +786,7 @@ func TestObservationDedupeKeyIncludesParticipantAndSource(t *testing.T) {
 }
 
 func TestImportCapturesTheSelfParticipant(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -781,7 +801,7 @@ func TestImportCapturesTheSelfParticipant(t *testing.T) {
 	imp, st, closeServer := newTestImporter(t, f)
 	defer closeServer()
 
-	_, err := imp.Import(context.Background(), ImportOptions{AccountID: "telegram", NoMedia: true})
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: "telegram", NoMedia: true})
 	require.NoError(err, "Import")
 
 	selfID := participantForBeeperUser(t, st, "@telegram_me:beeper.local")
@@ -791,10 +811,11 @@ func TestImportCapturesTheSelfParticipant(t *testing.T) {
 }
 
 func TestSkippedInvalidObservationIsDeduplicatedWithinRecorderRun(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	recorder := newObservationRecorder(st)
 	participantID, err := st.EnsureParticipantByIdentifier(
 		participantIdentifierType, "@invalid_phone:beeper.local", "Test User")
@@ -823,10 +844,11 @@ func TestSkippedInvalidObservationIsDeduplicatedWithinRecorderRun(t *testing.T) 
 }
 
 func TestRenamedUsernameSupersedesTheOldValueOnTheSameAnchor(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	recorder := newObservationRecorder(st)
 	sourceID := newBeeperTestSource(t, st, "telegram")
 
@@ -859,10 +881,11 @@ func TestRenamedUsernameSupersedesTheOldValueOnTheSameAnchor(t *testing.T) {
 }
 
 func TestRenamedUsernameDoesNotSupersedeAnotherSource(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	participantID, err := st.EnsureParticipantByIdentifier(
 		participantIdentifierType, "@alice:beeper.local", "Alice Example")
 	require.NoError(err, "ensure participant")
@@ -901,6 +924,7 @@ func TestRenamedUsernameDoesNotSupersedeAnotherSource(t *testing.T) {
 }
 
 func TestRenamedUsernameSupersessionRetriesAfterPartialWrite(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name          string
 		freshRecorder bool
@@ -912,7 +936,7 @@ func TestRenamedUsernameSupersessionRetriesAfterPartialWrite(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
 			st := testutil.NewTestStore(t)
-			ctx := context.Background()
+			ctx := t.Context()
 			recorder := newObservationRecorder(st)
 			sourceID := newBeeperTestSource(t, st, "telegram")
 			participantID, err := st.EnsureParticipantByIdentifier(
@@ -965,39 +989,41 @@ func installRenameSupersedeFailure(t *testing.T, st *store.Store) func() {
 	require := require.New(t)
 
 	if st.IsPostgreSQL() {
-		_, err := st.DB().Exec(`CREATE FUNCTION fail_beeper_username_supersede()
+		_, err := st.DB().ExecContext(t.Context(), `CREATE FUNCTION fail_beeper_username_supersede()
 			RETURNS trigger LANGUAGE plpgsql AS $$
 			BEGIN
 				RAISE EXCEPTION 'forced rename supersede failure';
 			END;
 			$$`)
 		require.NoError(err, "create PostgreSQL failure function")
-		_, err = st.DB().Exec(`CREATE TRIGGER fail_beeper_username_supersede
+		_, err = st.DB().ExecContext(t.Context(), `CREATE TRIGGER fail_beeper_username_supersede
 			BEFORE UPDATE OF active_until ON participant_contact_observations
 			FOR EACH ROW WHEN (NEW.active_until IS NOT NULL)
 			EXECUTE FUNCTION fail_beeper_username_supersede()`)
 		require.NoError(err, "create PostgreSQL failure trigger")
 
+		// Cleanup runs after t.Context() is canceled.
 		release := func() {
-			_, err := st.DB().Exec(`DROP TRIGGER IF EXISTS fail_beeper_username_supersede
+			_, err := st.DB().ExecContext(context.WithoutCancel(t.Context()), `DROP TRIGGER IF EXISTS fail_beeper_username_supersede
 				ON participant_contact_observations`)
 			require.NoError(err, "drop PostgreSQL failure trigger")
-			_, err = st.DB().Exec(`DROP FUNCTION IF EXISTS fail_beeper_username_supersede()`)
+			_, err = st.DB().ExecContext(context.WithoutCancel(t.Context()), `DROP FUNCTION IF EXISTS fail_beeper_username_supersede()`)
 			require.NoError(err, "drop PostgreSQL failure function")
 		}
 		t.Cleanup(release)
 		return release
 	}
 
-	_, err := st.DB().Exec(`CREATE TRIGGER fail_beeper_username_supersede
+	_, err := st.DB().ExecContext(t.Context(), `CREATE TRIGGER fail_beeper_username_supersede
 		BEFORE UPDATE OF active_until ON participant_contact_observations
 		FOR EACH ROW WHEN NEW.active_until IS NOT NULL
 		BEGIN
 			SELECT RAISE(ABORT, 'forced rename supersede failure');
 		END`)
 	require.NoError(err, "create SQLite failure trigger")
+	// Cleanup runs after t.Context() is canceled.
 	release := func() {
-		_, err := st.DB().Exec(`DROP TRIGGER IF EXISTS fail_beeper_username_supersede`)
+		_, err := st.DB().ExecContext(context.WithoutCancel(t.Context()), `DROP TRIGGER IF EXISTS fail_beeper_username_supersede`)
 		require.NoError(err, "drop SQLite failure trigger")
 	}
 	t.Cleanup(release)
@@ -1005,10 +1031,11 @@ func installRenameSupersedeFailure(t *testing.T, st *store.Store) func() {
 }
 
 func TestMultipleUsernamesAndPhonesCoexistOnOneParticipant(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	recorder := newObservationRecorder(st)
 
 	participantID, err := st.EnsureParticipantByIdentifier(
@@ -1061,10 +1088,11 @@ func TestMultipleUsernamesAndPhonesCoexistOnOneParticipant(t *testing.T) {
 }
 
 func TestRecycledUsernameDoesNotMergePeopleOrEraseHistory(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	sourceID := newBeeperTestSource(t, st, "telegram")
 	cc := captureContext{SourceID: sourceID, AccountID: "telegram", Network: "Telegram"}
 
@@ -1107,10 +1135,11 @@ func TestRecycledUsernameDoesNotMergePeopleOrEraseHistory(t *testing.T) {
 }
 
 func TestSameUsernameUnderDifferentStableIDsStaysAConflict(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	cc := captureContext{
 		SourceID: newBeeperTestSource(t, st, "telegram"), AccountID: "telegram", Network: "Telegram",
 	}
@@ -1144,4 +1173,90 @@ func TestSameUsernameUnderDifferentStableIDsStaysAConflict(t *testing.T) {
 	aliceCurrent, err := st.ListParticipantObservationsContext(ctx, alice, true)
 	require.NoError(err, "alice current")
 	assert.Len(aliceCurrent, 1, "neither observation is repointed or superseded by the collision")
+}
+
+func TestWhatsAppMergeCountsResolvedAddresses(t *testing.T) {
+	st, participant, owner, merge, err := whatsappMergeFixture(t)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name string
+		read func() (store.PersonMergeLabels, error)
+	}{
+		{"detail", func() (store.PersonMergeLabels, error) {
+			detail, err := st.GetPersonMergeContext(t.Context(), merge)
+			if err != nil {
+				return store.PersonMergeLabels{}, err
+			}
+			return detail.Labels, nil
+		}},
+		{"list", func() (store.PersonMergeLabels, error) {
+			page, err := st.ListPersonMergesContext(t.Context(), owner)
+			if err != nil {
+				return store.PersonMergeLabels{}, err
+			}
+			if len(page) != 1 {
+				return store.PersonMergeLabels{}, fmt.Errorf("got %d merges, want 1", len(page))
+			}
+			return page[0].Labels, nil
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			labels, err := tc.read()
+			require.NoError(t, err)
+			assert.Equal(t, 2, labels.AbsorbedAddressCount)
+			var keys []string
+			for _, address := range labels.Addresses {
+				if address.ParticipantID == participant {
+					keys = append(keys, address.IdentityKey)
+				}
+			}
+			assert.ElementsMatch(t, []string{`["phone","","","+12025550123"]`, `["whatsapp","","","+12025550123"]`}, keys)
+		})
+	}
+	t.Run("durable identifier", func(t *testing.T) {
+		user := &User{ID: "@garden-reader:beeper.local", FullName: "Reader", PhoneNumber: "+12025550123"}
+		again, err := newParticipantResolver(st, "garden").resolveUser(t.Context(), user)
+		require.NoError(t, err)
+		assert.Equal(t, participant, again)
+	})
+}
+
+func whatsappMergeFixture(t *testing.T) (*store.Store, int64, int64, int64, error) {
+	t.Helper()
+	st, ctx := testutil.NewTestStore(t), t.Context()
+	account := "garden"
+	user := &User{ID: "@garden-reader:beeper.local", FullName: "Reader", PhoneNumber: "+12025550123"}
+	participant, err := newParticipantResolver(st, account).resolveUser(ctx, user)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	_, err = newObservationRecorder(st).capture(ctx, participant, user, captureContext{SourceID: newBeeperTestSource(t, st, account), AccountID: account, Network: "WhatsApp"})
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	guest, _, err := st.CreatePersonFromParticipantContext(ctx, participant)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	_, err = st.AddPersonContactPointContext(ctx, guest.ID, store.PersonContactPointInput{AddressKind: store.ContactAddressPhone, ServiceSlug: new("whatsapp"), OriginalValue: "+12025550123", Envelope: store.ValueEnvelopeInput{Source: store.ProvenanceUser}})
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	guest, err = st.GetPersonContext(ctx, guest.ID)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	ownerID, err := st.EnsureParticipantContext(ctx, "owner@example.org", "Owner", "example.org")
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	ownerPerson, _, err := st.CreatePersonFromParticipantContext(ctx, ownerID)
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	merged, err := st.MergePersonsContext(ctx, store.PersonMergeRequest{SurvivorID: ownerPerson.ID, AbsorbedID: guest.ID, ExpectedSurvivorRevision: ownerPerson.Revision, ExpectedAbsorbedRevision: guest.Revision, IdempotencyKey: "whatsapp-merge", Actor: "test"})
+	if err != nil {
+		return nil, 0, 0, 0, err
+	}
+	return st, participant, ownerPerson.ID, merged.Merge.ID, nil
 }

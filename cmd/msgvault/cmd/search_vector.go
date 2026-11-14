@@ -94,6 +94,11 @@ func runHybridSearch(cmd *cobra.Command, queryStr, mode string, explain bool) (r
 	if searchJSON {
 		return outputHybridResultsJSON(resp, explain)
 	}
+	defer func() {
+		for _, hint := range semanticMoreResultsHints(resp) {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Hint: "+hint["message"])
+		}
+	}()
 	return outputHybridResultsTable(resp, explain)
 }
 
@@ -173,13 +178,14 @@ func outputHybridResultsJSON(resp *daemonclient.CLIHybridSearch, explain bool) e
 	rows := make([]map[string]any, len(resp.Results))
 	for i, r := range resp.Results {
 		row := map[string]any{
-			"id":              r.ID,
-			"subject":         r.Subject,
-			"from_email":      r.FromEmail,
-			"sent_at":         r.SentAt.Format(time.RFC3339),
-			"boosted":         r.SubjectBoosted,
-			"conversation_id": r.Message.ConversationID,
-			"snippet":         r.Message.Snippet,
+			"id":                  r.ID,
+			"subject":             r.Subject,
+			"from_email":          r.FromEmail,
+			"sent_at":             r.SentAt.Format(time.RFC3339),
+			"boosted":             r.SubjectBoosted,
+			"conversation_id":     r.Message.ConversationID,
+			"snippet":             r.Message.Snippet,
+			"hidden_text_present": r.Message.HiddenTextPresent,
 		}
 		if r.AttachmentCount != nil {
 			row["attachment_count"] = *r.AttachmentCount
@@ -218,6 +224,9 @@ func outputHybridResultsJSON(resp *daemonclient.CLIHybridSearch, explain bool) e
 	if resp.Accelerator != "" {
 		output["accelerator"] = resp.Accelerator
 	}
+	if hints := semanticMoreResultsHints(resp); len(hints) > 0 {
+		output["hints"] = hints
+	}
 	return printJSON(output)
 }
 
@@ -241,4 +250,25 @@ func sortSemanticResultsByDate(results []daemonclient.CLIHybridSearchResult) {
 		}
 		return 0
 	})
+}
+
+func semanticMoreResultsHints(resp *daemonclient.CLIHybridSearch) []map[string]string {
+	if resp.HasMore {
+		return []map[string]string{{"code": "more_available", "message": "more messages match; raise --limit"}}
+	}
+	if resp.RankingLimitReached > 0 {
+		message := fmt.Sprintf("semantic result limit reached; raise vector.search.max_page_size_hybrid above %d", resp.RankingLimitReached)
+		if resp.CandidateLimitReached > 0 {
+			message += fmt.Sprintf(" and vector.search.k_per_signal above %d", resp.CandidateLimitReached)
+		}
+		message += " on the server and restart it, then raise --limit"
+		return []map[string]string{{
+			"code":    "ranking_limit_reached",
+			"message": message,
+		}}
+	}
+	if resp.CandidateLimitReached > 0 {
+		return []map[string]string{{"code": "candidate_limit_reached", "message": fmt.Sprintf("more messages match; raise vector.search.k_per_signal above %d on the server and restart it, then raise --limit", resp.CandidateLimitReached)}}
+	}
+	return nil
 }

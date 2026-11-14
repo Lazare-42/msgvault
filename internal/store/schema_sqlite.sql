@@ -33,33 +33,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     cc_addr,
     tokenize='unicode61 remove_diacritics 1'
 );
-
--- Document chunks keep canonical text in document_chunks. This external-
--- content index is a rebuildable derivative and never owns excerpts.
-CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
-    text,
-    content='document_chunks',
-    content_rowid='id',
-    tokenize='unicode61 remove_diacritics 1'
-);
-
-CREATE TRIGGER IF NOT EXISTS trg_document_chunks_fts_insert
-AFTER INSERT ON document_chunks BEGIN
-    INSERT INTO document_chunks_fts(rowid, text) VALUES (new.id, new.text);
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_document_chunks_fts_delete
-AFTER DELETE ON document_chunks BEGIN
-    INSERT INTO document_chunks_fts(document_chunks_fts, rowid, text)
-    VALUES ('delete', old.id, old.text);
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_document_chunks_fts_update
-AFTER UPDATE OF text ON document_chunks BEGIN
-    INSERT INTO document_chunks_fts(document_chunks_fts, rowid, text)
-    VALUES ('delete', old.id, old.text);
-    INSERT INTO document_chunks_fts(rowid, text) VALUES (new.id, new.text);
-END;
 CREATE VIRTUAL TABLE IF NOT EXISTS attachment_ocr_fts USING fts5(
     content_hash UNINDEXED,
     page_number UNINDEXED,

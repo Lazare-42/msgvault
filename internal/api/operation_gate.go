@@ -368,7 +368,8 @@ func writeOperationGateBusy(w http.ResponseWriter, r *http.Request, gate Operati
 // and runs schema init/migrations.
 //
 // Backup freeze begin, meeting import, and historical import jobs coordinate
-// the gate in their handlers.
+// the gate in their handlers. Local search acquires it in its controller after
+// installing shared files.
 // Meeting import first reads and validates its bounded request body so a slow
 // authenticated upload cannot hold the gate. Backup freeze end bypasses the
 // gate so it can release the freeze held by begin. Routing these through the
@@ -377,6 +378,9 @@ func writeOperationGateBusy(w http.ResponseWriter, r *http.Request, gate Operati
 // DELETE /api/v1/agent-tokens/{id} uses a dynamic path; its exemption is
 // handled by the strings.HasPrefix check in operationGateRequest below.
 var operationGateExemptPaths = map[string]bool{
+	// MCP envelopes delegate gate acquisition to their nested API requests.
+	"/mcp":        true,
+	"/mcp/writes": true,
 	// Calendar control acquires the gate after parsing, authorization, and preview.
 	"/api/v1/calendar/control": true,
 	// Scoring coordinates the gate around local mutations, never provider I/O.
@@ -391,7 +395,9 @@ var operationGateExemptPaths = map[string]bool{
 	agentTokensPath:                    true,
 	sessionLoginPath:                   true,
 	importJobsEndpointPath:             true,
+	localEmbeddingsEndpointPath:        true,
 	meetingImportEndpointPath:          true,
+	messageImportEndpointPath:          true,
 	muesliImportEndpointPath:           true,
 	muesliRecordingEndpointPath:        true,
 	"/api/v1/cli/add-calendar/plan":    true,
@@ -420,11 +426,12 @@ var operationGateExemptPaths = map[string]bool{
 // registerSearchCoverageRoute (the OpenAPI "Exploration" tag), so a new
 // analytical route forces a conscious classification decision here.
 //
-// The remote-image proxy and CardDAV account test are the non-Exploration
+// The remote-image proxy and CardDAV account test are non-Exploration
 // entries. Both perform SSRF-validated outbound reads without changing
 // archive or persistent configuration state, so they must stay available
-// while a long archive operation holds the gate. Kata evidence preparation
-// only reads message bodies and extracted document text. Message tag reads and
+// while a long archive operation holds the gate. Meeting actions, context,
+// and metrics are also non-Exploration read routes. Kata evidence preparation
+// only reads message bodies and Docbank renditions. Message tag reads and
 // previews bypass the gate here; their handler takes it for actual writes.
 const cardDAVAccountTestPath = "/api/v1/carddav/account/test"
 
@@ -460,6 +467,10 @@ var readOnlyPostRoutePatterns = []string{
 	"/api/v1/relationships",
 	"/api/v1/relationships/{id}/calendar",
 	"/api/v1/relationships/{id}/timeline",
+	// Meeting actions, context, and metrics read archived meeting rows in a read snapshot.
+	"/api/v1/meetings/actions",
+	"/api/v1/meetings/context",
+	"/api/v1/meetings/metrics",
 	"/api/v1/search/coverage",
 }
 
@@ -605,6 +616,10 @@ func cliRepairMessageGateDecision(r *http.Request) (label string, skip bool, err
 // cliRunReadOnlyCommands are proxied CLI commands that only read. Keys are
 // the leading command-path words of CLIRunRequest args (flags follow them).
 var cliRunReadOnlyCommands = map[string]bool{
+	"export-messages":   true,
+	"export-discord":    true,
+	"list-folders":      true,
+	"policy list":       true,
 	"draft-get":         true,
 	"draft-send-as":     true,
 	"logs":              true,
@@ -612,7 +627,9 @@ var cliRunReadOnlyCommands = map[string]bool{
 	"show-deletion":     true,
 	"embeddings list":   true,
 	"embeddings status": true,
-	"documents search":  true,
+	// Tier previews only read.
+	"person tiers preview": true,
+	"person tiers explain": true,
 }
 
 // cliRunSelfGatedCommands are proxied CLI commands that acquire the
@@ -631,6 +648,19 @@ var cliRunSelfGatedCommands = map[string]bool{
 // ungated generic CLI subprocess.
 func IsCLIRunEmbeddingsOptimize(args []string) bool {
 	return len(args) > 0 && cliRunCommandWords(args) == "embeddings optimize"
+}
+
+// IsCLIRunEmbeddingsBuild identifies commands coordinated by the daemon.
+func IsCLIRunEmbeddingsBuild(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch cliRunCommandWords(args) {
+	case "embeddings build", "embeddings resume", "build-embeddings":
+		return true
+	default:
+		return false
+	}
 }
 
 func cliRunGateDecision(r *http.Request, auth requestAuthentication) (label string, skip bool, err error) {
@@ -658,7 +688,7 @@ func cliRunGateDecision(r *http.Request, auth requestAuthentication) (label stri
 			return "", true, nil
 		}
 		command := cliRunCommandWords(req.Args)
-		if cliRunReadOnlyCommands[command] || cliRunSelfGatedCommands[command] || IsCLIRunEmbeddingsOptimize(req.Args) {
+		if cliRunReadOnlyCommands[command] || cliRunSelfGatedCommands[command] || IsCLIRunEmbeddingsOptimize(req.Args) || IsCLIRunEmbeddingsBuild(req.Args) {
 			return "", true, nil
 		}
 		if command != "" {
@@ -675,9 +705,9 @@ func cliRunGateDecision(r *http.Request, auth requestAuthentication) (label stri
 // cliRunCommandGroups are proxied parent commands whose second arg is a
 // subcommand name rather than a positional value.
 var cliRunCommandGroups = map[string]bool{
+	"policy":     true,
 	"embeddings": true,
 	"backup":     true,
-	"documents":  true,
 }
 
 // cliRunCommandWords extracts the command path while consuming supported flags and their values.
@@ -685,6 +715,9 @@ func cliRunCommandWords(args []string) string {
 	first := args[0]
 	if strings.HasPrefix(first, "-") {
 		return ""
+	}
+	if first == cliRunPersonCommand && len(args) > 2 && args[1] == "tiers" {
+		return first + " tiers " + args[2]
 	}
 	if !cliRunCommandGroups[first] {
 		return first

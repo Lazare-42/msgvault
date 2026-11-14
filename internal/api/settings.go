@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
+	"go.kenn.io/msgvault/internal/attachmentpolicy"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/scheduler"
@@ -308,6 +309,14 @@ var settingsCatalog = []settingDefinition{
 	stringArraySetting("beeper.accounts", settingsGroupSources, func(c *config.Config) []string { return c.Beeper.Accounts }),
 	stringArraySetting("beeper.exclude_accounts", settingsGroupSources, func(c *config.Config) []string { return c.Beeper.ExcludeAccounts }),
 	numberSetting("beeper.rate_limit_qps", settingsGroupSources, func(c *config.Config) float64 { return c.Beeper.RateLimitQPS }),
+	boolSetting("inline.enabled", settingsGroupSources, func(c *config.Config) bool { return c.Inline.Enabled }),
+	stringSetting("inline.schedule", settingsGroupSources, nil, func(c *config.Config) string { return c.Inline.Schedule }),
+	boolSetting("feeds.enabled", settingsGroupSources, func(c *config.Config) bool { return c.Feeds.Enabled }),
+	stringSetting("feeds.schedule", settingsGroupSources, nil, func(c *config.Config) string { return c.Feeds.Schedule }),
+	configuredBoolSetting("inline.media", settingsGroupAttachments, func(c *config.Config) bool { return c.Inline.Media == nil || *c.Inline.Media }, func(c *config.Config) bool { return c.Inline.Media == nil }),
+	stringSetting("inline.media_scope", settingsGroupAttachments, []string{string(attachmentpolicy.ScopeAll), string(attachmentpolicy.ScopeDirect), string(attachmentpolicy.ScopeNone)}, func(c *config.Config) string { return effectiveMediaScope(c.Inline.MediaScope) }),
+	intSetting("inline.media_max_participants", settingsGroupAttachments, func(c *config.Config) int { return c.Inline.MediaMaxParticipants }),
+	intSetting("inline.max_media_mb", settingsGroupAttachments, func(c *config.Config) int { return c.Inline.MaxMediaMB }),
 	boolSetting("slack.enabled", settingsGroupSources, func(c *config.Config) bool { return c.Slack.Enabled }),
 	stringSetting("slack.schedule", settingsGroupSources, nil, func(c *config.Config) string { return c.Slack.Schedule }),
 	stringArraySetting("slack.channels", settingsGroupSources, func(c *config.Config) []string { return c.Slack.Channels }),
@@ -330,6 +339,8 @@ var settingsCatalog = []settingDefinition{
 	stringSetting("teams.media_scope", settingsGroupAttachments, []string{"all", "direct", "none"}, func(c *config.Config) string { return effectiveMediaScope(c.Teams.MediaScope) }),
 	intSetting("teams.media_max_participants", settingsGroupAttachments, func(c *config.Config) int { return c.Teams.MediaMaxParticipants }),
 	intSetting("teams.max_media_mb", settingsGroupAttachments, func(c *config.Config) int { return c.Teams.MaxMediaMB }),
+	intSetting("imessage.media_max_participants", settingsGroupAttachments, func(c *config.Config) int { return c.IMessage.MediaMaxParticipants }),
+	intSetting("imessage.max_media_mb", settingsGroupAttachments, func(c *config.Config) int { return c.IMessage.MaxMediaMB }),
 	stringSetting("activity.timezone", "archive", nil, func(c *config.Config) string { return c.Activity.Timezone }),
 	intSetting("activity.max_direct_counterparts", "archive", func(c *config.Config) int { return c.Activity.MaxDirectCounterparts }),
 	intSetting("activity.batch_size", "archive", func(c *config.Config) int { return c.Activity.BatchSize }),
@@ -351,6 +362,7 @@ var settingsCatalog = []settingDefinition{
 	secretSetting("integrations.tasks.api_key", "integrations", func(_ *Server, c *config.Config) string { return c.Integrations.Tasks.APIKey }),
 	stringSetting("integrations.tasks.default_project", "integrations", nil, func(c *config.Config) string { return c.Integrations.Tasks.DefaultProject }),
 	boolSetting("integrations.kata.enabled", "integrations", func(c *config.Config) bool { return c.Integrations.Kata.Enabled }),
+	boolSetting("integrations.kata.trust_private_network", "integrations", func(c *config.Config) bool { return c.Integrations.Kata.TrustPrivateNetwork }),
 	stringSetting("integrations.kata.endpoint", "integrations", nil, func(c *config.Config) string { return c.Integrations.Kata.Endpoint }),
 	secretSetting("integrations.kata.api_key", "integrations", func(_ *Server, c *config.Config) string { return c.Integrations.Kata.APIKey }),
 	stringSetting("integrations.kata.default_project", "integrations", nil, func(c *config.Config) string { return c.Integrations.Kata.DefaultProject }),
@@ -734,7 +746,14 @@ func (s *Server) buildSettingsResponse(
 		if definition.inherited != nil {
 			setting.Inherited = definition.inherited(cfg)
 		}
-		if definition.credentialID != "" {
+		if definition.key == "vector.embeddings.endpoint" && cfg.Vector.Embeddings.LocalOnly {
+			setting.Description = "Shared local embedding server selected. Enter a URL to switch providers."
+		}
+		if definition.credentialID == providercredentials.VectorEmbeddingsID && cfg.Vector.Embeddings.LocalOnly {
+			setting.ReadOnly = true
+			setting.Description = "Local embeddings don't use provider credentials."
+			setting.Secret = &SecretSettingState{Configured: false, Source: string(providercredentials.SourceNone)}
+		} else if definition.credentialID != "" {
 			value, state, err := credentials.Resolve(definition.credentialID,
 				definition.credentialEndpoint(cfg), definition.credentialEnvironment(cfg), osLookupEnv)
 			if errors.Is(err, providercredentials.ErrOriginMismatch) {
@@ -874,7 +893,13 @@ func endpointOrigin(endpoint string) string {
 	}
 	scheme := strings.ToLower(parsed.Scheme)
 	if parsed.Host != "" {
-		return scheme + "://" + strings.ToLower(parsed.Host)
+		// IPv6 interface zones are case-sensitive destination identities.
+		host, zone, zoned := strings.Cut(parsed.Host, "%")
+		origin := scheme + "://" + strings.ToLower(host)
+		if zoned {
+			origin += "%" + zone
+		}
+		return origin
 	}
 	return scheme + "://" + parsed.Opaque + parsed.Path
 }
@@ -961,6 +986,9 @@ func settingsEdits(current *config.Config, updates []SettingUpdate) ([]config.Ed
 			return nil, false, fmt.Errorf("%w: %s", errInvalidSettingUpdate, update.Key)
 		}
 		edits = append(edits, config.Edit{Key: update.Key, Value: value})
+		if update.Key == "vector.embeddings.endpoint" {
+			edits = append(edits, config.Edit{Key: "vector.embeddings.local_only", Value: false})
+		}
 		restartRequired = restartRequired || definition.restartRequired
 	}
 	edits = append(edits, credentialSeveranceEdits(current, edits)...)
@@ -990,8 +1018,9 @@ func validateSettingUpdate(key string, value any, options []string) error {
 			return errors.New("must be positive")
 		}
 	case "log.sql_slow_ms", "beeper.media_max_participants", "beeper.max_media_mb",
-		"slack.media_max_participants", "slack.max_media_mb", "discord.media_max_participants",
+		"slack.media_max_participants", "slack.max_media_mb", "inline.media_max_participants", "inline.max_media_mb", "discord.media_max_participants",
 		"discord.max_media_mb", "teams.media_max_participants", "teams.max_media_mb",
+		"imessage.media_max_participants", "imessage.max_media_mb",
 		"vector.search.max_page_size_hybrid":
 		integer, ok := value.(int)
 		if !ok || integer < 0 {

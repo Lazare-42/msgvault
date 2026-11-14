@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"testing"
 	"time"
 
 	"go.kenn.io/msgvault/internal/personenrichment"
@@ -16,6 +17,14 @@ var ParseDBTime = parseDBTime
 // test can open a second independent handle to the same isolated database.
 func DBPathForTest(s *Store) string {
 	return s.dbPath
+}
+
+var pgTestStore func(*testing.T) *Store
+
+// SetPGTestStoreForTest lets package store_test provide testutil's clone fixture,
+// which internal tests can't import because testutil imports store.
+func SetPGTestStoreForTest(f func(*testing.T) *Store) {
+	pgTestStore = f
 }
 
 // MessagesTableColumns returns the live column names of the messages table on
@@ -212,7 +221,7 @@ func (s *Store) SetIMAPLabelRepairPerMessageHookForTest(fn func(messageID int64)
 func ReconcileMessageLabelsTxContextForTest(
 	ctx context.Context, s *Store, messageID int64, labelIDs []int64, replace bool,
 ) error {
-	return s.withTx(func(tx *loggedTx) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		_, err := s.reconcileMessageLabelsTxContext(ctx, tx, messageID, labelIDs, replace)
 		return err
 	})
@@ -367,3 +376,22 @@ var (
 	OwnerIdentifierMatch = ownerIdentifierMatch
 	SenderOwnerFallback  = senderOwnerFallback
 )
+
+// TierOptionsAsOf reads person tier counts as of a fixed date, not today.
+func TierOptionsAsOf(options PersonTierOptions, asOf time.Time) PersonTierOptions {
+	options.asOf = asOf
+	return options
+}
+
+// SetPersonTierRowPage sets the tier read page size and returns the restore func.
+func SetPersonTierRowPage(n int) func() {
+	old := personTierRowPage
+	personTierRowPage = n
+	return func() { personTierRowPage = old }
+}
+
+// LastSuccessfulSyncQueryForTest is the newest-completed-run lookup each
+// incremental sync runs.
+func LastSuccessfulSyncQueryForTest(filterByType bool) string {
+	return lastSuccessfulSyncQuery(filterByType)
+}

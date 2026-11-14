@@ -3,12 +3,17 @@ package query
 import (
 	"time"
 
+	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/search"
 )
 
 // ExploreRequest is the canonical modality-neutral analytical request. The
 // API layer validates the finite grouping/sort catalog before constructing it.
 type ExploreRequest struct {
+	// PersonInteractionsOnly excludes owner-absent events and meetings from person timelines.
+	PersonInteractionsOnly bool `json:"-"`
+	// SentOnly excludes unsent messages before grouping for contact activity timelines.
+	SentOnly     bool         `json:"-"`
 	Context      Context      `json:"context"`
 	Search       SearchSpec   `json:"search"`
 	Grouping     []GroupSpec  `json:"grouping,omitempty"`
@@ -71,8 +76,9 @@ type Context struct {
 	// AdditionalDomainGroups is the domain analogue of
 	// AdditionalParticipantGroups: each inner slice is OR'd internally, the
 	// groups are AND'd together and AND'd with the primary Domains group.
-	AdditionalDomainGroups [][]string `json:"additional_domain_groups,omitempty"`
-	MessageTypes           []string   `json:"message_types,omitempty"`
+	AdditionalDomainGroups [][]string  `json:"additional_domain_groups,omitempty"`
+	MessageTypes           []string    `json:"message_types,omitempty"`
+	Kinds                  []EntryKind `json:"kinds,omitempty"`
 	// MailingLists is an exact case-insensitive scalar membership group.
 	// AdditionalMailingListGroups preserves repeated API filter conjunctions;
 	// values within each group are OR'd, while groups are AND'd.
@@ -169,6 +175,7 @@ type SearchProvenance struct {
 // EntryRow is one logical archive row. Chat/text rows aggregate messages only
 // after Context has been applied; other modalities retain durable item units.
 type EntryRow struct {
+	SenderLabel                string       `json:"sender_label,omitempty"`
 	Key                        string       `json:"key"`
 	Kind                       EntryKind    `json:"kind"`
 	AnchorMessageID            *int64       `json:"anchor_message_id,omitzero" nullable:"false"`
@@ -227,6 +234,7 @@ type ExploreCoverageResult struct {
 }
 
 type ExploreGroupRequest struct {
+	Timezone  string         `json:"timezone,omitempty"`
 	Explore   ExploreRequest `json:"explore"`
 	Dimension string         `json:"dimension"`
 	// GroupKey, when non-empty, restricts the response to the single group
@@ -240,19 +248,40 @@ type ExploreGroupRequest struct {
 	Page     PageSpec `json:"page"`
 }
 
+type ExploreGroupActivity struct {
+	Bucket string `json:"bucket"`
+	Count  int64  `json:"count"`
+}
+
+type ExploreGroupCoParticipant struct {
+	Key   string `json:"key"`
+	Label string `json:"label"`
+	Count int64  `json:"count"`
+}
+
+type ExploreGroupOverview struct {
+	FirstAt        time.Time                   `json:"first_at"`
+	Activity       []ExploreGroupActivity      `json:"activity"`
+	CoParticipants []ExploreGroupCoParticipant `json:"co_participants"`
+}
+
 type ExploreGroupRow struct {
+	TotalItems     int64     `json:"total_items,omitempty,omitzero"`
 	Key            string    `json:"key"`
 	Label          string    `json:"label"`
 	Count          int64     `json:"count"`
 	EstimatedBytes int64     `json:"estimated_bytes"`
 	LatestAt       time.Time `json:"latest_at"`
+	// Level ranks a day row among the returned day rows; other dimensions omit it.
+	Level identityindex.HeatLevel `json:"level,omitempty" enum:"NONE,FIRST_QUARTILE,SECOND_QUARTILE,THIRD_QUARTILE,FOURTH_QUARTILE"`
 }
 
 type ExploreGroupResponse struct {
-	Rows             []ExploreGroupRow `json:"rows"`
-	TotalCount       int64             `json:"total_count"`
-	CacheRevision    string            `json:"cache_revision"`
-	SearchProvenance SearchProvenance  `json:"search_provenance"`
+	Overview         *ExploreGroupOverview `json:"overview,omitempty"`
+	Rows             []ExploreGroupRow     `json:"rows"`
+	TotalCount       int64                 `json:"total_count"`
+	CacheRevision    string                `json:"cache_revision"`
+	SearchProvenance SearchProvenance      `json:"search_provenance"`
 }
 
 type ExploreSelectionRequest struct {

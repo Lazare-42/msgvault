@@ -128,6 +128,11 @@ const (
 	DeletionSearchAggregate DeletionSearchMode = "aggregate"
 )
 
+// MaxDeletionTargetSearchResults is the largest permitted bounded search
+// result set. Callers use the extra row as an overflow sentinel for the
+// 100,000-match staging limit.
+const MaxDeletionTargetSearchResults = 100_001
+
 // DeletionTargetSearchResolver resolves a filtered search and source deletion
 // eligibility in one backend query. Keeping this capability separate from
 // Engine lets callers fail closed when a backend cannot provide a stable
@@ -139,6 +144,20 @@ type DeletionTargetSearchResolver interface {
 		filter MessageFilter,
 		mode DeletionSearchMode,
 	) ([]DeletionTarget, error)
+}
+
+// BoundedDeletionTargetSearchResolver resolves at most maxResults exact
+// search matches for one-shot staging and reports the count before eligibility
+// filtering. The existing unbounded resolver stays
+// available to callers such as the TUI that intentionally stage every match.
+type BoundedDeletionTargetSearchResolver interface {
+	GetDeletionTargetsBySearchBounded(
+		ctx context.Context,
+		searchQuery *search.Query,
+		filter MessageFilter,
+		mode DeletionSearchMode,
+		maxResults int,
+	) ([]DeletionTarget, int, error)
 }
 
 // DeletionTargetAggregateSearchResolver resolves the exact message population
@@ -187,11 +206,15 @@ type SemanticMessageSearchResult struct {
 	HasMore  bool
 }
 
-// Explorer is intentionally separate from Engine: only the committed
-// DuckDB/Parquet analytical read model implements it. Transactional engines
-// must never become a modality-specific fallback for exploration.
-type Explorer interface {
+// EntryExplorer lists message and conversation rows. Auto mode may serve
+// live SQLite rows during or after a full analytical cache rebuild.
+type EntryExplorer interface {
 	Explore(ctx context.Context, request ExploreRequest) (*ExploreResponse, error)
+}
+
+// Explorer adds operations that require the committed analytical cache.
+type Explorer interface {
+	EntryExplorer
 	ExploreCoverage(ctx context.Context, request ExploreCoverageRequest, visit func(messageIDs []int64) error) (*ExploreCoverageResult, error)
 	ExploreGroups(ctx context.Context, request ExploreGroupRequest) (*ExploreGroupResponse, error)
 	ExploreSelectionStats(ctx context.Context, request ExploreSelectionRequest) (*ExploreSelectionStats, error)
@@ -243,12 +266,22 @@ type DomainSearchResult struct {
 	HasMore  bool
 }
 
+// SearchHint suggests a retry when a search returns no matches.
+type SearchHint struct {
+	Code      string `json:"code"`
+	Message   string `json:"message"`
+	RetryWith struct {
+		Query string `json:"query"`
+	} `json:"retry_with"`
+}
+
 // SearchFastResult carries messages and index status, with optional totals and aggregate stats.
 type SearchFastResult struct {
 	IndexState string
 	Messages   []MessageSummary
 	TotalCount int64
 	Stats      *TotalStats
+	Hints      []SearchHint
 }
 
 // TotalStats provides overall database statistics.

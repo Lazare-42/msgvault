@@ -227,7 +227,7 @@ func TestConvertMessageCaptionlessMediaIsArchived(t *testing.T) {
 		},
 	}
 
-	inbound, ok := transport.convertMessage(context.Background(), evt)
+	inbound, ok := transport.convertMessage(t.Context(), evt)
 	require.True(ok, "a captionless media message must still be archived")
 	assert.Empty(inbound.Text)
 	require.NotNil(inbound.Attachment)
@@ -257,7 +257,7 @@ func TestConvertMessageMediaWithCaptionKeepsBothTextAndAttachment(t *testing.T) 
 		},
 	}
 
-	inbound, ok := transport.convertMessage(context.Background(), evt)
+	inbound, ok := transport.convertMessage(t.Context(), evt)
 	require.True(ok)
 	assert.Equal("check this out", inbound.Text)
 	require.NotNil(inbound.Attachment)
@@ -282,7 +282,7 @@ func TestConvertMessageDownloadFailureStillArchivesMessage(t *testing.T) {
 		},
 	}
 
-	inbound, ok := transport.convertMessage(context.Background(), evt)
+	inbound, ok := transport.convertMessage(t.Context(), evt)
 	require.True(ok, "a download failure must not drop the message")
 	require.NotNil(inbound.Attachment)
 	assert.Empty(inbound.Attachment.Data)
@@ -308,7 +308,7 @@ func TestConvertMessageNoDownloaderRecordsErrorWithoutDroppingMessage(t *testing
 		},
 	}
 
-	inbound, ok := transport.convertMessage(context.Background(), evt)
+	inbound, ok := transport.convertMessage(t.Context(), evt)
 	require.True(ok)
 	require.NotNil(inbound.Attachment)
 	assert.Empty(inbound.Attachment.Data)
@@ -322,7 +322,7 @@ func TestConvertMessageTextOnlyMessageHasNoAttachment(t *testing.T) {
 		Message: &waE2E.Message{Conversation: new("hello there")},
 	}
 
-	inbound, ok := transport.convertMessage(context.Background(), evt)
+	inbound, ok := transport.convertMessage(t.Context(), evt)
 	require.True(t, ok)
 	assert.Equal(t, "hello there", inbound.Text)
 	assert.Nil(t, inbound.Attachment)
@@ -335,7 +335,7 @@ func TestConvertMessageEmptyMessageIsDropped(t *testing.T) {
 		Message: &waE2E.Message{},
 	}
 
-	_, ok := transport.convertMessage(context.Background(), evt)
+	_, ok := transport.convertMessage(t.Context(), evt)
 	assert.False(t, ok, "a message with neither text nor media must still be dropped")
 }
 
@@ -415,7 +415,7 @@ func TestConvertMessageBareLocationPinIsArchived(t *testing.T) {
 			transport := &WhatsmeowTransport{account: "15551234567@s.whatsapp.net", downloader: &fakeMediaDownloader{}}
 			evt := &events.Message{Info: testMessageInfo("msg-loc"), Message: tt.msg}
 
-			inbound, ok := transport.convertMessage(context.Background(), evt)
+			inbound, ok := transport.convertMessage(t.Context(), evt)
 			require.True(t, ok, "a bare location pin must still be archived, not dropped")
 			assert.NotEmpty(inbound.Text)
 			assert.Contains(inbound.Text, "48.8566")
@@ -437,7 +437,7 @@ func TestNewWhatsmeowTransportAndResetClientKeepDownloaderInSync(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
-	transport, err := NewWhatsmeowTransport(context.Background(), WhatsmeowOptions{
+	transport, err := NewWhatsmeowTransport(t.Context(), WhatsmeowOptions{
 		SessionPath: filepath.Join(dir, "session.db"),
 		Account:     "15551234567@s.whatsapp.net",
 	})
@@ -449,7 +449,7 @@ func TestNewWhatsmeowTransportAndResetClientKeepDownloaderInSync(t *testing.T) {
 	assert.Same(transport.client, transport.peerSender)
 
 	oldClient := transport.client
-	require.NoError(transport.resetClient(context.Background()))
+	require.NoError(transport.resetClient(t.Context()))
 	assert.NotSame(oldClient, transport.client, "resetClient must install a fresh client")
 	require.NotNil(transport.downloader)
 	assert.Same(transport.client, transport.downloader,
@@ -483,7 +483,7 @@ func (f *fakePeerMessageSender) SendPeerMessage(_ context.Context, message *waE2
 func newRequestHistorySyncTestTransport(t *testing.T) (*WhatsmeowTransport, *fakePeerMessageSender) {
 	t.Helper()
 	dir := t.TempDir()
-	transport, err := NewWhatsmeowTransport(context.Background(), WhatsmeowOptions{
+	transport, err := NewWhatsmeowTransport(t.Context(), WhatsmeowOptions{
 		SessionPath: filepath.Join(dir, "session.db"),
 		Account:     "15551234567@s.whatsapp.net",
 	})
@@ -500,7 +500,7 @@ func TestRequestHistorySyncBuildsAndSendsOnDemandRequest(t *testing.T) {
 	transport, sender := newRequestHistorySyncTestTransport(t)
 	anchorTime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
 
-	err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+	err := transport.RequestHistorySync(t.Context(), TransportRequestHistorySyncRequest{
 		ChatJID:         "120363@g.us",
 		AnchorMessageID: "ANCHOR123",
 		AnchorTimestamp: anchorTime,
@@ -537,7 +537,7 @@ func TestRequestHistorySyncDefaultsAndClampsCount(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			transport, sender := newRequestHistorySyncTestTransport(t)
-			err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+			err := transport.RequestHistorySync(t.Context(), TransportRequestHistorySyncRequest{
 				ChatJID:         "120363@g.us",
 				AnchorMessageID: "anchor",
 				AnchorTimestamp: time.Now(),
@@ -553,7 +553,7 @@ func TestRequestHistorySyncDefaultsAndClampsCount(t *testing.T) {
 
 func TestRequestHistorySyncRequiresAnchorMessageID(t *testing.T) {
 	transport, sender := newRequestHistorySyncTestTransport(t)
-	err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+	err := transport.RequestHistorySync(t.Context(), TransportRequestHistorySyncRequest{
 		ChatJID: "120363@g.us",
 	})
 	require.Error(t, err)
@@ -562,7 +562,7 @@ func TestRequestHistorySyncRequiresAnchorMessageID(t *testing.T) {
 
 func TestRequestHistorySyncRejectsInvalidChatJID(t *testing.T) {
 	transport, sender := newRequestHistorySyncTestTransport(t)
-	err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+	err := transport.RequestHistorySync(t.Context(), TransportRequestHistorySyncRequest{
 		ChatJID:         "",
 		AnchorMessageID: "anchor",
 	})
@@ -574,7 +574,7 @@ func TestRequestHistorySyncPropagatesSendError(t *testing.T) {
 	transport, sender := newRequestHistorySyncTestTransport(t)
 	sender.err = errors.New("boom")
 
-	err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+	err := transport.RequestHistorySync(t.Context(), TransportRequestHistorySyncRequest{
 		ChatJID:         "120363@g.us",
 		AnchorMessageID: "anchor",
 		AnchorTimestamp: time.Now(),
@@ -649,7 +649,7 @@ func TestDownloadMediaAttachmentRejectsOversizedDeclaredSize(t *testing.T) {
 		},
 	}
 
-	attachment := transport.downloadMediaAttachment(context.Background(), msg)
+	attachment := transport.downloadMediaAttachment(t.Context(), msg)
 	require.NotNil(t, attachment)
 	assert.Empty(attachment.Data)
 	assert.NotEmpty(attachment.DownloadError)
@@ -734,7 +734,7 @@ func TestArchiveHistorySyncPersistsPerConversationWithBoundedConcurrency(t *test
 	assert := assert.New(t)
 	require := require.New(t)
 	dir := t.TempDir()
-	transport, err := NewWhatsmeowTransport(context.Background(), WhatsmeowOptions{
+	transport, err := NewWhatsmeowTransport(t.Context(), WhatsmeowOptions{
 		SessionPath: filepath.Join(dir, "session.db"),
 		Account:     "15551234567@s.whatsapp.net",
 	})
@@ -762,7 +762,7 @@ func TestArchiveHistorySyncPersistsPerConversationWithBoundedConcurrency(t *test
 		},
 	}}
 
-	transport.archiveHistorySync(context.Background(), event)
+	transport.archiveHistorySync(t.Context(), event)
 
 	mu.Lock()
 	defer mu.Unlock()

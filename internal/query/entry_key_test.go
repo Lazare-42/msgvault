@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -15,6 +14,7 @@ import (
 // expression the explore engine renders inside DuckDB, for both the
 // per-message and the chat conversation classification.
 func TestEntryKeyFactsMatchSQLProducedEntryKeys(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	b := NewTestDataBuilder(t)
@@ -28,7 +28,7 @@ func TestEntryKeyFactsMatchSQLProducedEntryKeys(t *testing.T) {
 	})
 	b.AddAttachmentWithMIME(42, chat, 10, "photo.png", "image/png")
 
-	result, err := b.BuildEngine().SearchFiles(context.Background(), FileSearchRequest{
+	result, err := b.BuildEngine().SearchFiles(t.Context(), FileSearchRequest{
 		Sort: SortSpec{Field: "occurred_at", Direction: "asc"}, Page: PageSpec{Limit: 25},
 	})
 	requirements.NoError(err)
@@ -53,6 +53,7 @@ func TestEntryKeyFactsMatchSQLProducedEntryKeys(t *testing.T) {
 }
 
 func TestEntryKeyFallsBackToInternalMessageID(t *testing.T) {
+	t.Parallel()
 	facts := EntryKeyFacts{
 		SourceID: 3, MessageID: 42, ConversationID: 7,
 		MessageType: "email", ConversationType: "email_thread",
@@ -61,6 +62,7 @@ func TestEntryKeyFallsBackToInternalMessageID(t *testing.T) {
 }
 
 func TestIsChatEntryClassification(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name             string
 		messageType      string

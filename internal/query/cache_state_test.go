@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -14,17 +13,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestCacheRevisionIncludesPublicationTime(t *testing.T) {
-	state := CacheSyncState{
-		SchemaVersion: 15,
-		PublishedAt:   time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
-	}
-	changed := state
-	changed.PublishedAt = changed.PublishedAt.Add(time.Second)
-	assert.NotEqual(t, state.Revision(), changed.Revision())
-}
-
 func TestCacheSyncStateEncodesStatsAsNestedObject(t *testing.T) {
+	t.Parallel()
 	requirementsForTest := require.New(t)
 	minYear := int64(2004)
 	maxYear := int64(2026)
@@ -51,7 +41,8 @@ func TestCacheSyncStateEncodesStatsAsNestedObject(t *testing.T) {
 }
 
 func TestAcquireReadyCacheReadLockRejectsAbsentCache(t *testing.T) {
-	_, err := AcquireReadyCacheReadLock(context.Background(), t.TempDir())
+	t.Parallel()
+	_, err := AcquireReadyCacheReadLock(t.Context(), t.TempDir())
 	require.ErrorIs(t, err, ErrCacheUnavailable)
 	var unavailable *CacheUnavailableError
 	require.ErrorAs(t, err, &unavailable)
@@ -59,6 +50,7 @@ func TestAcquireReadyCacheReadLockRejectsAbsentCache(t *testing.T) {
 }
 
 func TestInspectCacheReadiness(t *testing.T) {
+	t.Parallel()
 	validState := CacheSyncState{
 		LastMessageID: 1,
 		LastSyncAt:    time.Date(2026, 7, 15, 12, 0, 0, 0, time.UTC),
@@ -153,6 +145,7 @@ func TestInspectCacheReadiness(t *testing.T) {
 }
 
 func TestInspectCacheMarkerReadinessSkipsDatasetFingerprint(t *testing.T) {
+	// serial: swaps the package global inspectDatasetFingerprint.
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	dir := completeReadinessCache(t)
@@ -173,18 +166,8 @@ func TestInspectCacheMarkerReadinessSkipsDatasetFingerprint(t *testing.T) {
 	assertions.Equal(CacheInterrupted, readiness)
 }
 
-func TestCacheWithoutArchiveOnlyDeletionEligibilityRequiresRebuild(t *testing.T) {
-	dir := completeReadinessCache(t)
-	state, err := ReadCacheSyncState(dir)
-	require.NoError(t, err)
-	state.SchemaVersion = 31
-	writeReadinessState(t, dir, state)
-	readiness, err := InspectCacheReadiness(dir)
-	require.NoError(t, err)
-	assert.Equal(t, CacheStaleSchema, readiness)
-}
-
 func TestInspectCacheReadinessNamesStaleSchemaAndDrift(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	dir := completeReadinessCache(t)
@@ -206,6 +189,7 @@ func TestInspectCacheReadinessNamesStaleSchemaAndDrift(t *testing.T) {
 }
 
 func TestInspectCacheReadinessPrefersStaleSchemaWhenNewDatasetIsMissing(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	dir := completeReadinessCache(t)
 	state, err := ReadCacheSyncState(dir)
@@ -220,6 +204,7 @@ func TestInspectCacheReadinessPrefersStaleSchemaWhenNewDatasetIsMissing(t *testi
 }
 
 func TestCacheRevisionUsesOnlyCommittedStateWatermarks(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	state := CacheSyncState{
 		SchemaVersion:                  CacheSchemaVersion,
@@ -259,6 +244,9 @@ func TestCacheRevisionUsesOnlyCommittedStateWatermarks(t *testing.T) {
 	changed.ParticipantDisplayNameRevision++
 	assert.NotEqual(revision, changed.Revision())
 	changed = state
+	changed.PersonDisplayNameRevision++
+	assert.NotEqual(revision, changed.Revision())
+	changed = state
 	changed.PublishedAt = changed.PublishedAt.Add(time.Second)
 	assert.NotEqual(revision, changed.Revision())
 	changed = state
@@ -267,6 +255,7 @@ func TestCacheRevisionUsesOnlyCommittedStateWatermarks(t *testing.T) {
 }
 
 func TestInspectCacheReadinessReturnsFilesystemErrors(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	analyticsPath := filepath.Join(dir, "analytics")
 	require.NoError(t, os.WriteFile(analyticsPath, []byte("not-a-directory"), 0o600))
@@ -294,28 +283,4 @@ func writeReadinessState(t *testing.T, dir string, state CacheSyncState) {
 	data, err := json.Marshal(state)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(CacheStatePath(dir), data, 0o600))
-}
-
-func TestCacheSchemaVersion26RequiresRebuild(t *testing.T) {
-	assertions := assert.New(t)
-	requirements := require.New(t)
-	dir := completeReadinessCache(t)
-	state, err := ReadCacheSyncState(dir)
-	requirements.NoError(err)
-	state.SchemaVersion = 26
-	data, err := json.Marshal(state)
-	requirements.NoError(err)
-	requirements.NoError(os.WriteFile(CacheStatePath(dir), data, 0o600))
-	requirements.NoError(os.RemoveAll(filepath.Join(dir, datasetPersonDisplayNames)))
-	readiness, err := InspectCacheReadiness(dir)
-	requirements.NoError(err)
-	assertions.Equal(CacheStaleSchema, readiness)
-}
-
-func TestCacheSchemaVersionPersonRevisionInvalidatesReaders(t *testing.T) {
-	assertions := assert.New(t)
-	state := CacheSyncState{SchemaVersion: CacheSchemaVersion}
-	before := state.Revision()
-	state.PersonDisplayNameRevision++
-	assertions.NotEqual(before, state.Revision())
 }

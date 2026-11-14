@@ -119,7 +119,7 @@ func TestGetMessagesRawBatchWithDiagnosticsUsesMissingRawForLegacyNil(t *testing
 	require.False(hasDiagnostics)
 	syncer := New(client, nil, nil)
 
-	results, err := syncer.getMessagesRawBatchWithDiagnostics(context.Background(), []string{"Archive|10"})
+	results, err := syncer.getMessagesRawBatchWithDiagnostics(t.Context(), []string{"Archive|10"})
 
 	require.NoError(err)
 	require.Len(results, 1)
@@ -140,7 +140,7 @@ func TestGetMessagesRawBatchWithDiagnosticsPreservesClientError(t *testing.T) {
 	}
 	syncer := New(client, nil, nil)
 
-	results, err := syncer.getMessagesRawBatchWithDiagnostics(context.Background(), []string{"Archive|10"})
+	results, err := syncer.getMessagesRawBatchWithDiagnostics(t.Context(), []string{"Archive|10"})
 
 	require.NoError(err)
 	require.Len(results, 1)

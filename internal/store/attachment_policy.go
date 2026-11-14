@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
 )
@@ -14,16 +15,19 @@ import (
 type AttachmentPolicyCandidate struct {
 	AttachmentID     int64
 	MessageID        int64
+	MessageType      string
+	MessageMetadata  string
+	MediaType        string
+	MIMEType         string
 	SourceType       string
 	SourceIdentifier string
 	ConversationType string
 	ParticipantCount int
-	// RosterUnresolved reports that no authoritative roster backs
-	// ParticipantCount: the provider could not read one, or none was ever
-	// archived, so the count is only the accumulated participant rows. Purge
-	// must not exclude on the participant threshold while it is set: excluding
-	// deletes blobs, and the current membership may be under the limit even
-	// when the accumulated count is not.
+	// RosterUnresolved reports that no complete authoritative roster backs
+	// ParticipantCount: the provider could not read one, none was ever archived,
+	// or a repair has not finished applying it. Purge must not exclude on the
+	// participant threshold while it is set: the current membership may be
+	// under the limit even when the accumulated count is not.
 	RosterUnresolved   bool
 	Size               int64
 	ContentHash        string
@@ -49,12 +53,16 @@ func (s *Store) ListAttachmentPolicyCandidates(ctx context.Context) ([]Attachmen
 		       COALESCE(CAST(c.metadata AS TEXT), ''), COALESCE(a.size, 0),
 		       COALESCE(a.content_hash, ''), a.storage_path,
 		       COALESCE(a.thumbnail_hash, ''), COALESCE(a.thumbnail_path, ''),
-		       COALESCE(a.source_attachment_id, ''), COALESCE(a.attachment_state, '')
+		       COALESCE(a.source_attachment_id, ''), COALESCE(a.attachment_state, ''),
+		       COALESCE(m.message_type, ''), COALESCE(CAST(m.metadata AS TEXT), ''),
+		       COALESCE(a.media_type, ''), COALESCE(a.mime_type, '')
 		FROM attachments a
 		JOIN messages m ON m.id = a.message_id
 		JOIN conversations c ON c.id = m.conversation_id
 		JOIN sources src ON src.id = m.source_id
-		WHERE src.source_type IN ('beeper', 'slack', 'slackdump', 'discord', 'teams', 'twilio', 'chatwoot')
+		WHERE src.source_type IN ('beeper', 'matrix', 'slack', 'slackdump', 'discord', 'teams', 'twilio', 'chatwoot', 'inline', 'apple_messages')
+		  AND NOT EXISTS (SELECT 1 FROM source_merge_archive_only_messages am WHERE am.message_id = m.id)
+		  AND NOT EXISTS (SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = a.id)
 		  AND (COALESCE(a.attachment_state, '') IN (?, '')
 		       OR (src.source_type = 'chatwoot' AND COALESCE(a.content_hash, '') <> ''))
 		  AND (
@@ -83,6 +91,7 @@ func (s *Store) ListAttachmentPolicyCandidates(ctx context.Context) ([]Attachmen
 			&candidate.ParticipantCount, &conversationMetadata, &candidate.Size, &candidate.ContentHash,
 			&candidate.StoragePath, &candidate.ThumbnailHash, &candidate.ThumbnailPath,
 			&candidate.SourceAttachmentID, &state,
+			&candidate.MessageType, &candidate.MessageMetadata, &candidate.MediaType, &candidate.MIMEType,
 		); err != nil {
 			return nil, fmt.Errorf("scan attachment policy candidate: %w", err)
 		}
@@ -90,7 +99,7 @@ func (s *Store) ListAttachmentPolicyCandidates(ctx context.Context) ([]Attachmen
 			candidate.SourceType, candidate.ParticipantCount, conversationMetadata,
 		)
 		record := decodeMembershipRecord(conversationMetadata)
-		candidate.RosterUnresolved = !record.counted || record.unknown
+		candidate.RosterUnresolved = !record.counted || record.unknown || record.repairPending
 		if state == "" && candidate.ContentHash == "" {
 			contentHash, ok := casPathHash(candidate.StoragePath)
 			if !ok {
@@ -116,17 +125,18 @@ func (s *Store) ExcludeAttachmentOccurrences(ctx context.Context, exclusions []A
 		return nil
 	}
 	return s.withTxContext(ctx, func(tx *loggedTx) error {
-		messageIDs := make(map[int64]struct{})
+		messageIDs := make(map[int64]string)
 		for _, exclusion := range exclusions {
 			if exclusion.AttachmentID <= 0 || exclusion.Reason == "" || exclusion.Reason == attachmentpolicy.SkipFetchFailure {
 				return fmt.Errorf("invalid attachment exclusion: id=%d reason=%q", exclusion.AttachmentID, exclusion.Reason)
 			}
 			var messageID int64
-			var sourceAttachmentID string
-			err := tx.QueryRow(`
-				SELECT message_id, COALESCE(source_attachment_id, '')
-				FROM attachments WHERE id = ?
-			`, exclusion.AttachmentID).Scan(&messageID, &sourceAttachmentID)
+			var sourceAttachmentID, sourceType string
+			err := tx.QueryRowContext(ctx, `
+				SELECT a.message_id, COALESCE(a.source_attachment_id, ''), src.source_type
+				FROM attachments a JOIN messages m ON m.id = a.message_id
+				JOIN sources src ON src.id = m.source_id WHERE a.id = ?
+			`, exclusion.AttachmentID).Scan(&messageID, &sourceAttachmentID, &sourceType)
 			if errors.Is(err, sql.ErrNoRows) {
 				return fmt.Errorf("attachment occurrence %d not found", exclusion.AttachmentID)
 			}
@@ -139,7 +149,7 @@ func (s *Store) ExcludeAttachmentOccurrences(ctx context.Context, exclusions []A
 			if sourceAttachmentID == "" {
 				return fmt.Errorf("attachment occurrence %d has no provider identity", exclusion.AttachmentID)
 			}
-			result, err := tx.Exec(`
+			result, err := tx.ExecContext(ctx, `
 				UPDATE attachments
 				SET storage_path = ?, content_hash = NULL,
 				    thumbnail_hash = NULL, thumbnail_path = NULL,
@@ -157,10 +167,15 @@ func (s *Store) ExcludeAttachmentOccurrences(ctx context.Context, exclusions []A
 			if changed != 1 {
 				return fmt.Errorf("exclude attachment occurrence %d: changed %d rows", exclusion.AttachmentID, changed)
 			}
-			messageIDs[messageID] = struct{}{}
+			messageIDs[messageID] = sourceType
 		}
-		for messageID := range messageIDs {
-			if _, err := tx.Exec(`
+		for messageID, sourceType := range messageIDs {
+			if sourceType == sourceTypeMatrix {
+				if err := recomputeMessageSizeEstimateWith(boundQuerier{ctx: ctx, q: tx}, messageID); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.ExecContext(ctx, `
 				UPDATE messages
 				SET has_attachments = (SELECT COUNT(*) FROM attachments WHERE message_id = ?) > 0,
 				    attachment_count = (SELECT COUNT(*) FROM attachments WHERE message_id = ?)
@@ -179,17 +194,26 @@ func (s *Store) AttachmentBlobReferenced(ctx context.Context, contentHash, stora
 	if contentHash == "" && storagePath == "" {
 		return false, nil
 	}
+	query, args := attachmentBlobReferenceQuery(contentHash, storagePath)
 	var exists bool
-	err := s.db.QueryRowContext(ctx, s.Rebind(`
-		SELECT EXISTS (
-			SELECT 1 FROM attachments
-			WHERE (? <> '' AND (content_hash = ? OR thumbnail_hash = ?))
-			   OR (? <> '' AND (storage_path = ? OR thumbnail_path = ?))
-		)
-	`), contentHash, contentHash, contentHash,
-		storagePath, storagePath, storagePath).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, s.Rebind(query), args...).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("check attachment blob reference: %w", err)
 	}
 	return exists, nil
+}
+
+func attachmentBlobReferenceQuery(contentHash, storagePath string) (string, []any) {
+	var conditions []string
+	var args []any
+	// Empty-input guards in SQL prevent SQLite from using its multi-index OR plan.
+	if contentHash != "" {
+		conditions = append(conditions, "content_hash = ? OR thumbnail_hash = ?")
+		args = append(args, contentHash, contentHash)
+	}
+	if storagePath != "" {
+		conditions = append(conditions, "storage_path = ? OR thumbnail_path = ?")
+		args = append(args, storagePath, storagePath)
+	}
+	return "SELECT EXISTS (SELECT 1 FROM attachments WHERE " + strings.Join(conditions, " OR ") + ")", args
 }

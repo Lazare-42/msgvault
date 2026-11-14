@@ -33,6 +33,7 @@ type MockEngine struct {
 	MessagesBySourceID map[string]*query.MessageDetail
 
 	// Optional overrides — set these to customise behavior per-test.
+	AggregateFunc                           func(context.Context, query.ViewType, query.AggregateOptions) ([]query.AggregateRow, error)
 	SearchFastFunc                          func(context.Context, *search.Query, query.MessageFilter, int, int) ([]query.MessageSummary, error)
 	SearchFunc                              func(context.Context, *search.Query, int, int) ([]query.MessageSummary, error)
 	SearchDeepFunc                          func(context.Context, *search.Query, query.MessageFilter, int, int) ([]query.MessageSummary, error)
@@ -46,6 +47,7 @@ type MockEngine struct {
 	GetDeletionTargetsByFilterFunc          func(context.Context, query.MessageFilter) ([]query.DeletionTarget, error)
 	GetDeletionTargetsByMessageIDsFunc      func(context.Context, []int64) ([]query.DeletionTarget, error)
 	GetDeletionTargetsBySearchFunc          func(context.Context, *search.Query, query.MessageFilter, query.DeletionSearchMode) ([]query.DeletionTarget, error)
+	GetDeletionTargetsBySearchBoundedFunc   func(context.Context, *search.Query, query.MessageFilter, query.DeletionSearchMode, int) ([]query.DeletionTarget, int, error)
 	GetDeletionTargetsByAggregateSearchFunc func(context.Context, string, query.MessageFilter, query.ViewType, string) ([]query.DeletionTarget, error)
 	SearchByDomainsFunc                     func(context.Context, []string, *time.Time, *time.Time, int, int, []int64) (query.DomainSearchResult, error)
 	SearchFastWithStatsFunc                 func(context.Context, *search.Query, string, query.MessageFilter, query.ViewType, int, int) (*query.SearchFastResult, error)
@@ -59,7 +61,10 @@ type MockEngine struct {
 var _ query.Engine = (*MockEngine)(nil)
 var _ query.MessageBodySearcher = (*MockEngine)(nil)
 
-func (m *MockEngine) Aggregate(_ context.Context, _ query.ViewType, _ query.AggregateOptions) ([]query.AggregateRow, error) {
+func (m *MockEngine) Aggregate(ctx context.Context, viewType query.ViewType, opts query.AggregateOptions) ([]query.AggregateRow, error) {
+	if m.AggregateFunc != nil {
+		return m.AggregateFunc(ctx, viewType, opts)
+	}
 	return m.AggregateRows, nil
 }
 func (m *MockEngine) SubAggregate(_ context.Context, _ query.MessageFilter, _ query.ViewType, _ query.AggregateOptions) ([]query.AggregateRow, error) {
@@ -320,3 +325,10 @@ func (m *MockEngine) GetTotalStats(ctx context.Context, opts query.StatsOptions)
 }
 
 func (m *MockEngine) Close() error { return nil }
+
+func (m *MockEngine) GetDeletionTargetsBySearchBounded(ctx context.Context, q *search.Query, filter query.MessageFilter, mode query.DeletionSearchMode, maxResults int) ([]query.DeletionTarget, int, error) {
+	if m.GetDeletionTargetsBySearchBoundedFunc != nil {
+		return m.GetDeletionTargetsBySearchBoundedFunc(ctx, q, filter, mode, maxResults)
+	}
+	return m.DeletionTargets, len(m.DeletionTargets), nil
+}

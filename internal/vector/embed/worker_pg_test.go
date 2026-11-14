@@ -119,7 +119,8 @@ func int64ArrayLiteral(ids []int64) string {
 func pgCountMissing(t *testing.T, db *sql.DB, gen int64) int {
 	t.Helper()
 	var n int
-	require.NoError(t, db.QueryRow(
+	require.NoError(t, db.QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM messages
 		  WHERE (embed_gen IS NULL OR embed_gen <> $1)
 		    AND deleted_at IS NULL AND deleted_from_source_at IS NULL`, gen).Scan(&n))
@@ -147,7 +148,7 @@ func openPGWorkerDB(t *testing.T, n int) *sql.DB {
 	setup, err := sql.Open("pgx", url)
 	require.NoError(t, err, "open setup")
 	defer func() { _ = setup.Close() }()
-	_, err = setup.Exec("CREATE SCHEMA " + schemaName)
+	_, err = setup.ExecContext(t.Context(), "CREATE SCHEMA "+schemaName)
 	require.NoError(t, err, "create schema")
 
 	testURL := url
@@ -159,6 +160,7 @@ func openPGWorkerDB(t *testing.T, n int) *sql.DB {
 
 	db, err := sql.Open("pgx", testURL)
 	require.NoError(t, err, "open")
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
 		_ = db.Close()
 		cleanup, err := sql.Open("pgx", url)
@@ -166,10 +168,10 @@ func openPGWorkerDB(t *testing.T, n int) *sql.DB {
 			return
 		}
 		defer func() { _ = cleanup.Close() }()
-		_, _ = cleanup.Exec("DROP SCHEMA " + schemaName + " CASCADE")
+		_, _ = cleanup.ExecContext(context.WithoutCancel(t.Context()), "DROP SCHEMA "+schemaName+" CASCADE")
 	})
 
-	_, err = db.Exec(`
+	_, err = db.ExecContext(t.Context(), `
 		CREATE TABLE messages (
 			id BIGINT PRIMARY KEY,
 			subject TEXT,
@@ -204,7 +206,7 @@ func openPGWorkerDB(t *testing.T, n int) *sql.DB {
 			EXECUTE FUNCTION bump_message_last_modified();`)
 	require.NoError(t, err, "create main schema")
 
-	ctx := context.Background()
+	ctx := t.Context()
 	for i := 1; i <= n; i++ {
 		_, err := db.ExecContext(ctx,
 			`INSERT INTO messages (id, subject) VALUES ($1, $2)`, i, fmt.Sprintf("msg %d", i))
@@ -224,7 +226,7 @@ func TestWorkerPG_RunOnce_EndToEnd(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	const n = 5
 	db := openPGWorkerDB(t, n)
 
@@ -253,6 +255,12 @@ func TestWorkerPG_RunOnce_EndToEnd(t *testing.T) {
 		Recorder:         newTestOperationRecorder(),
 	})
 
+	_, err = worker.embedBatch(ctx, gen, []int64{1})
+	require.NoError(err)
+	var saved int
+	require.NoError(db.QueryRowContext(ctx, `SELECT COUNT(*) FROM embedding_checkpoints`).Scan(&saved))
+	require.Positive(saved, "a completed request is checkpointed before publication")
+
 	res, err := worker.RunOnce(ctx, gen, testEmbeddingPassScope())
 	require.NoError(
 		err, "RunOnce must not error on pgx")
@@ -267,6 +275,8 @@ func TestWorkerPG_RunOnce_EndToEnd(t *testing.T) {
 	require.NoError(db.QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM embeddings WHERE generation_id = $1`, int64(gen)).Scan(&embedded))
 	assert.Equal(n, embedded, "one embedding row per message")
+	require.NoError(db.QueryRowContext(ctx, `SELECT COUNT(*) FROM embedding_checkpoints`).Scan(&saved))
+	assert.Zero(saved, "publication deletes the saved request")
 }
 
 // TestWorkerPG_EmbedBatch_RebindsINClause targets embedBatch directly: it
@@ -276,7 +286,7 @@ func TestWorkerPG_EmbedBatch_RebindsINClause(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	db := openPGWorkerDB(t, 3)
 
 	backend, err := pgvector.Open(ctx, pgvector.Options{DB: db, Dimension: 4})
@@ -295,7 +305,9 @@ func TestWorkerPG_EmbedBatch_RebindsINClause(t *testing.T) {
 		LastModifiedExpr: "m.last_modified",
 	})
 
-	eb, err := w.embedBatch(ctx, []int64{1, 2, 3})
+	gen, err := backend.CreateGeneration(ctx, "m", 4, "")
+	require.NoError(err)
+	eb, err := w.embedBatch(ctx, gen, []int64{1, 2, 3})
 	require.NoError(
 		err, "embedBatch must rebind ? to $N for pgx")
 

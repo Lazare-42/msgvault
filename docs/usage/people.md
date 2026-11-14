@@ -1,18 +1,21 @@
 ---
-last_edited: "2026-10-02"
+last_edited: "2026-11-01"
 title: People and Profiles
 description: Find people across your archive, keep their details together, and understand your contact history.
 ---
 
 Find someone across email, chats, and meetings, then keep their contact details
 and the things you want to remember in one profile. Start in the Web UI's
-**Relationships** workspace to explore contacts already in your archive, then
-save selected people in **Directory**. You can also use the
+**People** workspace to explore contacts already in your archive, then
+choose **Save** in their header. You can also use the
 [TUI People browser](/docs/usage/tui/#people).
+
+Google resource addresses not linked to a person are excluded from observed people regardless of `exclude_domain_patterns`; their addresses stay searchable.
 
 | I want to… | Start here |
 |---|---|
 | Save someone's name, details, or notes | [Create a profile](#promote-a-durable-person) |
+| See which conversations still need an answer | [Open loops](open-loops.md) |
 | Remember what they recently shared | [Person briefs](/docs/usage/people-briefs/) |
 | Review meeting time and recorded follow-ups | [Meeting activity](meetings.md#export-context-and-read-follow-ups) |
 | Find files you exchanged | [Person files](#find-files-related-to-a-person) |
@@ -24,8 +27,7 @@ save selected people in **Directory**. You can also use the
 
 Ordinary profile editing and identity discovery use your archive. Briefs,
 automatic fact extraction, semantic person search, and external enrichment
-need separate provider configuration and consent. You can use the Directory
-without enabling them.
+need separate provider configuration and consent. You can edit saved profiles without enabling them.
 
 ## Understand the records
 
@@ -76,9 +78,9 @@ operation. A link into one saved profile extends its participant bindings. A
 candidate that spans two different saved profiles needs a separate person
 merge review.
 
-In the Web UI, a stale decision closes its dialog and refreshes the queue.
-Review the changed evidence, then reopen the decision. Your draft notes remain
-available; the open dialog never silently replaces the token you reviewed.
+In the Web UI, open **People → Filter → Possible duplicates**. A stale decision
+refreshes the pair. Review its changed evidence before choosing **Merge** or
+**Keep separate** again. Your draft notes remain available.
 
 Review notes are private profile data. Avoid putting unnecessary personal
 details in them. The matching CLI and token-guarded API are documented in the
@@ -124,9 +126,8 @@ for exact settings and routes.
 
 ## Promote a durable person
 
-Directory starts empty until you save profiles or import contacts. In
-**Relationships**, select a person, choose **Open in Directory**, then
-**Promote to person**. This creates a saved profile from the contact already
+The **Saved** filter starts empty until you save profiles or import contacts. In
+**People**, select a person, and choose **Save** in the header. This creates a saved profile from the contact already
 observed in your archive. The profile starts with the first nonblank observed
 name in the linked cluster, ordered by participant ID. A contact without an
 observed name keeps the `Person N` fallback.
@@ -166,14 +167,26 @@ person and UID.
 
 ### Browse people by last contact
 
+Drafts and unsent messages don't set last contact, cadence, or relationship temperature. They stay out of the relationship calendar, relationship list, person and domain timelines, and chat inbox summaries. Explore, search, and the Files view still include them for lookup. A person's or domain's Files tab, `person files`, and MCP `search_person_files` list only files on sent or received mail. A contact you've only drafted to reads as existing with no sent or received messages and no relationship calendar. A person ID that doesn't exist reads as not found.
+
+Cached views update after a cache refresh. Full checks at startup and during explicit cache builds detect sent-state changes. Scheduled post-sync refresh checks indexed changes first. If those already require a build, `min_rebuild_interval` can delay both the full sent-state check and the visible update. If indexed state is clean, sent state is checked before that interval is applied. Ordinary requests use a cache marker check; they don't scan the archive for sent-state changes.
+
 Use `person directory` to browse promoted people, most recent contact first. It queries the selected daemon and returns a page of up to 50 people by default.
 
 ```bash
 msgvault person directory --last-contact-after 2026-06-01
 msgvault person directory --sort last_contact_asc
 msgvault person directory --sort name
+msgvault person directory --query "Alex Example"
+msgvault person directory --address alex@example.test
 msgvault person directory --last-contact-after 2026-06-01 --last-contact-before 2026-07-01 --json
 ```
+
+`--query` uses the Directory's lexical search over current curated names, contact points, and organizations. It works without semantic search. `--address` matches a literal, case-insensitive substring of addresses and identifiers on the person's currently bound participants, or current curated contact points. `%`, `_`, and backslash are ordinary characters. Superseded contact points and observed participants without a saved person are excluded. A cleared saved display name stays cleared; observed names do not replace it.
+
+Combine flags to narrow results, for example `person directory --query Alex --address example.test`. Address filtering requires an up-to-date daemon; the CLI reports an upgrade error if the selected daemon cannot apply it. Lookup does not create profiles or change identity links.
+
+Address-only lookups can scan all saved people when matches are sparse or absent. A remote PostgreSQL database can make these database round trips slower. Combine `--query` with `--address` when you know a name or organization to narrow the candidates first.
 
 `--last-contact-after` and `--last-contact-before` are inclusive. Both accept `YYYY-MM-DD` or RFC3339 timestamps with offsets and fractional seconds. A date alone means midnight UTC, so an upper bound of `2026-07-01` includes the start of that day. The default sort is `last_contact_desc`. Use `last_contact_asc` for oldest contact first or `name` for name order.
 
@@ -181,7 +194,7 @@ Drafts and unsent messages don't set last contact or cadence.
 
 The table shows ID, display name, and last contact in UTC. Missing names and timestamps show `-`. JSON returns the Directory envelope with a `people` array and optional `next_cursor`. It preserves the daemon's fields and omits `last_contact_at` when no timestamp exists.
 
-When output includes `Next cursor`, pass it unchanged with the same date bounds and sort to read the next page. For JSON, use the `next_cursor` value.
+When output includes `Next cursor`, pass it unchanged with the same query, address, date bounds, and sort to read the next page. For JSON, use the `next_cursor` value.
 
 ```bash
 msgvault person directory --last-contact-after 2026-06-01 --cursor "<next_cursor>"
@@ -190,6 +203,8 @@ msgvault person directory --last-contact-after 2026-06-01 --cursor "<next_cursor
 `person list` continues to show the full unpaginated profile collection. Its `--json` output remains an array of profiles.
 
 ## Keep private notes
+
+In **People → Details**, use **More fields** to add notes, pronunciation, and custom fields. Manage field definitions, connection types, and organizations in **Settings → People**. The header's **More actions → History** includes replaced values and merge history.
 
 Save context in your own words with the Notes field. It preserves line breaks
 and keeps earlier values in attribute history:
@@ -271,22 +286,19 @@ Use a saved person ID to find attachments across their linked identities:
 ```bash
 msgvault person files 7 --direction from_person --filename proposal
 msgvault person files 7 --mime-family pdf --after 2026-01-01
-msgvault person files 7 --lane documents --query "project proposal"
+msgvault media search "project proposal" --person 7 --direction from_person
 msgvault person files 7 --lane visual --query "garden plan"
 msgvault person files 7 --lane all --query "project proposal" --json
 ```
 
 The default `metadata` lane lists archived attachments without semantic search.
+The `metadata` lane lists only attachments on sent or received mail.
 `--direction` accepts `from_person`, `to_person`, and `group`; it is repeatable.
 `--filename` matches a case-insensitive substring. MIME families are `image`,
 `pdf`, `audio`, `video`, `text`, `document`, `archive`, and `other`.
 
-The `documents` and `visual` lanes need their respective indexes; see
-[document search](/docs/usage/document-indexing/) and
-[visual search](/docs/usage/vector-search/). Both require `--query`, as does
-`all`. The `all` result reports each lane separately, including unavailable
-lanes; its metadata results do not use the semantic query. Document search
-cannot apply filename or MIME-family filters.
+The `visual` lane needs [visual search](/docs/usage/vector-search/). It requires `--query`, as does `all`. The `all` result reports each lane separately, including unavailable
+lanes; its metadata results do not use the semantic query. Search document text through Docbank with `media search --person <id>`.
 
 Each lane has its own cursor. Use `--cursor` with one lane to continue a result;
 `all` cannot take a cursor. `--limit` is per lane, defaults to 100, and accepts
@@ -297,13 +309,13 @@ RFC3339 timestamp.
 
 [Person briefs](/docs/usage/people-briefs/) summarize recent chat and text
 messages with citations. The guide covers enrollment, generation, reading in
-Directory or the TUI, refresh timing, and saved versions. Email-only contacts
+People Details or the TUI, refresh timing, and saved versions. Email-only contacts
 cannot receive a brief yet.
 
 ## Keep a person’s follow-ups in view
 
 Enable the [Kata connection](../configuration.md#integrationskata) to see live
-todos on a person's Directory page. Create or unlink tasks there, and link
+todos on a person's Details tab in People. Create or unlink tasks there, and link
 existing tasks with the [CLI](../cli-reference.md#person-agenda) or API. Edit
 and complete tasks in Kata. Tasks stay in Kata; this connection requires Kata
 API schema 0.21.0 or later.

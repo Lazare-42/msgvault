@@ -34,7 +34,7 @@ func TestWhatsAppLiveAPISendMessage(t *testing.T) {
 			}, nil
 		}},
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/send", strings.NewReader(`{
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/send", strings.NewReader(`{
 		"chat_id":"15551234567@s.whatsapp.net",
 		"body":"hello",
 		"local_request_id":"wa-desk:1"
@@ -53,7 +53,7 @@ func TestWhatsAppLiveAPISendMessage(t *testing.T) {
 
 func TestWhatsAppLiveAPISendRequiresBearerToken(t *testing.T) {
 	handler := &whatsappLiveAPIHandler{token: "secret"}
-	req := httptest.NewRequest(http.MethodPost, "/api/send", strings.NewReader(`{}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/send", strings.NewReader(`{}`))
 	response := httptest.NewRecorder()
 
 	handler.sendMessage(response, req)
@@ -68,7 +68,7 @@ func TestWhatsAppLiveAPISendReportsNotReady(t *testing.T) {
 			return whatsapplive.SendResult{}, errors.New("whatsapp is not ready: ready=false")
 		}},
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/send", strings.NewReader(`{"chat_id":"a","body":"b"}`))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/send", strings.NewReader(`{"chat_id":"a","body":"b"}`))
 	req.Header.Set("Authorization", "Bearer secret")
 	response := httptest.NewRecorder()
 

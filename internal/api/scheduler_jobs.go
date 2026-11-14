@@ -6,13 +6,17 @@ import (
 
 	"go.kenn.io/msgvault/internal/chatwoot"
 	"go.kenn.io/msgvault/internal/circleback"
+	"go.kenn.io/msgvault/internal/feeds"
 	"go.kenn.io/msgvault/internal/gcal"
 	"go.kenn.io/msgvault/internal/granola"
 	"go.kenn.io/msgvault/internal/meetingimport"
+	"go.kenn.io/msgvault/internal/messageimport"
+	"go.kenn.io/msgvault/internal/meta"
 	"go.kenn.io/msgvault/internal/muesli"
 	"go.kenn.io/msgvault/internal/notionmeetings"
 	"go.kenn.io/msgvault/internal/omi"
 	"go.kenn.io/msgvault/internal/plaud"
+	"go.kenn.io/msgvault/internal/pocket"
 	"go.kenn.io/msgvault/internal/synctechsms"
 	"go.kenn.io/msgvault/internal/twenty"
 	"go.kenn.io/msgvault/internal/twilio"
@@ -39,6 +43,7 @@ const (
 	sourceTypeGmail  = "gmail"
 	sourceTypeMatrix = "matrix"
 	sourceTypeSlack  = "slack"
+	sourceTypeInline = "inline"
 )
 
 // BeeperJobName is the single generic-job name that drives every beeper
@@ -52,6 +57,20 @@ const MatrixJobName = sourceTypeMatrix
 // SlackJobName is the single generic-job name that drives the configured
 // Slack workspace source.
 const SlackJobName = sourceTypeSlack
+
+// InlineJobName drives every configured Inline account and its chat selection.
+const InlineJobName = sourceTypeInline
+
+// FeedsJobName drives every followed feed; all feeds share one source.
+const FeedsJobName = "feeds"
+
+// IMessageJobName drives the selected Apple Messages source.
+const IMessageJobName = "apple-messages"
+
+// WhatsAppAppleJobName identifies a native WhatsApp store by its owner phone.
+func WhatsAppAppleJobName(phone string) string {
+	return "whatsapp:" + phone
+}
 
 // CardDAVJobName is the scheduler identity for the default CardDAV connection.
 const CardDAVJobName = "carddav"
@@ -72,7 +91,7 @@ func classifySourceScheduling(sourceType, identifier string) sourceScheduleClass
 	switch sourceType {
 	case "", sourceTypeGmail, "imap", "msmail", "teams", "discord":
 		return sourceScheduleClassification{kind: sourceScheduleAccount}
-	case meetingimport.SourceType:
+	case meetingimport.SourceType, messageimport.SourceType:
 		return sourceScheduleClassification{kind: sourceScheduleNonSchedulable}
 	default:
 		jobName, ok := SchedulerJobNameForSource(sourceType, identifier)
@@ -97,6 +116,20 @@ func classifySourceScheduling(sourceType, identifier string) sourceScheduleClass
 // they are governed by the account scheduler, not a generic job.
 func SchedulerJobNameForSource(sourceType, identifier string) (string, bool) {
 	switch sourceType {
+	case "whatsapp":
+		return WhatsAppAppleJobName(identifier), true
+	case "apple_messages":
+		return IMessageJobName, true
+	case meta.InstagramSourceType:
+		if _, ok := meta.ParseInstagramSourceIdentifier(identifier); !ok {
+			return "", false
+		}
+		return meta.InstagramSourceType + ":" + identifier, true
+	case meta.SourceType:
+		if _, _, ok := meta.ParseSourceIdentifier(identifier); !ok {
+			return "", false
+		}
+		return meta.SourceType + ":" + identifier, true
 	case chatwoot.SourceType:
 		baseURL, accountID, _, ok := chatwoot.ParseSourceIdentifier(identifier)
 		if !ok {
@@ -129,6 +162,8 @@ func SchedulerJobNameForSource(sourceType, identifier string) (string, bool) {
 		// Store identifier == config Identifier (see
 		// internal/circleback/importer.go GetOrCreateSource call).
 		return "circleback:" + identifier, true
+	case pocket.SourceType:
+		return "pocket:" + identifier, true
 	case notionmeetings.SourceType:
 		return "notion-meetings:" + identifier, true
 	case twilio.SourceType:
@@ -144,6 +179,10 @@ func SchedulerJobNameForSource(sourceType, identifier string) (string, bool) {
 		// internal/beeper/importer.go GetOrCreateSource, one store source
 		// per beeper AccountID, all driven by the singleton "beeper" job).
 		return BeeperJobName, true
+	case sourceTypeInline:
+		return InlineJobName, true
+	case feeds.SourceType:
+		return FeedsJobName, true
 	case sourceTypeMatrix:
 		return MatrixJobName, true
 	case sourceTypeSlack:
@@ -157,9 +196,13 @@ func SchedulerJobNameForSource(sourceType, identifier string) (string, bool) {
 
 // isSourceSyncJobName reports whether a generic scheduler job syncs a source.
 func isSourceSyncJobName(name string) bool {
-	kind, _, _ := strings.Cut(name, ":")
+	kind, identifier, _ := strings.Cut(name, ":")
 	if kind == CardDAVJobName {
 		return true
+	}
+	if kind == meta.SourceType || kind == meta.InstagramSourceType {
+		canonical, ok := SchedulerJobNameForSource(kind, identifier)
+		return ok && canonical == name
 	}
 	_, ok := SchedulerJobNameForSource(strings.ReplaceAll(kind, "-", "_"), "source/calendar")
 	return ok

@@ -192,6 +192,8 @@ attributes, inboxes, meetings, files, and dated activity together. See
 [People, Profiles, and Source Identities](/docs/usage/people/)
 for curation, tracking, and provider setup.
 
+The Relationship calendar groups days in your system's named timezone. When the system zone can't be named, such as on Windows, it uses UTC and shows "UTC" by the year. Dated activity lists show local time.
+
 ### Person briefs
 
 In the People browser, a person's Overview tab shows their **Last time we
@@ -369,8 +371,9 @@ Press `,` outside an input or modal to edit settings on the selected daemon.
 Use the arrow keys to choose a category and field, `Enter` to edit, `Space` to
 toggle a boolean, and `Ctrl+S` to save. `Esc` asks before discarding unsaved
 changes. Fields marked restart-required remain pending until the daemon
-restarts. Named person-enrichment provider policies are read-only here; edit
-them in [Web Settings](/docs/web-ui/#settings-and-restart-behavior).
+restarts. Settings shows the daemon host's restart command, with custom option
+and service guidance; `PgUp` and `PgDn` scroll long views. Named person-enrichment
+provider policies are read-only here; edit them in [Web Settings](/docs/web-ui/#settings-and-restart-behavior).
 
 ## Performance
 

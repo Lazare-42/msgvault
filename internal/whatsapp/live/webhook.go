@@ -131,7 +131,7 @@ func (n *WebhookNotifier) deliver(event InboundEvent) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, n.url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, n.url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}

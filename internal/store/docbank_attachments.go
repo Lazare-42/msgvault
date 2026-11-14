@@ -104,14 +104,21 @@ func docbankAttachmentEligibleWhere() string {
 // docbankAttachmentSourceExists matches an eligible attachment for hash, a SQL expression.
 func docbankAttachmentSourceExists(hash string) string {
 	eligible := ` AND ` + docbankAttachmentEligibleWhere()
-	// LOWER on both sides lets SQLite use the expression index for a correlated hash.
+	hashMatch, pathMatch := docbankAttachmentMatch("a", hash)
 	return `(EXISTS (
 			SELECT 1 FROM attachments a
-			WHERE LOWER(a.content_hash) = LOWER(` + hash + `)` + eligible + `)
+			WHERE ` + hashMatch + eligible + `)
 		OR EXISTS (
 			SELECT 1 FROM attachments a
-			WHERE a.storage_path = SUBSTR(` + hash + `,1,2) || '/' || ` + hash + `
-			  AND COALESCE(a.content_hash,'') = ''` + eligible + `))`
+			WHERE ` + pathMatch + eligible + `))`
+}
+
+// docbankAttachmentMatch keeps hash and hashless CAS lookups separately indexable.
+func docbankAttachmentMatch(alias, hash string) (string, string) {
+	// LOWER on both sides lets SQLite use the expression index for a correlated hash.
+	return `LOWER(` + alias + `.content_hash) = LOWER(` + hash + `)`,
+		alias + `.storage_path = SUBSTR(` + hash + `,1,2) || '/' || ` + hash + `
+			  AND COALESCE(` + alias + `.content_hash,'') = ''`
 }
 
 // DocbankAttachmentStoragePaths returns local candidates for a mirror source hash.
@@ -151,7 +158,7 @@ func (r docbankAttachmentPackResolver) Resolve(ctx context.Context, hash packsto
 	if err != nil || !exists {
 		return packstore.Location{}, err
 	}
-	entry, err := r.store.GetAttachmentPackEntry(hash.String())
+	entry, err := r.store.GetAttachmentPackEntry(ctx, hash.String())
 	if err != nil || entry == nil {
 		return packstore.Location{}, err
 	}
@@ -453,6 +460,9 @@ func (s *Store) RecordDocbankAttachment(
 	return nil
 }
 
+// docbankRequeueOutcomes are cleared by backfill so processing can be requested again.
+var docbankRequeueOutcomes = []string{"consent", "stale_authority", "pdf_password_required", "rendition_operator_required", "operator_required", "invalid_receipt"}
+
 // RetryDocbankAttachments requeues failures and restarts discovery in one transaction.
 func (s *Store) RetryDocbankAttachments(ctx context.Context, destination string) error {
 	return s.withTxContext(ctx, func(tx *loggedTx) error {
@@ -462,6 +472,12 @@ func (s *Store) RetryDocbankAttachments(ctx context.Context, destination string)
 			SET state = 'sending', reason = '', attempts = 0, next_action_at = NULL
 			WHERE destination_key = ? AND state = 'failed'`, destination); err != nil {
 			return fmt.Errorf("requeue failed attachment mirror deliveries: %w", err)
+		}
+		if _, err := q.Exec(`
+			DELETE FROM docbank_attachment_processing
+			WHERE destination_key = ? AND next_action_at IS NULL
+			  AND outcome IN ('`+strings.Join(docbankRequeueOutcomes, "','")+`')`, destination); err != nil {
+			return fmt.Errorf("requeue recoverable attachment processing outcomes: %w", err)
 		}
 		if _, err := q.Exec(`DELETE FROM archive_metadata WHERE key = ?`, beeperMediaScanKey(destination)); err != nil {
 			return fmt.Errorf("reset attachment mirror discovery: %w", err)
@@ -477,7 +493,7 @@ func (s *Store) RecordDocbankAttachmentRetry(
 	_, err := s.db.ExecContext(ctx, s.Rebind(`
 		UPDATE docbank_attachment_deliveries SET reason = ?, next_action_at = ?
 		WHERE destination_key = ? AND content_hash = ? AND state = 'sending'`),
-		reason, s.timestampValue(time.Now().UTC().Add(beeperMediaRetryDelay)), destination, d.ContentHash)
+		reason, s.timestampValue(time.Now().UTC().Add(BeeperMediaRetryDelay)), destination, d.ContentHash)
 	if err != nil {
 		return fmt.Errorf("record attachment mirror retry: %w", err)
 	}

@@ -79,7 +79,7 @@ var whatsappLiveMCPCmd = &cobra.Command{
 			return usageErr(cmd, err)
 		}
 
-		st, cleanup, err := openWritableStoreAndInitForInvocation(state)
+		st, cleanup, err := openWritableStoreAndInitForInvocation(cmd.Context(), state)
 		if err != nil {
 			return err
 		}

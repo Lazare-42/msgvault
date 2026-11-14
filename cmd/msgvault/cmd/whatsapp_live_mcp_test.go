@@ -44,7 +44,7 @@ func TestWhatsAppLiveMCPServesOnlyWhatsAppTools(t *testing.T) {
 		},
 	})
 	require.NoError(err)
-	req := httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/mcp", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Mcp-Protocol-Version", "2026-07-28")

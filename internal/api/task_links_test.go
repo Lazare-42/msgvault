@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/taskclient"
 	"go.kenn.io/msgvault/internal/tasklinks"
+	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
 type taskLinkMessageStore struct {
@@ -43,12 +44,14 @@ func (s *taskLinkMessageStore) GetMessageContext(_ context.Context, id int64) (*
 }
 
 type fakeTaskLinkOperations struct {
-	createKeys []string
-	creates    []taskclient.TaskCreate
-	identities []tasklinks.MessageIdentity
-	lookup     tasklinks.LookupResult
-	search     []tasklinks.TaskSummary
-	err        error
+	createKeys  []string
+	creates     []taskclient.TaskCreate
+	identities  []tasklinks.MessageIdentity
+	lookup      tasklinks.LookupResult
+	search      []tasklinks.TaskSummary
+	searchQuery string
+	truncated   bool
+	err         error
 }
 
 func (f *fakeTaskLinkOperations) Create(_ context.Context, key string, create taskclient.TaskCreate, identity tasklinks.MessageIdentity, addedAt time.Time) (taskclient.Task, error) {
@@ -66,11 +69,13 @@ func (f *fakeTaskLinkOperations) Unlink(_ context.Context, _ string, identity ta
 	f.identities = append(f.identities, identity)
 	return taskclient.Task{ID: "task-1", Project: "project", Title: "Linked", Revision: "r2"}, f.err
 }
-func (f *fakeTaskLinkOperations) Lookup(context.Context, tasklinks.MessageIdentity) tasklinks.LookupResult {
+func (f *fakeTaskLinkOperations) Lookup(_ context.Context, identity tasklinks.MessageIdentity) tasklinks.LookupResult {
+	f.identities = append(f.identities, identity)
 	return f.lookup
 }
-func (f *fakeTaskLinkOperations) Search(context.Context, string) ([]tasklinks.TaskSummary, error) {
-	return f.search, f.err
+func (f *fakeTaskLinkOperations) Search(_ context.Context, query string) ([]tasklinks.TaskSummary, bool, error) {
+	f.searchQuery = query
+	return f.search, f.truncated, f.err
 }
 
 func emailMessage(messageType string) *APIMessage {
@@ -103,7 +108,7 @@ func TestCreateTaskForEmailDerivesStableServerIdempotency(t *testing.T) {
 	srv := taskLinkServer(t, "email", ops)
 	body := []byte(`{"title":"Follow up","description":"Synthetic notes","priority":"high","labels":["mail","follow-up"],"added_at":"2026-07-19T01:02:03Z"}`)
 	for range 2 {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader(body))
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Api-Key", "test-key")
 		req.Header.Set("X-Request-ID", "browser-request-1")
@@ -127,7 +132,7 @@ func TestCreateTaskForEmailDerivesStableServerIdempotency(t *testing.T) {
 func TestCreateTaskRequiresBrowserRequestID(t *testing.T) {
 	t.Parallel()
 	srv := taskLinkServer(t, "email", &fakeTaskLinkOperations{})
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader([]byte(`{"title":"Follow up","added_at":"2026-07-19T01:02:03Z"}`)))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader([]byte(`{"title":"Follow up","added_at":"2026-07-19T01:02:03Z"}`)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", "test-key")
 	resp := httptest.NewRecorder()
@@ -161,7 +166,7 @@ func TestCreateTaskRejectsOversizedAndTrailingJSONBodies(t *testing.T) {
 		{name: "trailing object", body: []byte(`{"title":"Follow up","added_at":"2026-07-19T01:02:03Z"} {}`), want: http.StatusBadRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader(tc.body))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader(tc.body))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("X-Api-Key", "test-key")
 			req.Header.Set("X-Request-ID", "browser-request-1")
@@ -183,7 +188,7 @@ func TestTaskLinkAPIsTreatLegacyBlankMessageTypeAsEmail(t *testing.T) {
 		{method: http.MethodPost, path: "/api/v1/messages/42/tasks", body: `{"task_id":"task-1","added_at":"2026-07-19T01:02:03Z"}`, want: http.StatusCreated},
 		{method: http.MethodDelete, path: "/api/v1/messages/42/tasks/task-1", want: http.StatusOK},
 	} {
-		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+		req := httptest.NewRequestWithContext(t.Context(), tc.method, tc.path, strings.NewReader(tc.body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Api-Key", "test-key")
 		req.Header.Set("X-Request-ID", "browser-request-1")
@@ -191,6 +196,19 @@ func TestTaskLinkAPIsTreatLegacyBlankMessageTypeAsEmail(t *testing.T) {
 		srv.Router().ServeHTTP(resp, req)
 		assert.Equal(t, tc.want, resp.Code, resp.Body.String())
 	}
+}
+
+type cancelTaskArchiveIdentity struct {
+	MessageStore
+	CtxMessageStore
+	SourceStatusStore
+
+	cancel context.CancelFunc
+}
+
+func (s *cancelTaskArchiveIdentity) ArchiveUIDContext(ctx context.Context) (string, error) {
+	s.cancel()
+	return "archive-a", ctx.Err()
 }
 
 func TestTaskMessageLookupErrorClassification(t *testing.T) {
@@ -217,7 +235,7 @@ func TestTaskMessageLookupErrorClassification(t *testing.T) {
 				{http.MethodPost, "/api/v1/messages/42/tasks", `{"task_id":"task-1","added_at":"2026-07-19T01:02:03Z"}`},
 				{http.MethodDelete, "/api/v1/messages/42/tasks/task-1", ""},
 			} {
-				req := httptest.NewRequest(endpoint.method, endpoint.path, strings.NewReader(endpoint.body))
+				req := httptest.NewRequestWithContext(t.Context(), endpoint.method, endpoint.path, strings.NewReader(endpoint.body))
 				req.Header.Set("Content-Type", "application/json")
 				req.Header.Set("X-Api-Key", "test-key")
 				req.Header.Set("X-Request-ID", "browser-request-1")
@@ -236,6 +254,34 @@ func TestTaskMessageLookupErrorClassification(t *testing.T) {
 	}
 }
 
+func TestTaskMessageIdentityUsesArchiveContext(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	f := storetest.New(t)
+	id := f.CreateMessage("task-identity-email")
+	ops := &fakeTaskLinkOperations{}
+	srv := NewServerWithOptions(ServerOptions{Config: &config.Config{}, Store: f.Store, Logger: testLogger(), TaskLinkOperations: ops})
+	path := fmt.Sprintf("/api/v1/messages/%d/tasks", id)
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil))
+	require.Equal(http.StatusOK, response.Code, response.Body.String())
+	require.Len(ops.identities, 1)
+	identity := ops.identities[0]
+	assert.Equal("1", identity.ArchiveRevision)
+	assert.Equal(id, identity.MessageID)
+	assert.Equal("gmail", identity.SourceType)
+	assert.Equal("test@example.com", identity.SourceIdentifier)
+	assert.Equal("task-identity-email", identity.SourceMessageID)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	srv = NewServerWithOptions(ServerOptions{Config: &config.Config{}, Store: &cancelTaskArchiveIdentity{MessageStore: f.Store, CtxMessageStore: f.Store, SourceStatusStore: f.Store, cancel: cancel}, Logger: testLogger(), TaskLinkOperations: ops})
+	response = httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, httptest.NewRequestWithContext(ctx, http.MethodGet, path, nil))
+	require.Equal(http.StatusServiceUnavailable, response.Code, response.Body.String())
+	assert.Contains(response.Body.String(), `"error":"identity_unavailable"`)
+}
+
 func TestTaskLinkAPIsRejectNonEmailConcreteRows(t *testing.T) {
 	t.Parallel()
 	srv := taskLinkServer(t, "imessage", &fakeTaskLinkOperations{})
@@ -244,7 +290,7 @@ func TestTaskLinkAPIsRejectNonEmailConcreteRows(t *testing.T) {
 		{http.MethodPost, "/api/v1/messages/42/tasks"},
 		{http.MethodDelete, "/api/v1/messages/42/tasks/task-1"},
 	} {
-		req := httptest.NewRequest(tc.method, tc.path, bytes.NewReader([]byte(`{"task_id":"task-1","title":"Synthetic"}`)))
+		req := httptest.NewRequestWithContext(t.Context(), tc.method, tc.path, bytes.NewReader([]byte(`{"task_id":"task-1","title":"Synthetic"}`)))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Api-Key", "test-key")
 		req.Header.Set("X-Request-ID", "browser-request-1")
@@ -262,7 +308,7 @@ func TestTaskLookupAlwaysReturnsIndexAuthorityFields(t *testing.T) {
 		State: tasklinks.StatePartial, Complete: false, LastScan: now, RemoteRevision: "remote-1", Reason: tasklinks.ReasonSafetyLimit},
 		Tasks: []tasklinks.TaskSummary{{ID: "task-1", Title: "Linked task"}}}}
 	srv := taskLinkServer(t, "email", ops)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/messages/42/tasks", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/messages/42/tasks", nil)
 	req.Header.Set("X-Api-Key", "test-key")
 	resp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(resp, req)
@@ -317,23 +363,34 @@ func TestTaskLookupDisclosesExactSanitizedOutboundMetadata(t *testing.T) {
 
 func TestTaskSearchReturnsConfiguredProjectResults(t *testing.T) {
 	t.Parallel()
-	ops := &fakeTaskLinkOperations{search: []tasklinks.TaskSummary{{ID: "task-1", Title: "Synthetic result", Revision: "r1"}}}
+	assert := assert.New(t)
+	require := require.New(t)
+	ops := &fakeTaskLinkOperations{truncated: true, search: []tasklinks.TaskSummary{{ID: "task-1", Title: "Synthetic result", Revision: "r1"}}}
 	srv := taskLinkServer(t, "email", ops)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/integrations/tasks/search?q=Synthetic", nil)
+	for _, tc := range []struct{ query, want string }{{"", ""}, {"?q=+Synthetic+", "Synthetic"}} {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/tasks/search"+tc.query, nil)
+		req.Header.Set("X-Api-Key", "test-key")
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		require.Equal(http.StatusOK, resp.Code, resp.Body.String())
+		assert.Equal(tc.want, ops.searchQuery)
+		var got TaskSearchResponse
+		require.NoError(json.Unmarshal(resp.Body.Bytes(), &got))
+		assert.Equal(ops.search, got.Tasks)
+		assert.True(got.Truncated)
+	}
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/tasks/search?q="+strings.Repeat("x", 257), nil)
 	req.Header.Set("X-Api-Key", "test-key")
 	resp := httptest.NewRecorder()
 	srv.Router().ServeHTTP(resp, req)
-	require.Equal(t, http.StatusOK, resp.Code, resp.Body.String())
-	var got TaskSearchResponse
-	require.NoError(t, json.Unmarshal(resp.Body.Bytes(), &got))
-	assert.Equal(t, ops.search, got.Tasks)
+	assert.Equal(http.StatusBadRequest, resp.Code)
 }
 
 func TestTaskLinkSecondConflictIsSurfaced(t *testing.T) {
 	t.Parallel()
 	ops := &fakeTaskLinkOperations{err: taskclient.ErrConflict}
 	srv := taskLinkServer(t, "email", ops)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader([]byte(`{"task_id":"task-1","added_at":"2026-07-19T01:02:03Z"}`)))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader([]byte(`{"task_id":"task-1","added_at":"2026-07-19T01:02:03Z"}`)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", "test-key")
 	req.Header.Set("X-Request-ID", "browser-request-1")
@@ -346,7 +403,7 @@ func TestTaskLinkRequestRejectedIsSurfacedAsClientError(t *testing.T) {
 	t.Parallel()
 	ops := &fakeTaskLinkOperations{err: taskclient.ErrRequestRejected}
 	srv := taskLinkServer(t, "email", ops)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader([]byte(`{"task_id":"task-1","added_at":"2026-07-19T01:02:03Z"}`)))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/messages/42/tasks", bytes.NewReader([]byte(`{"task_id":"task-1","added_at":"2026-07-19T01:02:03Z"}`)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Api-Key", "test-key")
 	req.Header.Set("X-Request-ID", "browser-request-1")

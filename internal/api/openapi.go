@@ -17,6 +17,9 @@ import (
 // (info.version). It tracks the HTTP wire contract, not the binary build
 // version, so clients can reason about compatibility independently of releases.
 //
+// Record each change with a summary in internal/api/testdata/api-version-contracts.
+// See docs/development.md#api-schema-version-maintenance. Do not add entries here.
+//
 // 1.1.0: GET /api/v1/cli/search no longer blocks on the FTS completeness
 // probe/backfill; it returns immediately and reports background index work in
 // the additive index_state field ("checking"/"building"). Clients older than
@@ -279,9 +282,8 @@ import (
 // mixed selections; clients can disclose that subset before confirmation.
 // 2.19.0 extends operation history with durable invocation lanes, date bounds,
 // filter-bound pagination, fixed error codes, supported actions, and related
-// status identifiers. It adds GET /api/v1/documents/status/current to resolve
-// status for the selected durable document profile. These Operations response
-// changes remain within the unreleased 2.x contract.
+// status identifiers. These Operations response changes remain within the
+// unreleased 2.x contract.
 // 2.20.0 adds the "last time we talked" person brief: the current version, the
 // version history, owner rejection, manual generation, and the brief enrollment
 // opt-in at /api/v1/people/{id}/brief*. A brief version reports its
@@ -376,9 +378,48 @@ import (
 // 3.23.0 adds the Docbank attachment mirror routes, receipts and status states.
 // 3.24.0 adds authenticated streamed Muesli recording imports.
 // 3.25.0 adds archived chat discovery ranked by the best matching name or title.
-// 3.26.0 adds the fork attachment OCR routes and owner IMAP sync configuration.
-// 3.27.0 exposes the original Message-ID in message details for reply threading.
-const APISchemaVersion = "3.27.0"
+// 3.26.0 adds bounded search-aware deletion resolution with an explicit
+// max_results cap and matched_count for skipped matches.
+// 3.27.0 adds optional attachment text results and recording errors in media search.
+// 3.28.0 adds the typed calendar projection to calendar event message details.
+// 3.29.0 adds literal address filtering to the durable people Directory.
+// 3.30.0 adds the stored hidden_text_present flag to message details and search rows.
+// 3.31.0 adds literal OR warnings to full-text search responses.
+// 3.32.0 adds scheduled-work queue times and CardDAV scheduler activity.
+// 3.33.0 adds the read-only person tier preview and explanation routes.
+// 3.34.0 adds answered-call counts to person tier signals.
+// 3.35.0 adds archived calendar occurrence listing.
+// 3.36.0 adds stored plaintext range counts to document indexing status.
+// 3.37.0 omits first_at and last_at on person summaries with no sent or received messages, and returns participants with no sent or received messages instead of 404.
+// 3.38.0 adds exact sender and To participant identities to conversation windows
+// and canonical entry-kind filters to analytical requests.
+// 3.39.0 adds the optional account to staged deletion list summaries.
+// 3.40.0 adds timezone-aware daily message grouping and sent_only group filtering.
+// It also filters participant timelines to events and meetings attended by the owner.
+// 3.41.0 adds body_text for a single message's stored plain-text body, which can be generated from HTML and is empty when no plain text is stored; conversation windows leave it unset.
+// Older servers omit body_text; body keeps its HTML fallback.
+// 3.42.0 adds iMessage participant and attachment-size limits to settings.
+// 3.43.0 adds receiver-reported sender authentication to single-message reads.
+// 3.44.0 adds owner-only open-loop routes and done, snooze, and reopen decisions.
+// 3.45.0 adds sender labels to message and file search rows.
+// 3.46.0 adds measured CLI full-text pagination and semantic ranking cap overflow.
+// 3.47.0 adds retry hints to CLI and fast search.
+// 3.48.0 adds owner-only local message search activation and progress.
+// 3.49.0 adds verification.read for revealing detected verification content in delegated reads.
+// 3.50.0 adds provider-neutral message import.
+// 3.51.0 adds attachment processing outcomes and worker errors.
+// 4.0.0 removes local document commands, search, status, and operation lanes.
+// Docbank owns document processing.
+// 4.1.0 adds recorded names, saved contacts, and reconciled addresses to merge-list and detail responses,
+// registered service labels to current contact points, and identity keys to observations.
+// 4.2.0 adds attachment retrieval modes, coverage, and degradations to media search.
+// 5.0.0 makes file list and suggestion content availability nullable when storage has not been checked.
+// 5.1.0 adds keyed group overviews, time-group item totals, saved view schema 3, and saved view run timezones.
+// 5.2.0 adds open Kata issue search and optional task search queries.
+// 5.3.0 adds the IMAP authentication method to CLI accounts.
+// 5.4.0 adds attachment OCR routes, owner IMAP sync configuration, and the
+// original Message-ID in message details for reply threading.
+const APISchemaVersion = "5.4.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
@@ -811,7 +852,7 @@ func hardenExploreSchemas(doc *huma.OpenAPI) {
 }
 
 func exploreGroupingEnum() []any {
-	dimensions := explorecatalog.GroupingDimensions()
+	dimensions := explorecatalog.RequestGroupingDimensions()
 	values := make([]any, len(dimensions))
 	for index, dimension := range dimensions {
 		values[index] = dimension
@@ -989,16 +1030,28 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		return
 	}
 	schemas := doc.Components.Schemas.Map()
-	// These response properties stay required in JSON, but an empty string is
-	// meaningful for canonical aliases, direct routes, unresolved routes, and
-	// candidates whose saved display name has been cleared.
+	// These response properties stay required in JSON, but allow empty strings.
 	for _, field := range []struct{ schema, property string }{
+		{"Attendee", "email"},
+		{"Attendee", "display_name"},
+		{"CalendarOccurrence", "start_date"},
+		{"CalendarOccurrence", "end_date"},
+		{"CalendarOccurrence", "subject"},
 		{"ContactCandidate", "display_name"},
+		{"MediaAttachmentResult", "filename"},
+		{"MediaAttachmentResult", "containing_title"},
+		{"MediaAttachmentResult", "excerpt"},
 		{"MessagingRoute", "merged_into_chat_id"},
 		{"MessagingRoute", "network"},
 		{"MessagingRoute", "network_label"},
 		{"MessagingRoute", "provider_chat_id"},
 		{"PersonMessagingRoutesPage", "alias_reason"},
+		{"ParticipantAddress", "display_value"},
+		{"ParticipantAddress", "service_slug"},
+		{"ParticipantAddress", "service_label"},
+		{"ParticipantAddress", "scope_kind"},
+		{"ParticipantAddress", "scope_value"},
+		{"ParticipantAddress", "participant_display_name"},
 	} {
 		if schema := schemas[field.schema]; schema != nil {
 			if property := schema.Properties[field.property]; property != nil {
@@ -1012,7 +1065,28 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			}
 		}
 	}
+	for _, name := range []string{"FileSearchRow", "FileSuggestionRow", "PersonFileSearchRow", "PersonFileSuggestionRow"} {
+		if schema := schemas[name]; schema != nil {
+			if property := schema.Properties["content_available"]; property != nil {
+				setCodegenGoType(property, "*bool")
+				nullableSchemaProperty(schema, "content_available")
+			}
+		}
+	}
 	const emailProperty = "email"
+	if calendar := schemas["CalendarProjection"]; calendar != nil {
+		for name, goType := range map[string]string{"all_day": "*bool", "sequence": "*int64"} {
+			if property := calendar.Properties[name]; property != nil {
+				setCodegenGoType(property, goType)
+			}
+		}
+		// Fields the stored event does not carry are present as null, including
+		// zero-capable scalars. Keep every field nullable through parsing and
+		// encoding.
+		for _, name := range []string{statusFieldName, "sequence", "start", "end", "all_day", "time_zone", "ical_uid"} {
+			nullableSchemaProperty(calendar, name)
+		}
+	}
 	if input := schemas["GCalEventInput"]; input != nil {
 		for name, goType := range map[string]string{"attendees": "*[]GCalAttendee", "recurrence": "*[]string"} {
 			if field := input.Properties[name]; field != nil {
@@ -1077,6 +1151,23 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			}
 		}
 	}
+	if message := schemas["ImportedMessage"]; message != nil {
+		// As with Meeting, the public schema keeps the title-or-body and
+		// single-body rules; the Go client gets a plain struct. A string keeps
+		// the caller's UTC offset, and metadata values stay arbitrary JSON.
+		message.AllOf = nil
+		if sentAt := message.Properties["sent_at"]; sentAt != nil {
+			setCodegenGoType(sentAt, "string")
+		}
+		if metadata := message.Properties["metadata"]; metadata != nil {
+			if values, ok := metadata.AdditionalProperties.(*huma.Schema); ok {
+				setCodegenGoType(values, "any")
+			}
+		}
+	}
+	if sender := schemas["MessageImportSender"]; sender != nil {
+		sender.AnyOf = nil
+	}
 	if totals := schemas["DurationTotals"]; totals != nil {
 		if average := totals.Properties["average_known_seconds"]; average != nil {
 			setCodegenGoType(average, "*float64")
@@ -1086,8 +1177,9 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 	nullableSchemaProperty(schemas["Metrics"], "first_meeting_at")
 	nullableSchemaProperty(schemas["Metrics"], "last_meeting_at")
 	for schemaName, property := range map[string]string{
-		"MeetingPerson": emailProperty,
-		"Source":        "account_email",
+		"MeetingPerson":       emailProperty,
+		"Source":              "account_email",
+		"MessageImportSource": "account_email",
 	} {
 		if schema := schemas[schemaName]; schema != nil {
 			if email := schema.Properties[property]; email != nil {
@@ -1341,15 +1433,13 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 	}
 	setEnumNames(schemas["ExploreGroupDimension"], []any{
 		"ExploreGroupDimensionSource", "ExploreGroupDimensionParticipant", "ExploreGroupDimensionDomain",
-		"ExploreGroupDimensionMessageType", "ExploreGroupDimensionMailingList", "ExploreGroupDimensionKind", "ExploreGroupDimensionYear", "ExploreGroupDimensionMonth",
+		"ExploreGroupDimensionMessageType", "ExploreGroupDimensionMailingList", "ExploreGroupDimensionKind", "ExploreGroupDimensionYear", "ExploreGroupDimensionMonth", "ExploreGroupDimensionDay",
 	})
 	if counter := schemas["OperationPublicCounter"]; counter != nil {
 		setEnumNames(counter.Properties["unit"], []any{
 			"OperationPublicCounterUnitAttachments",
 			"OperationPublicCounterUnitBooks",
-			"OperationPublicCounterUnitChunks",
 			"OperationPublicCounterUnitContacts",
-			"OperationPublicCounterUnitDocuments",
 			"OperationPublicCounterUnitMessages",
 			"OperationPublicCounterUnitPeople",
 			"OperationPublicCounterUnitWrites",
@@ -1359,6 +1449,12 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		setEnumNames(response.Properties["status"], []any{
 			"MeetingImportResponseStatusCreated",
 			"MeetingImportResponseStatusUpdated",
+		})
+	}
+	if response := schemas["MessageImportResponse"]; response != nil {
+		setEnumNames(response.Properties["status"], []any{
+			"MessageImportResponseStatusCreated",
+			"MessageImportResponseStatusUpdated",
 		})
 	}
 	if request := schemas["MeetingActionsRequest"]; request != nil {
@@ -1423,8 +1519,9 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			"readiness": {"ExploreCacheUnavailableResponseReadinessAbsent", "ExploreCacheUnavailableResponseReadinessBuilding", "ExploreCacheUnavailableResponseReadinessInterrupted", "ExploreCacheUnavailableResponseReadinessStaleSchema", "ExploreCacheUnavailableResponseReadinessDrifted"},
 		},
 		"ExploreFilter": {
-			"dimension": {"ExploreFilterDimensionSource", "ExploreFilterDimensionParticipant", "ExploreFilterDimensionDomain", "ExploreFilterDimensionMessageType", "ExploreFilterDimensionMailingList", "ExploreFilterDimensionAfter", "ExploreFilterDimensionBefore", "ExploreFilterDimensionDeletion", "ExploreFilterDimensionIdentity", "ExploreFilterDimensionAccount"},
+			"dimension": {"ExploreFilterDimensionSource", "ExploreFilterDimensionParticipant", "ExploreFilterDimensionDomain", "ExploreFilterDimensionMessageType", "ExploreFilterDimensionKind", "ExploreFilterDimensionMailingList", "ExploreFilterDimensionAfter", "ExploreFilterDimensionBefore", "ExploreFilterDimensionDeletion", "ExploreFilterDimensionIdentity", "ExploreFilterDimensionAccount"},
 		},
+		"ExploreGroupRow": {"level": {"ExploreGroupRowLevelNone", "ExploreGroupRowLevelFirstQuartile", "ExploreGroupRowLevelSecondQuartile", "ExploreGroupRowLevelThirdQuartile", "ExploreGroupRowLevelFourthQuartile"}},
 		"ExploreGroupSort": {
 			"direction": {"ExploreGroupSortDirectionAsc", "ExploreGroupSortDirectionDesc"},
 			"field":     {"ExploreGroupSortFieldKey", "ExploreGroupSortFieldCount", "ExploreGroupSortFieldEstimatedBytes", "ExploreGroupSortFieldLatestAt"},
@@ -1449,9 +1546,7 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 				"ImportJobResponseStatusFailed",
 			},
 		},
-		"ExploreSelection": {
-			"mode": {"ExploreSelectionModeExplicit", "ExploreSelectionModeAllMatching"},
-		},
+		"ExploreSelection": {"mode": {"ExploreSelectionModeExplicit", "ExploreSelectionModeAllMatching"}},
 		"ExploreSort": {
 			"direction": {"ExploreSortDirectionDesc"},
 			"field":     {"ExploreSortFieldOccurredAt"},

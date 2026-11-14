@@ -1,29 +1,38 @@
 <script lang="ts">
-  import { appShortcuts, Button, EmptyState, Modal, SearchInput } from '@kenn-io/kit-ui';
-
+  import DetailSection from '../people/DetailSection.svelte';
+  import EmptyLine from '../common/EmptyLine.svelte';
+  import InlineNotice from '../common/InlineNotice.svelte';
+  import ConflictNotice from '../common/ConflictNotice.svelte';
+  import { employmentConflictDetails, employmentFacts } from '../../directory/conflict';
+  import Dialog from '../common/Dialog.svelte';
   import type { DirectoryEntityController } from '../../directory/entity-controller.svelte';
-  import type { Employment, Organization } from '../../directory/models';
-  import EmploymentCurrentData from './EmploymentCurrentData.svelte';
+  import type { Employment, Organization, Prepared } from '../../directory/models';
+  import { WriteAttempt } from '../../directory/write-attempt.svelte';
+  import DetailRow from '../people/DetailRow.svelte';
+  import { dateSpan } from '../../directory/labels';
   import EmploymentEditor from './EmploymentEditor.svelte';
+  import EmploymentEndDialog from './EmploymentEndDialog.svelte';
   import OrganizationEditor from './OrganizationEditor.svelte';
 
   interface Props {
     controller: DirectoryEntityController;
     personID: number;
     organizationRequest?: { id: number; key: number };
+    onOpenPerson?: (personID: number) => void;
   }
 
-  let { controller, personID, organizationRequest = undefined }: Props = $props();
-  let organizationQuery = $state('');
-  let organizationEditor = $state<Organization | null | undefined>(undefined);
+  let { controller, personID, organizationRequest = undefined, onOpenPerson = undefined }: Props = $props();
+  let organizationEditor = $state<(Pick<Organization, 'id'> & Partial<Organization>) | null | undefined>(undefined);
   let employmentEditor = $state<Employment | null | undefined>(undefined);
-  let employmentAction = $state<'edit' | 'end'>('edit');
+  let endingEmployment = $state<Employment>();
+  const currentJobs = $derived(controller.employments.filter(job => job.is_current));
+  // The server lists jobs most recent first.
+  const pastJobs = $derived(controller.employments.filter(job => !job.is_current));
   let deletingEmployment = $state<Employment>();
-  let deleteConflictCurrent = $state<Employment>();
-  let deleteMessage = $state('');
-  let actionMessage = $state('');
-  let actionConflictCurrent = $state<Employment>();
-  let acting = $state(false);
+  const removal = new WriteAttempt<Prepared<Employment>>();
+  const primary = new WriteAttempt<Prepared<Employment>>();
+  let primaryTarget = $state<Employment>();
+  const acting = $derived(removal.busy || primary.busy);
   let openedOrganizationRequestKey = $state(0);
 
   $effect(() => {
@@ -32,196 +41,102 @@
     void openRequestedOrganization(organizationRequest.id);
   });
 
-  $effect(() => {
-    if (!deletingEmployment) return;
-    return appShortcuts.pushScope('directory-employment-delete');
-  });
-
-  function organizationName(id: number): string {
-    return controller.organizations.find((item) => item.id === id)?.name
-      ?? (controller.employmentProjection?.organization_id === id ? controller.employmentProjection.organization_name : undefined)
-      ?? `Organization ${id}`;
-  }
-
-  function organizationRecord(id: number): Organization | undefined {
-    return controller.organizations.find((item) => item.id === id);
-  }
-
   function employmentLabel(employment: Employment): string {
-    return employment.title ?? employment.role ?? 'Employment';
+    return employment.title ?? employment.role ?? 'Job';
   }
 
-  function dateText(value: { year?: number; month?: number; day?: number } | undefined): string {
-    if (!value) return '';
-    return [value.year?.toString().padStart(4, '0'), value.month?.toString().padStart(2, '0'), value.day?.toString().padStart(2, '0')].filter(Boolean).join('-');
-  }
-
-  async function searchOrganizations(): Promise<void> {
-    await controller.refreshOrganizations(organizationQuery);
-  }
-
-  async function openRequestedOrganization(id: number): Promise<void> {
-    actionMessage = '';
-    try {
-      const profile = await controller.prepareOrganizationMutation(id);
-      organizationEditor = profile.organization;
-    } catch (cause: unknown) {
-      actionMessage = cause instanceof Error ? cause.message : 'Unable to open the organization.';
-    }
+  function openRequestedOrganization(id: number): void {
+    primary.reset();
+    organizationEditor = { id, name: controller.organizationName(id) };
   }
 
   async function addEmployment(): Promise<void> {
-    actionMessage = '';
-    actionConflictCurrent = undefined;
+    primary.reset();
     if (controller.organizations.length === 0) await controller.refreshOrganizations();
-    employmentAction = 'edit';
     employmentEditor = null;
   }
 
   async function makePrimary(employment: Employment): Promise<void> {
     if (acting) return;
-    acting = true;
-    actionMessage = '';
-    actionConflictCurrent = undefined;
-    try {
-      const result = await controller.makeEmploymentPrimary(employment.id);
-      if (!result.ok) {
-        if (result.kind === 'conflict') {
-          actionConflictCurrent = result.current;
-          actionMessage = `This employment changed elsewhere. ${result.message}`;
-        } else actionMessage = result.message;
-      }
-    } finally {
-      acting = false;
-    }
+    if (primaryTarget?.id !== employment.id) primary.reset(); primaryTarget = employment;
+    await primary.run(current => controller.makeEmploymentPrimary(employment.id, current));
   }
 
   async function removeEmployment(): Promise<void> {
     if (!deletingEmployment || acting) return;
-    acting = true;
-    deleteMessage = '';
-    deleteConflictCurrent = undefined;
     const target = deletingEmployment;
-    try {
-      const result = await controller.deleteEmployment(target.id);
-      if (result.ok) closeDelete();
-      else if (result.kind === 'conflict') {
-        deleteConflictCurrent = result.current;
-        deleteMessage = `This employment changed elsewhere. ${result.message}`;
-      } else deleteMessage = result.message;
-    } finally {
-      acting = false;
-    }
+    if (await removal.run(current => controller.deleteEmployment(target.id, current))) closeDelete();
   }
 
   function openDelete(employment: Employment): void {
-    deleteMessage = '';
-    deleteConflictCurrent = undefined;
+    removal.reset();
     deletingEmployment = employment;
   }
 
   function closeDelete(): void {
     if (acting) return;
     deletingEmployment = undefined;
-    deleteConflictCurrent = undefined;
-    deleteMessage = '';
+    removal.reset();
   }
 </script>
 
-<section class="organization-employment" aria-label="Organizations and employment">
-  <header>
-    <div><h2>Organizations</h2><p>Maintain organizations and the selected person's employment history.</p></div>
-    <div class="actions"><Button label="New organization" onclick={() => { organizationEditor = null; }} /><Button tone="info" label="Add employment" onclick={() => void addEmployment()} /></div>
-  </header>
+<div class="organization-employment">
+  <DetailSection title="Work" addLabel="Add job…" onadd={() => void addEmployment()}
+    history={pastJobs.length ? pastRows : undefined} historyLabel={`${pastJobs.length} past ${pastJobs.length === 1 ? 'job' : 'jobs'}`}>
+    {#if controller.employmentsLoading}<p role="status">Loading jobs…</p>{/if}
+    {#if !controller.employments.length && !controller.employmentsLoading && !controller.errors.employments}<EmptyLine message="No work yet" />{/if}
+    <div class="records">{#each currentJobs as employment (employment.id)}{@render jobRow(employment)}{/each}</div>
+    {#if primaryTarget && !currentJobs.some(job => job.id === primaryTarget?.id)}{@render primaryFeedback()}{/if}
+    {#if controller.errors.employments}<InlineNotice message="Couldn't load jobs." details={controller.errors.employments} actionLabel="Retry" onaction={() => void controller.refreshEmployments()} />{/if}
+  </DetailSection>
+</div>
 
-  {#if controller.employmentProjection}
-    <p class="projection"><strong>Primary organization: {controller.employmentProjection.organization_name}</strong>{#if controller.employmentProjection.title} · {controller.employmentProjection.title}{/if}</p>
+{#snippet pastRows()}<div class="records">{#each pastJobs as employment (employment.id)}{@render jobRow(employment)}{/each}</div>{/snippet}
+{#snippet jobRow(employment: Employment)}
+  <!-- The organization is a link in the row's text, so the row itself takes no tap: Edit… is in ⋯, and a tap on a phone never lands on the wrong target. -->
+  <DetailRow actionLabel={`${employmentLabel(employment)} at ${controller.organizationName(employment.organization_id)}`} description={[dateSpan(employment.start_date, employment.end_date, employment.is_current), employment.department, employment.is_current && employment.is_primary && currentJobs.length > 1 ? 'Primary' : ''].filter(Boolean).join(' · ')} menu={[
+    { label: 'Edit…', onselect: () => employmentEditor = employment },
+    ...(employment.is_current ? [{ label: 'End…', onselect: () => endingEmployment = employment }] : []),
+    ...(employment.is_current && !employment.is_primary ? [{ label: 'Make primary', disabled: acting, onselect: () => void makePrimary(employment) }] : []),
+    { label: 'Delete…', danger: true, onselect: () => openDelete(employment) }
+  ]}>
+    {employmentLabel(employment)} at <button type="button" data-link onclick={() => openRequestedOrganization(employment.organization_id)}>{controller.organizationName(employment.organization_id)}</button>
+  </DetailRow>
+  {#if primaryTarget?.id === employment.id && employment.is_current}{@render primaryFeedback()}{/if}
+{/snippet}
+
+{#snippet primaryFeedback()}
+  {#if primary.failed}
+    {#if primary.conflict}
+      <ConflictNotice noun="job" saved={primary.conflict.data} record={employmentFacts(primary.conflict.data, controller, personID)} message={employmentConflictDetails(primary.conflict.data, primary.details)} actionLabel={primary.conflict.data.person_id === personID ? 'Retry' : undefined} onaction={() => { if (primaryTarget) void makePrimary(primaryTarget); }} />
+    {:else}<InlineNotice message="Couldn't make this job primary." details={primary.details} actionLabel="Retry" onaction={() => { if (primaryTarget) void makePrimary(primaryTarget); }} />{/if}
   {/if}
+{/snippet}
 
-  <section aria-label="Employment history">
-    <h3>Employment history</h3>
-    {#if controller.errors.employments}
-      <div class="refresh-error">
-        <p role="alert">{controller.errors.employments}</p>
-        <Button label="Refresh employment records" onclick={() => void controller.refreshEmployments()} />
-      </div>
-    {/if}
-    {#if controller.employmentsLoading}<p role="status">Loading employment records…</p>{/if}
-    {#if controller.employments.length === 0}
-      {#if !controller.employmentsLoading}<EmptyState title="No employment records." description="Add an employment to connect this person to an organization." />{/if}
-    {:else}
-      <ul class="records">
-        {#each controller.employments as employment (employment.id)}
-          <li>
-            <div><strong>{employmentLabel(employment)}</strong> · {organizationName(employment.organization_id)}
-              {#if employment.is_primary} <small>Primary</small>{/if}{#if employment.is_current} <small>Current</small>{/if}
-              {#if employment.start_date || employment.end_date}<span class="dates">{dateText(employment.start_date)} – {dateText(employment.end_date) || 'present'}</span>{/if}
-            </div>
-            <div class="row-actions">
-              <Button size="sm" label="Edit employment" onclick={() => { employmentAction = 'edit'; employmentEditor = employment; }} />
-              {#if employment.is_current}<Button size="sm" label="End employment" onclick={() => { employmentAction = 'end'; employmentEditor = employment; }} />{/if}
-              {#if employment.is_current && !employment.is_primary}<Button size="sm" label="Make primary employment" disabled={acting} onclick={() => void makePrimary(employment)} />{/if}
-              <Button size="sm" tone="danger" label="Delete employment" onclick={() => openDelete(employment)} />
-            </div>
-          </li>
-        {/each}
-      </ul>
-    {/if}
-    {#if actionMessage}
-      <div role="alert">
-        <p>{actionMessage}</p>
-        {#if actionConflictCurrent}
-          <EmploymentCurrentData employment={actionConflictCurrent} organization={organizationRecord(actionConflictCurrent.organization_id)} />
-        {/if}
-      </div>
-    {/if}
-  </section>
-
-  <section aria-label="Organization directory">
-    <h3>Organization directory</h3>
-    <form class="search" onsubmit={(event) => { event.preventDefault(); void searchOrganizations(); }}>
-      <SearchInput value={organizationQuery} ariaLabel="Search organizations" placeholder="Search organizations…" block oninput={(value) => { organizationQuery = value; }} />
-      <Button type="submit" label="Search organizations" disabled={controller.organizationsLoading} />
-    </form>
-    {#if controller.organizationsLoading}<p role="status">Searching organizations…</p>
-    {:else if controller.errors.organizations}<p role="alert">{controller.errors.organizations}</p>
-    {:else if controller.organizations.length === 0}<p class="empty">No organizations found.</p>
-    {:else}
-      <ul class="organizations">{#each controller.organizations as organization (organization.id)}<li><span><strong>{organization.name}</strong> · {organization.kind}{#if organization.primary_domain} · {organization.primary_domain}{/if}</span><Button size="sm" label={`Manage ${organization.name}`} onclick={() => { organizationEditor = organization; }} /></li>{/each}</ul>
-    {/if}
-  </section>
-</section>
-
+{#if endingEmployment}
+  <EmploymentEndDialog {controller} employment={endingEmployment} onClose={() => endingEmployment = undefined} />
+{/if}
 {#if organizationEditor !== undefined}
-  <OrganizationEditor controller={controller} organization={organizationEditor ?? undefined}
+  <OrganizationEditor controller={controller} organization={organizationEditor ?? undefined} {onOpenPerson}
     onDone={() => { organizationEditor = undefined; }} onClose={() => { organizationEditor = undefined; }} />
 {/if}
 {#if employmentEditor !== undefined}
-  <EmploymentEditor controller={controller} {personID} employment={employmentEditor ?? undefined} action={employmentAction}
+  <EmploymentEditor controller={controller} {personID} employment={employmentEditor ?? undefined}
     onDone={() => { employmentEditor = undefined; }} onClose={() => { employmentEditor = undefined; }} />
 {/if}
 {#if deletingEmployment}
-  <Modal title="Delete employment" ariaLabel="Delete employment" closeLabel="Close delete employment" onclose={closeDelete}>
-    <p>Delete {employmentLabel(deletingEmployment)} at {organizationName(deletingEmployment.organization_id)}?</p>
-    {#if deleteMessage}
-      <div role="alert">
-        <p>{deleteMessage}</p>
-        {#if deleteConflictCurrent}
-          <EmploymentCurrentData employment={deleteConflictCurrent} organization={organizationRecord(deleteConflictCurrent.organization_id)} />
-        {/if}
-      </div>
-    {/if}
-    {#snippet footer()}<Button label="Cancel" disabled={acting} onclick={closeDelete} /><Button tone="danger" surface="solid" label="Confirm delete employment" disabled={acting} onclick={() => void removeEmployment()} />{/snippet}
-  </Modal>
+  <Dialog title={`Delete ${employmentLabel(removal.conflict?.data ?? deletingEmployment)} at ${controller.organizationName((removal.conflict?.data ?? deletingEmployment).organization_id)}?`} width="small" primaryLabel="Delete" primaryTone="danger" onclose={closeDelete} onprimary={() => void removeEmployment()} busy={acting}>
+    <p>This permanently removes the job. {#if deletingEmployment.is_current}<button data-link type="button" disabled={acting} onclick={() => { endingEmployment = deletingEmployment; closeDelete(); }}>End it instead…</button>{/if}</p>
+    {#snippet notice()}
+      {#if removal.conflict}<ConflictNotice noun="job" saved={removal.conflict.data} record={employmentFacts(removal.conflict.data, controller, personID)} message={employmentConflictDetails(removal.conflict.data, removal.details)} actionLabel="Retry" onaction={() => void removeEmployment()} />
+      {:else if removal.failed}<InlineNotice message="Couldn't delete this job." details={removal.details} actionLabel="Retry" onaction={() => void removeEmployment()} />{/if}
+    {/snippet}
+  </Dialog>
 {/if}
 
 <style>
-  .organization-employment, section, .refresh-error { display: grid; gap: var(--space-3); }
-  header, .actions, .row-actions, .search, .organizations li { display: flex; gap: var(--space-2); align-items: center; justify-content: space-between; flex-wrap: wrap; }
-  h2, h3, p, ul { margin: 0; } header p, .dates, small, .empty { color: var(--text-muted); font-size: var(--font-size-sm); }
-  .projection { padding: var(--space-3); border-radius: var(--radius-sm); background: var(--bg-inset); }
-  .records, .organizations { list-style: none; padding: 0; display: grid; gap: var(--space-2); }
-  .records li { display: grid; gap: var(--space-2); padding: var(--space-3); border: 1px solid var(--border-default); border-radius: var(--radius-sm); }
-  .row-actions { justify-content: flex-start; } .dates { display: block; } .search :global(.kit-search-input) { flex: 1; min-width: 14rem; }
-  [role="alert"] { color: var(--text-danger); }
+  .organization-employment { display: grid; min-width: 0; }
+  .records { display: grid; }
+  p { margin: 0; font-size: var(--type-body-size); line-height: var(--type-body-line); }
+  [role="status"] { padding-block: var(--row-pad-y); color: var(--text-muted); font-size: var(--type-meta-size); line-height: var(--type-meta-line); }
 </style>

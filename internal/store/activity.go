@@ -211,6 +211,13 @@ func validActivityDate(value string) bool {
 	return err == nil && parsed.Format(time.DateOnly) == value
 }
 
+// activityProjectionPendingSQL includes roster changes awaiting message expansion.
+const activityProjectionPendingSQL = `EXISTS (
+    SELECT 1 FROM activity_projection_queue WHERE revision > processed_revision
+) OR EXISTS (SELECT 1 FROM activity_projection_conversation_queue)`
+
+const activityProjectionPendingQuery = `SELECT CASE WHEN ` + activityProjectionPendingSQL + ` THEN 1 ELSE 0 END`
+
 type ActivityProjectionQueueItem struct {
 	MessageID int64
 	Revision  int64
@@ -252,7 +259,11 @@ func (s *Store) ListActivityProjectionQueueContext(
 }
 
 func (s *Store) ActivityWatermarkContext(ctx context.Context) (int64, error) {
-	value, err := s.archiveMetadataValueContext(ctx, activityWatermarkKey)
+	return activityWatermark(ctx, s.db)
+}
+
+func activityWatermark(ctx context.Context, queryer contextRowQuerier) (int64, error) {
+	value, err := archiveMetadataValue(ctx, queryer, activityWatermarkKey)
 	if err != nil {
 		return 0, err
 	}
@@ -390,10 +401,7 @@ func (s *Store) CompleteActivityDirectLimitTransitionContext(
 			}
 		}
 		var pending int64
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM activity_projection_queue
-			WHERE revision > processed_revision
-		`).Scan(&pending); err != nil {
+		if err := tx.QueryRowContext(ctx, activityProjectionPendingQuery).Scan(&pending); err != nil {
 			return fmt.Errorf("check pending activity queue: %w", err)
 		}
 		if pending != 0 {
@@ -556,10 +564,7 @@ func (s *Store) CompleteActivityTimezoneTransitionContext(
 			}
 		}
 		var pending int64
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COUNT(*) FROM activity_projection_queue
-			WHERE revision > processed_revision
-		`).Scan(&pending); err != nil {
+		if err := tx.QueryRowContext(ctx, activityProjectionPendingQuery).Scan(&pending); err != nil {
 			return fmt.Errorf("check pending activity queue: %w", err)
 		}
 		if pending != 0 {
@@ -656,9 +661,9 @@ func setArchiveMetadataValueTx(
 	return nil
 }
 
-func (s *Store) archiveMetadataValueContext(ctx context.Context, key string) (string, error) {
+func archiveMetadataValue(ctx context.Context, queryer contextRowQuerier, key string) (string, error) {
 	var value string
-	err := s.db.QueryRowContext(ctx,
+	err := queryer.QueryRowContext(ctx,
 		`SELECT value FROM archive_metadata WHERE key = ?`, key).Scan(&value)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -785,11 +790,11 @@ func (s *Store) CompareAndSetActivityReconciledRevisionsContext(
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		identity, err := s.currentIdentityRevisionTx(tx)
+		identity, err := s.currentIdentityRevisionTxContext(ctx, tx)
 		if err != nil {
 			return err
 		}
-		account, err := readAccountIdentityRevision(tx)
+		account, err := readAccountIdentityRevision(boundQuerier{ctx: ctx, q: tx})
 		if err != nil {
 			return err
 		}
@@ -935,11 +940,11 @@ func (s *Store) StaleContactStatePersonsContext(
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		identityRevision, err := s.currentIdentityRevisionTx(tx)
+		identityRevision, err := s.currentIdentityRevisionTxContext(ctx, tx)
 		if err != nil {
 			return err
 		}
-		accountRevision, err := readAccountIdentityRevision(tx)
+		accountRevision, err := readAccountIdentityRevision(boundQuerier{ctx: ctx, q: tx})
 		if err != nil {
 			return err
 		}
@@ -1225,11 +1230,11 @@ func (s *Store) projectActivityBatchOnce(
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		currentIdentity, err := s.currentIdentityRevisionTx(tx)
+		currentIdentity, err := s.currentIdentityRevisionTxContext(ctx, tx)
 		if err != nil {
 			return err
 		}
-		currentAccount, err := readAccountIdentityRevision(tx)
+		currentAccount, err := readAccountIdentityRevision(boundQuerier{ctx: ctx, q: tx})
 		if err != nil {
 			return err
 		}
@@ -2100,11 +2105,11 @@ func (s *Store) RecomputeContactStateContext(
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		identity, err := s.currentIdentityRevisionTx(tx)
+		identity, err := s.currentIdentityRevisionTxContext(ctx, tx)
 		if err != nil {
 			return err
 		}
-		account, err := readAccountIdentityRevision(tx)
+		account, err := readAccountIdentityRevision(boundQuerier{ctx: ctx, q: tx})
 		if err != nil {
 			return err
 		}
@@ -2116,11 +2121,7 @@ func (s *Store) RecomputeContactStateContext(
 			return err
 		}
 		var pending int64
-		if err := tx.QueryRowContext(ctx, `
-			SELECT COUNT(*)
-			FROM activity_projection_queue
-			WHERE revision > processed_revision
-		`).Scan(&pending); err != nil {
+		if err := tx.QueryRowContext(ctx, activityProjectionPendingQuery).Scan(&pending); err != nil {
 			return fmt.Errorf("count pending activity projections: %w", err)
 		}
 		if pending > 0 {
@@ -2162,7 +2163,7 @@ func (s *Store) lockActivityProjectionQueueFreshnessTx(
 		return nil
 	}
 	if _, err := tx.ExecContext(ctx,
-		`LOCK TABLE activity_projection_queue IN SHARE MODE`); err != nil {
+		`LOCK TABLE activity_projection_queue, activity_projection_conversation_queue IN SHARE MODE`); err != nil {
 		return fmt.Errorf("lock activity projection queue freshness: %w", err)
 	}
 	return nil
@@ -2187,14 +2188,9 @@ func (s *Store) recomputeContactStateTx(
 	rows, err := tx.QueryContext(ctx, `
 		SELECT ae.occurred_at, ae.message_id, ae.channel, ae.direction,
 		       ae.owner_source_id, ae.owner_address
-		FROM activity_events ae
-		WHERE EXISTS (
-			SELECT 1
-			FROM activity_event_persons aep
-			WHERE aep.message_id = ae.message_id
-			  AND aep.person_id = ?
-			  AND aep.evidence = 'direct'
-		)
+		FROM activity_event_persons aep
+		JOIN activity_events ae ON ae.message_id = aep.message_id
+		WHERE aep.person_id = ? AND aep.evidence = 'direct'
 		ORDER BY ae.occurred_at, ae.message_id
 	`, personID)
 	if err != nil {
@@ -2286,9 +2282,10 @@ func (s *Store) reconcilePersonActivityStateTx(
 }
 
 // reclassifyPersonActivityTx starts from the affected people and indexed
-// participant/message edges. It never constructs an archive-wide counterpart
-// relation. Events whose classification did not change keep their old epoch;
-// the bounded projector backstop advances that stamp after the identity write.
+// participant/message edges and non-member event links. Membership-only events
+// stay outside the identity transaction, even when their old evidence is direct.
+// The bounded projector backstop repairs them from their stale identity epoch,
+// including audience-limit and owner changes affecting other room members.
 func (s *Store) reclassifyPersonActivityTx(
 	ctx context.Context, tx *loggedTx, personIDs []int64, revisions ContactRevisions,
 ) ([]int64, error) {
@@ -2297,8 +2294,8 @@ func (s *Store) reclassifyPersonActivityTx(
 	}
 	placeholders := personMergeSnapshotPlaceholders(len(personIDs))
 	personArgs := personMergeSnapshotIDArgs(personIDs)
-	args := make([]any, 0, len(personIDs)*4)
-	for range 4 {
+	args := make([]any, 0, len(personIDs)*3)
+	for range 3 {
 		args = append(args, personArgs...)
 	}
 	messageIDs, err := personMergeRowIDsTx(ctx, tx, `WITH affected_messages AS (
@@ -2312,15 +2309,10 @@ func (s *Store) reclassifyPersonActivityTx(
 		JOIN message_recipients recipient ON recipient.participant_id = binding.participant_id
 		WHERE binding.person_id IN (`+placeholders+`)
 		UNION
-		SELECT message.id
-		FROM person_participants binding
-		JOIN conversation_participants member ON member.participant_id = binding.participant_id
-		JOIN messages message ON message.conversation_id = member.conversation_id
-		WHERE binding.person_id IN (`+placeholders+`)
-		UNION
 		SELECT link.message_id
 		FROM activity_event_persons link
 		WHERE link.person_id IN (`+placeholders+`)
+		  AND link.role <> 'member'
 	)
 	SELECT event.message_id
 	FROM affected_messages affected

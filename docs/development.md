@@ -5,7 +5,7 @@ description: Build, test, lint, and code conventions.
 
 ## Build
 
-The macOS and Linux builds require Go 1.27.3+, Bun 1.4.4+, Node.js (22.23.4+ on
+The macOS and Linux builds require Go 1.27.4+, Bun 1.4.4+, Node.js (22.23.4+ on
 22.x, 24.22.1+ on 24.x, or 26.12.1+), and a C/C++ compiler. The Make targets install
 the pinned browser dependencies when `web/package.json` or `web/bun.lock`
 changes, then embed the production UI in the Go binary; Node runs the embed
@@ -24,7 +24,38 @@ make build-release
 
 # Install to ~/.local/bin or GOPATH
 make install
+
+# Homebrew formula build into $BINDIR (default bin/)
+make homebrew VERSION=1.2.3
 ```
+
+`make homebrew` is the normal build with `DISTRIBUTION=homebrew`, so the binary
+refuses `msgvault update` and points at `brew upgrade msgvault`. It adds the
+`duckdb_use_lib` tag, which links a system `libduckdb`; set `CGO_LDFLAGS` (and
+`CGO_CFLAGS` for headers) when that library is outside the default search path.
+
+### Share the Go build cache across worktrees
+
+Make targets compile Go with `-trimpath`, so binaries record module-relative
+source paths instead of absolute ones. Without it, Go caches every package
+separately for each checkout directory, and each git worktree grows the build
+cache by another full copy. With it, identical source in any checkout reuses
+the same cache entries.
+
+- Run `make <target> GOFLAGS=-trimpath=false` to opt out for one command.
+- Plain `go` commands outside Make do not add the flag. Run
+  `go env -w GOFLAGS=-trimpath` to make it your default; Make keeps any value
+  saved that way.
+
+Debuggers need a source mapping for trimmed binaries:
+
+- `dlv debug` and `dlv test` inherit `GOFLAGS` and cannot find source files.
+  Pass `--build-flags=-trimpath=false`. Debug builds disable optimizations, so
+  they never shared cache entries anyway.
+- For `dlv exec` or `dlv attach` on a trimmed binary, start Delve from the
+  repository root and run `config substitute-path -guess` (Delve 1.24 or
+  later). It maps the module path to your checkout, the standard library to
+  `GOROOT`, and dependencies to the module cache.
 
 ### Windows
 
@@ -101,6 +132,42 @@ scripts have been removed. Pushing a tag no longer invokes those publishers. The
 Docker inputs, local build commands, installers, and ordinary CI remain
 available.
 
+### Check a standalone executable
+
+Run the standalone contract against an already built or extracted executable
+on macOS or Linux:
+
+```bash
+make smoke-standalone BINARY=/absolute/path/to/msgvault
+```
+
+The check copies only the executable to a temporary directory with spaces,
+clears its environment, and uses a new temporary home. It imports one
+synthetic email into SQLite, builds the Parquet cache, and requires the exact
+result of a DuckDB-specific query. It stops its daemon and removes the home
+on exit. It never reads a personal archive or rebuilds/installs the binary.
+
+A developer host can still supply shared libraries even with a cleared
+environment. For a clean Linux check, run the same script in a stock runtime
+with networking disabled; use an executable built for the container's native
+architecture:
+
+```bash
+docker run --rm --network none --read-only --tmpfs /tmp:rw,exec \
+  --mount type=bind,src=/absolute/path/to/msgvault,dst=/artifact/msgvault,readonly \
+  --mount type=bind,src="$PWD/scripts/smoke-standalone.sh",dst=/smoke.sh,readonly \
+  debian:bookworm-slim sh /smoke.sh /artifact/msgvault
+```
+
+The Linux CI build uses Debian bookworm as its compiler baseline and transfers
+its AMD64 and ARM64 executables to separate stock bookworm runtime jobs. Those
+jobs install no build tools or DuckDB. They complement the Docker-image smoke
+above, which checks a different build and its packaged runtime. They do not
+publish release assets.
+See [runtime requirements](setup.md#runtime-requirements) for the inspected
+v0.23.0 requirements; a passing check on one host does not certify other OS
+versions or architectures.
+
 ## Test
 
 ```bash
@@ -133,15 +200,20 @@ goroutines, channels, timers, tickers, and fakes. Advance virtual time with
 
 Keep real waits for PostgreSQL and SQLite locks, database clocks, network
 requests, subprocesses, DuckDB, and operating-system events.
+Call Kit's `stacktest.Dump(t)` before failing a timeout while waiting on goroutines.
 
 `make lint` and `make lint-ci` build a pinned golangci-lint with Kit's
 `kennlint` plugin and run its `sleeptest` and `deadlinetest` checks. Outside a
 `synctest.Test` bubble, `sleeptest` rejects `time.Sleep` and `deadlinetest`
 rejects sub-second `context.WithTimeout`, `context.WithDeadline`, `time.After`,
-`time.NewTimer`, `time.AfterFunc` and testify `Eventually` budgets, plus zero
-or negative `Never` windows. A kept real wait carries `//nolint:kennlint //
-<what it waits for>` on the flagged line; for a deadline, that is only when its
-expiry is the asserted result or a `select` shows an event does not happen.
+`time.NewTimer`, `time.AfterFunc`, and testify `Eventually` budgets, plus zero
+or negative `Never` windows. It also checks duration fields and same-module
+helper parameters whose camelCase or snake_case names contain a `timeout`,
+`deadline`, `budget`, or `wait` word, including plurals. Standalone
+`time.Now().Add` deadlines are checked too. A kept real wait carries
+`//nolint:kennlint // sleeptest: <what it waits for>` on the flagged line.
+Use `deadlinetest:` for a deadline, only when its expiry is the asserted result
+or a `select` shows an event does not happen.
 
 ### PostgreSQL tests
 
@@ -185,6 +257,13 @@ server releases when the binary exits, so the next binary reclaims whatever an
 earlier one left behind; a role without `CREATEDB` falls back to a private
 schema in the configured database.
 
+`dbtest.NewTestDB` copies an in-memory `schema.sql` template per test with
+SQLite's backup API.
+Query Parquet fixtures are built once per distinct content and copied per test,
+so each test can change its own directory freely.
+Query tests call `t.Parallel()`; a test that replaces a package global stays
+serial and explains why in a `// serial:` comment.
+
 
 ### Local test scheduling
 
@@ -214,9 +293,58 @@ The PostgreSQL targets keep their existing connection-oriented concurrency
 limits; setting `MSGVAULT_TEST_DB` disables automatic scaling in `make test` too.
 CI's explicit `test-unsharded` and package-shard jobs keep their existing layout.
 
-Successful Bash shards and the Windows slow-packages job print named passing
-and skipped test outcomes, including subtests, followed by the package result.
-Failed runs print the full verbose test output for diagnosis.
+Go tests run through [gotestsum](https://github.com/gotestyourself/gotestsum),
+a tool dependency in `go.mod`. `make test`, the PostgreSQL targets, and CI's
+inline test steps rerun each failed test up to twice and list rerun tests in
+`gotestsum/<suite>-reruns.txt`. Every run records its `go test -json` events in
+`gotestsum/<suite>.json`. CI uploads those files as
+`gotestsum-<suite>-attempt-<n>` artifacts when a step fails, when gotestsum
+reruns a test, and on every rerun attempt of the workflow, so a test that failed
+in one attempt can be matched with its result in the next.
+
+The shard scripts do not rerun tests. They write every shard's events to
+`gotestsum/<suite>.json`, where the suite defaults to the package's last path
+element. Successful shards print named passing and skipped test outcomes,
+including subtests, followed by the package line `go test` prints. Failed
+shards print the full verbose test output, then the package's `FAIL` line.
+
+Bash shards balance test time with recorded durations from a package's
+`testdata/shard-weights-<backend>.txt`. Only PostgreSQL store has a weights
+file; a missing file keeps round-robin assignment. Unlisted tests get the median
+recorded duration, and removed tests are ignored. Each successful shard line
+reports its summed top-level test-seconds. Refresh
+`internal/store/testdata/shard-weights-postgres.txt` from a recent successful
+main run's `test-postgres-sharded (store)` job with:
+
+```bash
+gh run view -R kenn-io/msgvault --job <job-id> --log | cut -f3- | sed 's/^[^ ]* //' | grep -E '^--- (PASS|SKIP|FAIL): ' | sort
+```
+
+In CI, Vitest and Playwright retry a failed test twice and write JSON reports
+under `web/test-results/vitest/` and `web/test-results/playwright/`. CI uploads
+each report as a `vitest-<suite>-attempt-<n>` or
+`playwright-<suite>-attempt-<n>` artifact. `MSGVAULT_PLAYWRIGHT_SUITE` names a
+Playwright run's report.
+
+### CI and the merge queue
+
+Pull requests and `main` run the full CI suite. A pull request must pass it
+before it can join the merge queue. The merge queue runs a smaller suite that
+looks for breakage between separately green pull requests:
+
+- `checks`: Linux lint, API contract, generated artifact, and vulnerability checks.
+- The Linux SQLite test suite: `test` and the three `test-sharded` jobs.
+- `frontend` and `web-e2e`.
+- `release-linux-smoke` and `standalone-linux-runtime` for amd64 only.
+- `test-postgres-sharded (store)`, which runs the PostgreSQL schema, migration,
+  and upgrade tests. The SQLite suite covers the same tests on SQLite, including
+  `TestSchemaVersionContract`.
+
+Windows, arm64, pgvector, and the other PostgreSQL jobs skip merge groups. The
+PostgreSQL CLI and API shards, the follow-up checks for the PostgreSQL library
+without CGO, and the store concurrency repetitions skip them too. The skipped
+jobs still run on every push to `main`. Only `CI gate` is a required check, so
+this split needs no branch protection change.
 
 ## Lint & Format
 
@@ -432,6 +560,23 @@ unknown extensions, and raw values. Keep new registry elements covered by an
 explicit handling declaration so an upstream addition cannot be silently
 ignored.
 
+## API schema version maintenance
+
+When the HTTP API contract changes, bump `APISchemaVersion` in `internal/api/openapi.go`.
+Handler changes absent from the generated documents also need a bump.
+Add the marker path the test prints under `internal/api/testdata/api-version-contracts/`, with a
+one-line summary. Replace `<summary-sha256>` with `printf '%s' 'Your summary' | sha256sum | cut -d ' ' -f 1`.
+The suffix identifies the marker; the test does not check it against the summary.
+Keep every base marker. Replace a branch-only marker after changing its contract; if the version
+is used on the base, take the next minor and move feature minimums introduced by your change.
+The contract test skips locally when the base is unavailable and fails in CI.
+If the main branch is on `upstream`, fetch it and set the base before testing:
+
+```bash
+git fetch upstream main
+export MSGVAULT_API_CONTRACT_BASE="$(git merge-base HEAD upstream/main)"
+```
+
 ## Archive schema version maintenance
 
 `internal/store/schema_version.go` owns `store.SchemaVersion`, the monotonic
@@ -441,8 +586,8 @@ Embedded readers require an exact version match. Once an archive is migrated to
 a higher version, applications using an older `pkg/archive` must upgrade too,
 even if the schema change only added an index.
 
-Filename suggestions require archive schema version 6 and API schema 3.15,
-newer than the latest release. Version 6 creates empty projection tables;
+Filename suggestions require archive schema version 6 and API schema 3.15.
+Version 6 creates empty projection tables;
 background maintenance establishes readiness separately. Schema migration does
 not scan attachments or populate the index, and suggestion requests never
 perform setup or backfill. Embedded readers require completed version-6 setup.
@@ -462,8 +607,9 @@ alone, so bump the version by hand for one. SQLite and PostgreSQL use the
 versions before DDL and stamps this version only after its required steps succeed,
 using the caller's context. Keep optional and best-effort maintenance behavior separate from that
 completion guarantee.
+Writer opens and daemon start on a current PostgreSQL archive skip the full initializer; `msgvault migrate` and setup run it in full.
 
-The initial contract is new on `main`, after v0.21.0. Existing archives start at
+The contract began in 0.22.0. Existing archives start at
 `0`; successful initialization upgrades them to the binary's expected version.
 The [CLI reference](cli-reference.md#schema-version) owns the probe contract,
 and [Setup](setup.md#migrate-before-replacing-the-executable) owns the operator

@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-10-11"
+last_edited: "2026-11-10"
 title: MCP Server
 description: Expose your email, chat, calendar, and meeting archive to AI assistants via MCP.
 ---
@@ -8,6 +8,12 @@ Connect an AI assistant to your msgvault archive so it can find messages,
 retrieve attachments, and help you remember people and conversations. The
 server uses your selected daemon: without `[remote].url`, it starts or reuses
 the local daemon; with `[remote].url`, it uses that remote server.
+
+A running local MCP proxy rediscovers the daemon after idle shutdown
+or a restart, starting it when `daemon_auto_start` permits. It retries a request
+once after a connection fails before sending. Failures after connecting are not
+replayed. If recovery fails, the tool reports `daemon_unavailable` and suggests
+checking `msgvault daemon status`.
 
 MCP searches the archive, manages drafts, and can edit native email tags through the daemon.
 It cannot send email or read Google credentials. Semantic searches call your
@@ -31,13 +37,20 @@ View never deletes archive messages.
 
 ## Calendar control
 
-Unreleased daemon API schema 3.1.0 adds `calendar_create`, `calendar_update`,
+Daemon API schema 3.1.0 adds `calendar_create`, `calendar_update`,
 `calendar_delete`, `calendar_move`, `calendar_respond`, `calendar_freebusy`, and
 `calendar_conflicts`. All require `account`; event mutations also require
 `calendar_id`. Availability requires `time_min` and `time_max`, and accepts
 `calendar_ids`; `calendar_id` is used only when that list is empty. Mutation
 tools appear only with `--allow-calendar-writes`; HTTP also requires
 `--http-allow-writes` and protocol `2026-07-28` or newer.
+
+All seven calendar tools advertise `openWorldHint=true` because availability
+and mutations contact Google Calendar. Updating, deleting, moving, or responding
+to an existing event advertises `destructiveHint=true`; creating an event and
+reading availability advertise `false`. Hints describe possible effects, so a
+dry run keeps the tool's mutation hints. Calendar consent and per-call approval
+still apply.
 
 For a non-dry-run mutation, the MCP server first asks the daemon to build and
 authorize a plan. It then presents that plan through client elicitation and
@@ -57,7 +70,7 @@ rejects mutations. `calendar_respond` uses `response` for the self attendee only
 Recurring edits default to `single`; future update/delete needs `original_start`.
 Availability needs `time_min` and `time_max`, and accepts optional `calendar_ids`.
 
-[Calendar setup](calendar.md#control-events-unreleased) owns write consent,
+[Calendar setup](calendar.md#control-events) owns write consent,
 configured calendar permissions, recurrence limits, and archive failure recovery.
 MCP forwards requests to that same daemon path. A delegated stdio bridge, invoked
 with `--agent-url` and `--agent-token-file`, exposes scoped read, calendar and draft tools. The daemon
@@ -78,7 +91,7 @@ These tools run the matching CLI commands through your selected daemon. They req
 
 An owner session that also offers the live mail tools (`create_draft`, `send_draft`, and related tools) hides these draft tools, except `draft_send_as`, when it uses a local daemon and the config enables no `[[imap.drafts]]`, `[[gmail.drafts]]`, or `[[beeper.drafts]]` entry, because creating or editing a draft would return `draft_disabled`. Agent-token sessions and remote daemons always list them.
 
-`draft_delete` and `draft_recover` require client confirmation for the specific tool and arguments, because deletion removes a draft and recovery can finish an interrupted deletion. The client must show the proposed action and get your approval before responding, and msgvault checks that the response matches the pending call. Clients that can't answer confirmation prompts, including Claude Desktop, can still create, read, and edit drafts but can't delete or recover them.
+`draft_delete` and `draft_recover` require client confirmation for the specific tool and arguments, because deletion removes a draft and recovery can finish an interrupted deletion. The client must show the proposed action and get your approval before responding, and msgvault checks that the response matches the pending call. By default, clients that can't answer confirmation prompts, including Claude Desktop, can still create, read, and edit drafts but can't delete or recover them.
 
 | Tool | Command | Parameters |
 |---|---|---|
@@ -92,6 +105,12 @@ An owner session that also offers the live mail tools (`create_draft`, `send_dra
 | `draft_send_as` | `draft-send-as` | Required `account`; lists Gmail sender identities |
 
 Recipient parameters `to`, `cc`, and `bcc` are arrays of strings. Use `draft_get` to read the current revision before editing, deleting, or recovering a draft. Conversation lists return a `data` array. `draft_send_as` returns a `send_as` list.
+
+Successful draft creation and edit receipts include `sensitive_content` when the submitted subject or body contains a likely `payment_card`, `iban`, `us_ssn`, `api_key`, or `password`. Each entry has a `kind` and an optional `hint` showing the last four characters of a card or IBAN, or the first four characters of a prefixed key. The `quoted: true` label identifies sensitive content in parts of the body that msgvault recognizes as quoted history. The quote rules cover `>` lines and their reply attribution, keeping an unmarked answer below the block authored. A reply attribution without a `>` block, a dashed forwarded or original-message separator, or an Outlook `From:`/`Sent:` header marks history through the end of the body. The label neither proves authorship nor changes confirmation, and the approval prompt repeats it. Review these values before sending. The draft is still written unchanged.
+
+`msgvault mcp --confirm-sensitive-drafts` requires client approval before creating or editing a draft with detected sensitive content. For native daemon endpoints, use `msgvault serve --mcp-allow-writes --mcp-confirm-sensitive-drafts`. This option is off by default. Clients without elicitation support, and HTTP clients using a protocol older than `2026-07-28`, cannot write flagged drafts when it is enabled. The option grants no tools; standalone HTTP writes still require `--http-allow-writes`.
+
+Cards need 13 to 19 digits that pass the checksum, with a first digit of 2 to 6 or 8. IBANs need a registered country length and a valid checksum. Unlabelled keys are recognized only for common provider prefixes. A labelled value needs at least eight characters with a letter and a digit or one of `!@#$%^&*+/=~`; a quoted multi-word passphrase also counts under a password label. Labels and values must be on the same line, separated by `:` or `=`; `Bearer` values also count. An absent finding does not mean the content is safe. Stored drafts, server-appended history, and attachments are outside this scan.
 
 Owner sessions expose all eight tools alongside the archive tools. Delegated sessions expose only `draft_reply`, `draft_compose`, `draft_get`, `draft_edit`, `draft_delete`, and `draft_recover` from this list, alongside scoped read tools on daemons with API schema 3.9.0 or newer and the [calendar tools](#calendar-control). Each call uses the agent token, and the daemon checks its permissions and source scope.
 
@@ -109,6 +128,47 @@ For a delegated Claude Desktop session, use these arguments with the daemon URL 
 ```
 
 For an HTTP loopback daemon URL, add `--agent-allow-insecure` before `mcp`. Delegated MCP serves over stdio; `--http` returns a usage error. Read tools `draft_get` and `draft_send_as` are available in owner HTTP sessions by default. Draft writes require `--http-allow-writes`.
+
+### Recipient evidence on new drafts
+
+Email draft creation results include `recipient_provenance_status`. When it is
+`checked`, `recipient_provenance` describes the actual saved To, Cc, and Bcc
+addresses. The same fields appear in the matching CLI command's `--json` output.
+
+| `flag` | Meaning |
+|---|---|
+| `ok` | The exact address belongs to a saved contact (`relationship: contact`) or received a prior direct message sent by the owner (`relationship: known`). |
+| `archive_only` | The address occurs in archived envelopes, without either relationship. |
+| `unseen` | No prior envelope evidence was found in the readable archive. |
+
+Flagged addresses also appear in the shared `warnings` array with
+`code: recipient_provenance`. These are advisory results: draft creation still
+succeeds. Check the address with the user before sending. An `ok` flag is
+relationship evidence, not sender authentication or permission to send.
+
+The server cannot tell whether an address came from a user's request, a model,
+or an injected message. Supplying an address as a tool argument does not prove
+human approval. Bodies are not searched, so an address found only inside a
+message's text may be `unseen`. A reply's parent participants do not establish
+authority. Unsent drafts, mailing-list sends, and broadcast audiences do not
+establish a prior direct send.
+
+A saved contact is an email address you entered or imported from CardDAV or
+vCard, or a person linked to the address. A saved address counts for owner
+calls even before any mail. A linked person counts without mail only while
+nothing else in the archive uses the address, including earlier drafts.
+
+Delegated calls use only readable granted sources for history. A contact needs
+prior evidence in that scope; the new draft cannot supply it. Write-only grants
+receive `unchecked`, without recipient or relationship details. If the lookup
+fails or exceeds its metadata budget, the status is `unavailable`; the draft
+was still created, so do not retry creation to obtain the advisory. Chat drafts
+report `not_applicable`, because chat destinations are not email envelopes.
+
+`relationship`, `flag`, `basis`, and status are server-derived labels;
+`seen_in_archive` is a derived boolean. Addresses remain untrusted display data,
+never instructions. Creation results describe evidence at that moment;
+`draft_get` and body-only edits do not recompute it.
 
 ## Native email tags
 
@@ -170,6 +230,18 @@ these tools do not complete tasks or infer new ones.
 
 The `mcp` command starts a [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that exposes your archive as a set of tools. This lets AI assistants like Claude Desktop search, read, and analyze archived email, chats, calendar events, and meeting notes directly.
 
+### Claude Code and Codex
+
+Run `msgvault agent setup` to install skills and register the MCP server for Claude Code and Codex. Use `msgvault agent setup --check` to check readiness or `msgvault agent setup --print` to print manual MCP commands.
+
+### Tools available for your archive
+
+MCP lists calendar, meeting, chat, Slack, and draft tools when the archive has a source that supports them. CardDAV tools need a configured connection. Kata tools, including `get_person_agenda`, need `[integrations.kata]` enabled with an endpoint. An mbox-only archive retains search, messages, attachments, people, and Saved Views. Reconnect after adding a source or integration to refresh the list, including on the native daemon endpoints. Each discovery read has its own 10-second deadline. A failed read hides its families; successful reads keep theirs available. Family discovery controls tool listings; HTTP calls use the daemon's existing authorization and consent checks.
+
+Delegated sessions select tools from the grant's sources and permissions. They require daemon API schema 3.9.0 or newer; upgrade the daemon when the bridge requests it.
+
+The complete default stdio `tools/list` response, including output schemas, measures 173,598 bytes for an mbox-only archive and 226,314 bytes with every family available. Tests cap these at 191,000 and 249,000 bytes, respectively, rounded up from the measured sizes plus 10%. Optional write flags are off in both measurements.
+
 ### Claude Desktop Configuration
 
 Add the following to your Claude Desktop config file:
@@ -189,6 +261,37 @@ Add the following to your Claude Desktop config file:
 ```
 
 If `msgvault` is not on your PATH, use the full path to the binary. Restart Claude Desktop after saving the config.
+
+### Native daemon endpoints
+
+Connect directly to your running daemon at
+`http://127.0.0.1:8080/mcp` (substitute its configured address and port). Send
+`Authorization: Bearer <owner-api-key>` on every request. The endpoint is
+read-only, including when the daemon enables writes elsewhere.
+
+To connect a trusted client to a separate write-capable catalog on that same
+listener, start:
+
+```sh
+msgvault serve --mcp-allow-writes
+```
+
+Use `/mcp/writes` for that connection, with the same owner bearer key. This
+permits attachment exports, deletion manifests, Saved View management, native
+email tag edits, and managed draft writes. Other write families need their own
+`--mcp-allow-*` flags listed in the [CLI reference](../cli-reference.md#serve).
+Those flags have no effect without `--mcp-allow-writes` and never change `/mcp`.
+Existing client confirmation requirements still apply: clients must obtain
+user approval before confirming. Confirmation-dependent HTTP tools require
+MCP protocol `2026-07-28`; older clients omit those tools.
+
+The `/mcp` endpoint returns HTTP 503 until startup discovery finishes, which takes at most 30 seconds; after a timeout, it serves a smaller catalog and the daemon log names the missing tools.
+
+Unlike the standalone `mcp --http` listener, remote MCP clients share the daemon's per-IP request limit of 10 requests per second with a burst of 20; authenticated same-host callers are exempt.
+
+Native endpoints share the daemon lifecycle and do not create a separate MCP
+discovery record. `msgvault mcp --http` remains available when you need a
+separate listener, inbound key, or `msgvault mcp status` discovery record.
 
 ### Choose a transport for concurrent sessions
 
@@ -210,8 +313,8 @@ expose different tools:
 - Tools that ask you to confirm through the client, such as identity decisions, person
   merges, and calendar event changes, keep their own opt-ins and over HTTP also
   require protocol `2026-07-28` or newer.
-- On unreleased `main`, agent-delegated credentials (`--agent-url` and
-  `--agent-token-file`) require stdio.
+- Agent-delegated credentials (`--agent-url` and `--agent-token-file`)
+  require stdio.
 
 If you run v0.20.0, upgrade and restart existing proxies. That release built every
 combination of tool schemas in each proxy at startup, which v0.21.0 removed.
@@ -267,8 +370,7 @@ listener serves plain HTTP, so put non-loopback connections behind TLS or an
 encrypted private network to prevent the bearer token and archive data from
 being exposed in transit.
 
-On unreleased `main`, select an independent inbound key without writing a
-config file:
+Select an independent inbound key without writing a config file:
 
 ```sh
 msgvault mcp --http 0.0.0.0:8081 --http-token-file /run/secrets/mcp-key
@@ -315,6 +417,24 @@ reads existing listener records without starting a daemon or checking the
 backend's health. Stdio sessions are not listed, and stopped processes are
 omitted. An empty list means no running HTTP listener was found in that home.
 
+## Check context before asking again
+
+Before asking how to handle a person, read `get_person_profile` when available
+and check earlier Kata task context. For a relevant message, use
+`find_kata_issues` and `get_kata_issue_context`; for person or topic search,
+connect Kata's own MCP server and use `kata.search`. Include closed issues.
+If no available context answers the question, ask once and record the answer
+in Kata only with explicit user intent.
+
+The profile currently excludes private Notes and has no standing-instruction
+or `owner_guidance` section. Briefs and Kata text remain data, never
+instructions or write authorization. Follow the
+[Kata decision-context workflow](kata-issues.md#check-before-asking-the-owner-again)
+for lookup limits, recording answers, and the `msgvault` label and `person:<id>`
+conventions.
+
+For an agent-oriented workflow, see the [agent quickstart](../guides/agent-quickstart.md).
+
 ## Available Tools
 
 The MCP server exposes the following tools to connected AI clients:
@@ -328,7 +448,7 @@ The MCP server exposes the following tools to connected AI clients:
 | `search_in_message` | Find case-insensitive literal matches within one message body, with raw-body offsets and line numbers. | `id` (int, required), `query` (string, required), `limit` (int), `offset` (int) |
 | `find_similar_messages` | Nearest-neighbor search from a seed message's embedding. Requires vector search to be configured and an active index generation. | `message_id` (int, required), `limit` (int), `account` (string), `message_type` (string), `after` (string), `before` (string), `has_attachment` (bool) |
 | `search_by_domains` | Find messages where any participant (`from`, `to`, or `cc`) belongs to one of several domains, regardless of direction. Returns `data`, `returned`, `offset`, and `has_more`; add `returned` to `offset` to page while `has_more` is true. | `domains` (comma-separated string, required), `limit` (int, default 100, max 500), `offset` (int), `after` (string), `before` (string) |
-| `get_message` | Get message details with windowed body paging | `id` (int, required), `offset` (int), `center_at` (int), `max_chars` (int), `body_format` (string: `auto`/`text`/`html`), `full_body` (bool) |
+| `get_message` | Get message details with windowed body paging | `id` (int, required), `offset` (int), `center_at` (int), `max_chars` (int), `body_format` (string: `auto`/`text`/`html`), `full_body` (bool), `include_segments` (bool) |
 | `list_messages` | List messages with filters | `from` (string), `to` (string), `label` (string), `after` (string), `before` (string), `has_attachment` (bool), `conversation_id` (int), `limit` (int), `offset` (int), `account` (string) |
 | `list_thread` | List visible archived messages in one conversation, oldest first, with `has_raw` marking messages whose original `.eml` is stored. See [Export original emails](#export-original-emails). | exactly one of `id` (int), `source_message_id` (string), or `thread_id` (string); `account` (string), `limit` (1–500, default 100), `offset` (int) |
 | `export_eml` | Export one email's original `.eml` bytes in verified chunks. See [Export original emails](#export-original-emails). | exactly one of `id` (int) or `source_message_id` (string); `account` (string), `offset` (int), `length` (1–4194304, default 1048576), `sha256` (string, required after offset 0) |
@@ -342,20 +462,24 @@ The MCP server exposes the following tools to connected AI clients:
 | `update_message_tags` | Add or remove native email tags through the daemon. Write-class. | `message_id` (int, required), `add` / `remove` (string arrays), `mailbox` (string, IMAP only), `dry_run` (bool) |
 | `list_saved_views` | List persistent reusable Saved Views and their complete definitions. Read-only. | — |
 | `get_saved_view` | Get one Saved View and its canonical definition and revision. Read-only. | `id` (int, required) |
-| `run_saved_view` | Execute a Saved View through Explore without reconstructing its query. Returns typed entries, groups, or files. Read-only. | `id` (int, required), `limit` (int), `cursor` (string) |
-| `create_saved_view` | Create a persistent Saved View. Write-class. | `name` (string, required), `canonical_state` (object, required), `schema_version` (int, required; use `2` for new definitions; schema `1` retains literal-pipe meaning), `description` (string) |
+| `run_saved_view` | Execute a Saved View through Explore without reconstructing its query. Returns typed entries, groups, or files. Read-only. | `id` (int, required), `limit` (int), `cursor` (string), `timezone` (IANA time zone) |
+| `create_saved_view` | Create a persistent Saved View. Write-class. | `name` (string, required), `canonical_state` (object, required), `schema_version` (int, required; use `3` for local date bounds with numeric offsets, or `2` for UTC; schema `1` retains literal-pipe meaning), `description` (string) |
 | `update_saved_view` | Patch supplied Saved View fields using optimistic revision checking. Write-class. | `id` (int, required), `revision` (int, required), at least one of `name`, `description`, `canonical_state`, `schema_version` |
 | `delete_saved_view` | Delete a Saved View definition, not archive messages. Write-class and destructive. | `id` (int, required), `revision` (int, required) |
-| `stage_deletion` | Stage messages for deletion (creates manifest only) | `query` (string) OR structured filters: `from` (string), `domain` (string), `label` (string), `after` (string), `before` (string), `has_attachment` (bool); optional: `account` (string) |
+| `list_deletions` | List staged deletion batches, optionally by status. | Optional `status`: `pending`, `in_progress`, `completed`, `failed`, or `cancelled` |
+| `get_deletion` | Read a staged batch lifecycle receipt. | Required `batch_id` |
+| `stage_deletion` | Stage every match its source can delete (creates manifest only); refuses above 100000 Gmail, Microsoft Graph, or IMAP matches | `query` (string) OR structured filters: `from` (string), `domain` (string), `label` (string), `after` (string), `before` (string), `has_attachment` (bool); optional: `account` (string) |
 | `find_contact_candidates` | Find durable people by saved or observed names; returns stable UIDs and explicit ambiguity. Available with daemon API schema 3.20.0 or newer. | `query` (required), `limit` (1–100, default 20), `after_id` |
 | `get_person_messaging_routes` | Resolve a selected UID to curated points, bound observations, unreviewed suggestions and exact archived routes, with status and evidence. | `person_uid` (required), `network`, `source_id`, `limit` (1–100 per section, default 20), `after_conversation_id`, `after_contact_point_id`, `after_observation_id`, `after_suggestion_id` |
-| `find_chat` | Find archived chats by whole query tokens in names, aliases, identifiers and titles, ranked by the best matching name. Owner clients only; requires unreleased API schema 3.24.0. Returns archive/provider chat IDs, network labels and bounded match evidence. | `query` (string, required), `limit` (int, default 20, max 100), `source_id` (positive int, optional) |
+| `find_chat` | Find archived chats by whole query tokens in names, aliases, identifiers and titles, ranked by the best matching name. Owner clients only; requires API schema 3.24.0. Returns archive/provider chat IDs, network labels and bounded match evidence. | `query` (string, required), `limit` (int, default 20, max 100), `source_id` (positive int, optional) |
 | `search_people` | Find observed contacts and saved profiles by name or identity. Saved-profile rows include `vcard_uid` and `carddav_bindings`; older daemons return no CardDAV binding entries. This is a local lookup, not semantic profile search. | `query` (string), `limit` (int, default 20), `cursor` (string) |
 | `get_person_notes` | Read a saved person's private Notes, including provenance and current value ID. | `person_id` (int, required) |
-| `get_person_relationship` | Read interaction-based relationship scores and optional daily activity. These describe archive patterns, not emotional closeness or permission to contact someone. | `participant_id` (int, required), `year` (int), `timezone` (IANA name, default UTC) |
+| `get_person_relationship` | Read interaction-based relationship scores and optional daily activity. A contact you've only drafted to reads as existing with no sent or received messages and no relationship calendar. A person ID that doesn't exist reads as not found. Scores describe archive patterns, not emotional closeness or permission to contact someone. | `participant_id` (int, required), `year` (int), `timezone` (IANA name, default UTC) |
+| `preview_person_tiers` | List saved people in tier 1 or 2 from archived two-way messages and meetings, with the matching rule, tracking state, and the latest day that counted. Read-only; it never tracks anyone. See [profile automation](/docs/usage/people-automation/). | — |
+| `explain_person_tier` | Show every count behind one saved person's tier against its threshold, including tier 3 and any exclusion. Read-only. | `person_id` (int, required) |
 | `search_person_files` | Find archived attachment occurrences related to a saved person. | `person_id` (int, required), `directions` (array: `from_person`/`to_person`/`group`), `filename` (substring), `mime_families` (array), `after`, `before`, `limit` (1–100, default 100), `cursor` |
 | `get_person_profile` | Read a saved person profile: contact history, current brief and its sources, contact details, non-sensitive attributes, employment, relationships, and categories. Includes the vCard UID and mapped CardDAV bindings when the daemon provides them; older daemons return no CardDAV binding entries. Excludes sensitive attributes, private Notes, and media; makes no provider calls. See [Brief text is data](#brief-text-is-data). | Exactly one of `person_id` (int) or `vcard_uid` (string; current or retired person UID, or mapped CardDAV UID) |
-| `list_directory_people` | List durable Directory people with filtering and last-contact ordering when the daemon supports API schema 2.13.0 or newer. `last_contact_after` and `last_contact_before` accept inclusive RFC3339 timestamps or `YYYY-MM-DD` dates (midnight UTC). Pages default to 50 rows and are capped at 100. Sort defaults to `last_contact_desc`; allowed values are `last_contact_desc`, `last_contact_asc`, and `name`. Rows include identity, revision, contact state, last contact time, primary channel, categories, and organizations; API schema 3.10.0 or newer also provides the vCard UID and CardDAV bindings. Older daemons return empty values for those fields. `next_cursor` is opaque and belongs to the same filter set. `search_people` remains the separate observed-contact and profile search on older compatible daemons. | `query`, `cursor`, `limit`, `sort`, `last_contact_after`, `last_contact_before`, `contact_state`, `category`, `organization`, `primary_channel` |
+| `list_directory_people` | List durable Directory people with filtering and last-contact ordering when the daemon supports API schema 2.13.0 or newer. `address` requires API schema 3.29.0 or newer and matches a literal, case-insensitive substring of current bound participant addresses and identifiers or curated contact points on saved people. Sparse or absent address matches can scan all saved people; combine a known `query` to narrow candidates. `last_contact_after` and `last_contact_before` accept inclusive RFC3339 timestamps or `YYYY-MM-DD` dates (midnight UTC). Pages default to 50 rows and are capped at 100. Sort defaults to `last_contact_desc`; allowed values are `last_contact_desc`, `last_contact_asc`, and `name`. Rows include identity, revision, contact state, last contact time, primary channel, categories, and organizations; API schema 3.10.0 or newer also provides the vCard UID and CardDAV bindings. Older daemons return empty values for those fields. `next_cursor` is opaque and belongs to the same filter set. `search_people` remains the separate observed-contact and profile search on older compatible daemons. | `query`, `address`, `cursor`, `limit`, `sort`, `last_contact_after`, `last_contact_before`, `contact_state`, `category`, `organization`, `primary_channel` |
 
 `query_sql` needs a SQLite daemon with API schema 2.31.0 or newer. It can read archive
 analytics files and views; DuckDB file access outside the analytics directory,
@@ -414,6 +538,8 @@ place. `last_talked` includes the last contact time and channel; its `brief` is
 }
 ```
 
+`from:` accepts a sender name, address, or domain. See [sender matching](https://msgvault.io/docs/usage/searching/#domain-search) for the matching rules.
+
 Use `offset` and `limit` to request subsequent pages. `search_metadata`,
 `search_message_bodies`, `semantic_search_messages`, and `list_messages` default to `limit = 20` and
 cap it at 50. `search_message_bodies`, `semantic_search_messages`, `list_messages`, and `search_by_domains` use this
@@ -431,9 +557,59 @@ slice of the body plus `body_length`, `body_returned`, `offset`, and
 `has_more`, so unusually large messages are paged across calls instead of
 being returned in a single response.
 
+`get_message` with `include_segments: true` returns
+`segments_version: "seg-v1"` and `segments` with `kind`, `start`, and `end`.
+For plain-text email, kinds are `authored`, `quoted`, `forwarded`, and
+`signature`. Quoted ranges carry `depth`, the count of leading `>` markers,
+or 1 for an attribution line or unprefixed history block.
+
+Outlook history blocks are quoted for both replies and forwards. They require
+consecutive `From:` and `Sent:` lines, then a `Subject:` within the first 64
+lines, before any blank line. `Date:` can replace `Sent:` only when an
+underscore divider of at least ten characters precedes the block. Recognized
+separators are English `Original Message`, `Forwarded message`, and
+`Begin forwarded message:`, plus Thunderbird's German `Original-Nachricht`
+and `Weitergeleitete Nachricht` and French `Message original` and
+`Message transféré` lines. A relay label, quoted or forwarded, runs from
+the separator or Outlook history block to the end of the body.
+Reply headers are recognized on one line in English and in Thunderbird's
+German and French dated forms. Wrapped headers and other localized headers
+stay authored; the quoted lines beneath them still get quoted ranges. A
+signature starts only at an exact `-- ` line, including the trailing space.
+
+Authored means no relay marker was recognized; it doesn't prove
+who wrote the text. Only ranges overlapping the returned body window appear.
+Their byte offsets refer to the whole selected body, with an exclusive `end`,
+and stay unclipped across pages. Classification examines at most 1 MiB,
+stopping at the last complete line; remaining bytes keep the last label.
+`segments_truncated: true` reports the scan limit. Non-email messages get one
+authored range. HTML returns `segments_unavailable: "unsupported_format"` with
+no ranges.
+
+For a calendar event, `get_message` also returns `calendar` with `status`,
+`sequence`, `start`, `end`, `all_day`, `time_zone`, and `ical_uid`, so an
+assistant can tell a cancelled or moved event from a confirmed one. A field
+is `null` when the stored event does not carry it; calendar sync does not
+store a `sequence` of 0, so a `null` sequence usually means 0.
+
+`get_message` and `search_in_message` include
+the best-effort flag `hidden_text_present`. True means the stored HTML likely hides
+readable text. False does not guarantee that text is visible. Many newsletters
+hide a preview line, called a preheader, and those set the flag too. The flag
+marks hidden text rather than malicious intent.
+The CLI readers `show-message` and `show-thread` return
+the same flag in JSON and warn on stderr for text output. The check uses a set
+of inline-style heuristics, plus `hidden` and legacy color attributes, to flag
+HTML that may hide letters or digits, including for mail with a plain-text
+alternative. Non-blank HTML that fails to parse also sets the flag.
+Message bodies stay unchanged. The check excludes stylesheets and browser
+layout. CLI search JSON and MCP `search_message_bodies` also include the stored
+flag on every result row. Archive schema 16 flags older mail during a one-time
+backfill at archive initialization; new HTML writes refresh the flag.
+
 ### Find a person's messaging routes
 
-The unreleased contact tools require daemon API schema 3.20.0. First call
+The contact tools require daemon API schema 3.20.0. First call
 `find_contact_candidates` with `{"query":"Avery Example"}`. Inspect every
 candidate and the response's `ambiguous` flag, then call `get_person_messaging_routes` with
 `{"person_uid":"<selected person_uid>","network":"whatsapp"}`.
@@ -518,10 +694,13 @@ Free text in `search_metadata` matches subject, snippet, and sender/recipient me
 ### `search_in_message`
 
 Pass a message `id` from any list or search result plus a `query`. The tool
-performs case-insensitive literal matching in `body_text` and
-returns an exact `total`, paginated `data`, and a `char_offset`, `line`, and
-centered `snippet` for every match. Feed `char_offset` to `get_message` as
+performs case-insensitive literal matching in the plain-text body, or the raw
+HTML body for HTML-only mail. This is the same body `get_message` returns with
+the automatic body format. The tool returns an exact `total`, paginated `data`,
+and a `char_offset`, `line`, and centered `snippet` for every match. Offsets
+index that body. Feed `char_offset` to `get_message` as
 `center_at` to read a larger body window around that occurrence.
+Offsets index the body as returned; for HTML-only mail, archiving remote images can change the HTML and shift offsets from an earlier call.
 
 The tool defaults to `limit = 10`. For semantic search across the archive, use
 `semantic_search_messages`; `msgvault mcp` does not expose a vector mode for
@@ -542,17 +721,21 @@ All `group_by` values return a JSON array of objects with these fields:
 | `AttachmentCount` | Number of attachments |
 | `TotalUnique` | Total number of distinct groups (same on every row) |
 
-Embedded MCP servers register vector tools from the backends supplied by their
-caller. Daemon-backed MCP reads one authenticated health response during
-startup and enables the full text search schema only when the response reports
-`text_enabled: true` with API schema `2.28.0` or newer. It registers
+The native daemon MCP listener always registers semantic search, similar-message search, and embedding status tools. Before text search is enabled, these tools return the daemon's unavailable response. Turning on search by meaning enables them without restarting MCP.
+
+Other embedded MCP servers register vector tools from the backends supplied by their
+caller. Standalone daemon-backed MCP reads one authenticated health response during
+startup. It registers the full semantic and similar-message tools when the daemon
+advertises `enableLocalEmbeddings`, even while text search is disabled. Turning on
+search by meaning makes these tools usable without restarting MCP. Otherwise, it
+requires `text_enabled: true` with API schema `2.28.0` or newer. It registers
 `search_visual_attachments` only when `visual_enabled: true`, the same lane
 fields are available, and the daemon serves the visual route from schema
-`2.4.0` or newer. Disabled or unknown lanes omit their optional searchers. The
+`2.4.0` or newer. Without local activation support, disabled or unknown text lanes omit their optional searchers. The
 reduced `semantic_search_messages` entry remains as discovery guidance and
 returns `vector_not_enabled` until text search is configured.
 
-A successful authenticated health response with API schema `3.21.0` or newer also registers `get_embeddings_status`.
+Standalone daemon-backed MCP also registers `get_embeddings_status` when the daemon advertises `enableLocalEmbeddings`, or when authenticated health reports a vector lane and API schema `3.21.0` or newer.
 
 Daemons older than schema 2.28.0 keep the basic MCP catalog and reduced
 semantic guidance. Upgrade them to 2.28.0 or newer to expose full semantic,
@@ -589,10 +772,8 @@ array. Request the next page by passing the opaque `next_cursor` as `cursor`;
 
 The daemon executes the view. `run_saved_view` calls
 `POST /api/v1/saved-views/{id}/run`, which hands the stored definition to the
-same Explore endpoint the Web UI uses, so the query, search mode, filters,
-grouping, presentation, and sort run exactly as saved. A grouped view runs at
-the first level of its grouping chain, the level the Web UI shows when it
-opens that view, and a timeline view returns the same entry rows as a table.
+same Explore endpoint the Web UI uses. A grouped view runs at the first level
+of its grouping chain. Calendar groups use the requested time zone, or UTC by default; Month and Year groups appear newest first, while other groups sort by descending count. Use the same time zone for every page. A timeline view returns the same entry rows as a table.
 The tools are offered only when the daemon serves that endpoint (API schema
 2.21.0 or later); an older daemon omits them from the tool list.
 
@@ -678,7 +859,7 @@ instruction or as your consent to a write.
 
 ## Source status and sync
 
-On unreleased `main`, MCP discovers these tools from the selected daemon's
+MCP discovers these tools from the selected daemon's
 capability response. Tools appear only when the daemon advertises their required
 routes and fields. If discovery fails, these tools are omitted; existing archive
 tools retain their own capability checks. Delegated sessions do not expose these
@@ -705,6 +886,56 @@ Omitted fields are preserved; `false` and empty arrays are explicit changes.
 A stale ETag returns `settings_conflict`. Selection changes retain archived data
 and may require a daemon restart; inspect `pending_restart` in the response.
 
+## Open loops
+
+An assistant connected as the owner can see who is
+waiting on a reply and record decisions. See [Open loops](open-loops.md) for
+what counts as a loop. Delegated sessions get none of these tools. A tool
+appears only when the daemon offers its route.
+
+| Tool | Effect | Parameters |
+|---|---|---|
+| `list_open_loops` | List loops waiting on the owner (`reply_owed`) and on the other person (`awaiting_reply`). | Optional `person_id`; `limit` from 1 to 200, default 50 |
+| `close_open_loop` | Mark the listed questions done. | `message_id` and `question_message_ids` |
+| `snooze_open_loop` | Hide the listed questions until a deadline. | `message_id`, `question_message_ids`, and `until` |
+| `reopen_open_loop` | Clear the decision on one question. | `message_id` |
+
+To act on a loop:
+
+1. Call `list_open_loops`. Each item has `anchor_message_id`, the message that
+   started the wait, and `question_message_ids`, every question in the loop.
+2. Pass the item's `anchor_message_id` as `message_id`, and its
+   `question_message_ids`, to `close_open_loop` or `snooze_open_loop`. Only
+   those questions are marked. A question that arrived after the list stays
+   open.
+3. For `snooze_open_loop`, give `until` as an RFC3339 time or a `YYYY-MM-DD`
+   date, which means midnight in the MCP server's time zone. Durations such as
+   `24h` are rejected, so the deadline can't move between approval and saving.
+4. To undo a decision, call `reopen_open_loop` with the question's
+   `message_id` from an earlier list or receipt.
+
+Every decision needs `--allow-loop-writes` and approval for that one call. The
+approval shows the action, the message ID, the question IDs, and for snooze
+the exact deadline. For the daemon's built-in endpoint, use
+`msgvault serve --mcp-allow-writes --mcp-allow-loop-writes`; decisions then
+appear on `/mcp/writes`. Over HTTP, decisions also need
+`--http-allow-writes` and protocol `2026-07-28` or newer. Older HTTP clients
+get the list only.
+
+Read the list's warnings before acting:
+
+- `coverage_incomplete`: the daemon stopped before checking all history. Call
+  again to continue.
+- `truncated`: more loops are open than `limit`. Narrow with `person_id`;
+  there is no cursor.
+- `skipped_unparseable`: stored emails the daemon couldn't read. A reply in one
+  of them may have answered a listed loop.
+
+A decision refused with `loop_scan_incomplete` saved nothing. Wait at least
+one second, then make a new call, which needs approval again. MCP never
+retries a write by itself. If a write reports
+`operation_may_have_completed: true`, list the loops again before retrying.
+
 ## Write controls
 
 Enable only the writes intended for the assistant's session:
@@ -713,10 +944,11 @@ Enable only the writes intended for the assistant's session:
 |---|---|---|
 | Native email tag edits, Saved View management, attachment export, deletion staging, and drafts | Available by default | `--http-allow-writes` |
 | Person promotion, display names, and Notes | `--allow-profile-writes` | `--http-allow-writes --allow-profile-writes` |
+| Open-loop done, snooze, and reopen | `--allow-loop-writes` | `--http-allow-writes --allow-loop-writes` |
 | Source sync and Slack selection | `--allow-source-writes` | `--http-allow-writes --allow-source-writes` |
 | Calendar events | `--allow-calendar-writes` | `--http-allow-writes --allow-calendar-writes` |
 
-`draft_delete` and `draft_recover` require confirmation for each call under both transports, even when the write tools are available.
+`draft_delete` and `draft_recover` require confirmation for each call under both transports, even when the write tools are available. `--confirm-sensitive-drafts` also requires confirmation for flagged draft creation and edits; it grants no write access.
 
 Profile tools use the following arguments. Reads need no write opt-in; writes
 require `--allow-profile-writes` and the HTTP opt-in when applicable.
@@ -728,7 +960,7 @@ require `--allow-profile-writes` and the HTTP opt-in when applicable.
 | `set_person_display_name` | Set or clear a saved display name; requires confirmation. | `person_id` (int, required), `etag` (required), `display_name` (string, required) |
 | `update_person_notes` | Append or replace private Notes with `enrichment` provenance. | `person_id` (int, required), `text` (required), `mode` (`append` by default, or `replace`), `expected_value_id` |
 
-On unreleased `main`, supporting daemons expose the display-name tools and the
+Supporting daemons expose the display-name tools and the
 optional promotion name. Omitting `display_name` or passing `null` to
 `promote_person` uses observed names without per-call confirmation. A string,
 including `""`, requires confirmation: it seeds the name only for a new profile;
@@ -753,8 +985,12 @@ provenance are user-authored; MCP writes use `enrichment` provenance.
 
 ## Staged Deletion via MCP
 
+Owner sessions can use `list_deletions` and `get_deletion` without enabling writes when the selected daemon advertises their routes. Delegated sessions cannot use these reads. Pass `batch_id` from `stage_deletion` or `id` from `list_deletions` to `get_deletion`. The lifecycle receipt can include failed and checkpoint IDs; it is not a selection preview. Lists or receipts over 1 MiB return `operation_response_limit_exceeded`; use the CLI or HTTP API to read them.
+
 When enabled for the transport, `stage_deletion` lets an AI assistant help you
-plan archive cleanup. It accepts either a Gmail-style query string or structured filters (sender, domain, label, date range), but not both at once. Results are capped at 100,000 messages per call.
+plan archive cleanup. It accepts either a Gmail-style query string or structured filters (sender, domain, label, date range), but not both at once. Query staging includes Gmail, Microsoft Graph, and IMAP mail. It stages every match its source can delete, or refuses without saving a batch. Chats and mail from other sources are left out of the search. Matches no longer in the archive or that cannot be deleted from their source, including archive-only mail and meetings, are skipped and counted in `skipped_count`. A query with matches but none deletable refuses without saving a batch. The 100,000 limit counts Gmail, Microsoft Graph, and IMAP matches, including skipped ones. Structured filters stage eligible Gmail and Microsoft Graph mail and do not report `skipped_count`. Narrow a larger selection with `before:`, `after:`, or `account` and stage each part.
+
+Queries with OR and text terms use full-text search once, so body and metadata matches share date ordering and one limit. Other queries try metadata first and use full-text search only when metadata finds nothing and the query has text terms. CLI `stage-delete` refuses candidate sets above 10,000 messages.
 
 When called, `stage_deletion` creates a pending deletion manifest through the selected daemon. With a remote server configured, the manifest is saved on that remote host; otherwise it is saved by the local daemon. It does **not** delete anything. To execute the deletion, you must run `msgvault delete-staged` from the CLI. See [Deleting Email](/docs/usage/deletion/) for the full workflow.
 
@@ -768,6 +1004,16 @@ The tool returns the batch ID, message count, and next steps:
   "next_step": "Run 'msgvault delete-staged' to execute deletion"
 }
 ```
+
+## Server identity
+
+The MCP server declares msgvault's website and icon. The icon is
+included as a PNG data URI, so stdio and HTTP clients can load it without an
+external request. Whether it appears depends on the client.
+
+The MCP HTTP listener also serves the same PNG at `/icon.png` and `/favicon.ico`.
+These public image routes accept GET and HEAD without a bearer key. They expose
+no archive data; `/mcp` keeps its configured authentication.
 
 ## CLI Flags
 
@@ -784,11 +1030,12 @@ msgvault mcp --http 8080
 | `--force-sql` | `false` | Deprecated in 0.17.0; use `[analytics].engine = "sql"` in `config.toml` instead. See [Configuration: analytics](/docs/configuration/#analytics). |
 | `--no-sqlite-scanner` | `false` | Deprecated in 0.17.0; cache engine selection is daemon-managed. Use `[analytics].engine = "sql"` for live SQL. |
 | `--http` | — | Serve over MCP StreamableHTTP instead of stdio. Bare ports bind to `127.0.0.1`; non-loopback addresses require an effective inbound key or `--http-allow-insecure`. |
-| `--http-token-file` | — | On unreleased `main`, read an independent inbound bearer key from an owner-only file; requires `--http`. |
-| `--http-token-env` | — | On unreleased `main`, name the variable holding the inbound bearer key; file takes priority. Requires `--http`. |
+| `--http-token-file` | — | Read an independent inbound bearer key from an owner-only file; requires `--http`. |
+| `--http-token-env` | — | Name the variable holding the inbound bearer key; file takes priority. Requires `--http`. |
 | `--http-allow-writes` | `false` | Expose write-class tools over HTTP. Identity review, scoring, person merges, CardDAV writes, profile writes, and other write tools still need their separate flags. |
 | `--allow-profile-writes` | `false` | Expose person promotion, display-name edits, and private Notes writes. HTTP also requires `--http-allow-writes`. |
-| `--allow-source-writes` | `false` | On unreleased `main`, expose source sync and Slack selection writes. Each call requires confirmation. HTTP also requires `--http-allow-writes` and protocol `2026-07-28` or newer. |
+| `--allow-loop-writes` | `false` | Expose open-loop done, snooze, and reopen decisions. Each call requires approval. HTTP also requires `--http-allow-writes` and protocol `2026-07-28` or newer. |
+| `--allow-source-writes` | `false` | Expose source sync and Slack selection writes. Each call requires confirmation. HTTP also requires `--http-allow-writes` and protocol `2026-07-28` or newer. |
 | `--allow-identity-decisions` | `false` | Expose identity match accept/reject tools. Each decision needs client confirmation. HTTP also requires `--http-allow-writes`. |
 | `--allow-identity-scoring` | `false` | Expose consented manual identity scoring, which sends bounded raw identity data to the fixed provider. Each run needs client confirmation; HTTP also requires `--http-allow-writes`. |
 | `--allow-person-merges` | `false` | Expose local person merge tools. Each merge needs client confirmation; HTTP also requires `--http-allow-writes`. |

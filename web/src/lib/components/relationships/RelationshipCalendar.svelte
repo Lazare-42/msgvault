@@ -9,8 +9,10 @@
   } from '../../relationships/models';
   import { dayTooltipText } from '../../relationships/calendar-tooltip';
 
+  type CalendarData = Pick<RelationshipCalendarModel, 'year' | 'days'> & Partial<RelationshipCalendarModel>;
+
   interface Props {
-    calendar: RelationshipCalendarModel | null;
+    calendar: CalendarData | null;
     loading: boolean;
     error: string | null;
     year?: number;
@@ -19,6 +21,12 @@
     onYearChange: (year: number) => void;
     selectedDate?: string | null;
     onDateChange: (date: string | null) => void;
+    /** When the relationship began, as "Jan 2022", shown beside the title. */
+    since?: string;
+    /** The card's heading. */
+    title?: string;
+    /** Shows the current and peak relationship scores, which only people have. */
+    showTemperature?: boolean;
   }
 
   interface CalendarCell {
@@ -42,7 +50,10 @@
     currentYear,
     onYearChange,
     selectedDate = null,
-    onDateChange
+    onDateChange,
+    since = undefined,
+    title = 'Relationship',
+    showTemperature = true
   }: Props = $props();
 
   const selectedYear = $derived(calendar?.year ?? year);
@@ -67,7 +78,7 @@
   const levels = ['none', 'first-quartile', 'second-quartile', 'third-quartile', 'fourth-quartile'];
 
   function buildCalendarPanel(
-    response: RelationshipCalendarModel,
+    response: CalendarData,
     startMonth: number,
     endMonth: number,
     key: string
@@ -240,7 +251,7 @@
 <Card padding="sm">
 <section class="relationship-calendar" aria-label="Relationship activity calendar" bind:this={root}>
   <div class="calendar-heading">
-    <h2>Relationship</h2>
+    <h2>{title}{#if since}{' '}<span class="since">since {since}</span>{/if}</h2>
     <div class="year-navigation">
       {#if multiYear}
         <IconButton
@@ -296,10 +307,12 @@
         {#each levels as level}<span class="heat-cell level-{level}" aria-hidden="true"></span>{/each}
         <span>More</span>
       </div>
-      <div class="temperature-summary">
-        <span>Current {calendar.current.temperature}/100</span>
-        <span>Peak {calendar.peak_temperature}/100 - {calendar.peak_year}</span>
-      </div>
+      {#if showTemperature && calendar.current}
+        <div class="temperature-summary">
+          <span>Current {calendar.current.temperature}/100</span>
+          <span>Peak {calendar.peak_temperature}/100 - {calendar.peak_year}</span>
+        </div>
+      {/if}
     </div>
   {:else}
     <p class="calendar-state">Relationship activity has not loaded.</p>
@@ -327,8 +340,14 @@
 
   h2 {
     margin: 0;
-    font-size: var(--text-sm);
-    font-weight: 650;
+    font-size: var(--font-size-sm);
+    font-weight: var(--font-weight-semibold);
+  }
+
+  .since {
+    margin-left: var(--space-3);
+    color: var(--text-muted);
+    font-weight: var(--font-weight-normal);
   }
 
   .year-navigation {
@@ -350,9 +369,11 @@
     font-variant-numeric: tabular-nums;
   }
 
+  /* The padding keeps day outlines inside the scroll box, which clips them. */
   .calendar-graphs {
-    max-width: 100%;
-    margin-top: var(--space-3);
+    max-width: calc(100% + 6px);
+    margin: calc(var(--section-gap) - 3px) -3px -3px;
+    padding: 3px;
     overflow-x: auto;
     overflow-y: hidden;
   }
@@ -369,7 +390,7 @@
     gap: var(--relationship-cell-gap);
     margin-left: var(--relationship-label-gutter);
     color: var(--text-muted);
-    font-size: var(--text-xs);
+    font-size: var(--font-size-xs);
   }
 
   .month-row span {
@@ -389,7 +410,7 @@
     grid-template-rows: repeat(7, var(--relationship-cell-size));
     gap: var(--relationship-cell-gap);
     color: var(--text-muted);
-    font-size: 9px;
+    font-size: var(--font-size-2xs);
     line-height: var(--relationship-cell-size);
   }
 
@@ -436,8 +457,8 @@
     align-items: center;
     justify-content: space-between;
     gap: var(--space-2);
-    margin-top: var(--space-3);
-    font-size: var(--text-sm);
+    margin-top: var(--section-gap);
+    font-size: var(--font-size-sm);
   }
 
   .level-none { background: var(--bg-inset); }
@@ -454,7 +475,7 @@
   .calendar-meta {
     display: grid;
     gap: var(--space-2);
-    margin-top: var(--space-3);
+    margin-top: var(--section-gap);
   }
 
   .legend {
@@ -462,7 +483,7 @@
     align-items: center;
     gap: 4px;
     color: var(--text-muted);
-    font-size: var(--text-xs);
+    font-size: var(--font-size-xs);
   }
 
   .legend .heat-cell {
@@ -471,7 +492,7 @@
 
   .temperature-summary {
     flex-wrap: wrap;
-    font-size: var(--text-xs);
+    font-size: var(--font-size-xs);
     font-variant-numeric: tabular-nums;
   }
 
@@ -493,7 +514,7 @@
   .empty-year {
     margin: var(--space-3) 0 0;
     color: var(--text-muted);
-    font-size: var(--text-sm);
+    font-size: var(--font-size-sm);
   }
 
   .calendar-state {

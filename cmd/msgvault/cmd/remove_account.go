@@ -6,15 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/beeper"
 	"go.kenn.io/msgvault/internal/circleback"
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/discord"
 	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/inline"
 	matrixsource "go.kenn.io/msgvault/internal/matrix"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
@@ -30,7 +34,7 @@ const (
 )
 
 // removeAccountAfterCascadeHook pauses tests after the database mutation and
-// before the lock-held cache rebuild.
+// before the cache rebuild.
 var removeAccountAfterCascadeHook func()
 
 // removeAccountBeforeDiscordLifecycleLockHook lets tests observe that store
@@ -166,7 +170,7 @@ func runRemoveAccountLocalWithMatrixLock(cmd *cobra.Command, args []string, matr
 		return usageErr(cmd, err)
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForInvocation(state)
+	s, cleanup, err := openWritableStoreAndInitForInvocation(cmd.Context(), state)
 	if err != nil {
 		return err
 	}
@@ -326,11 +330,11 @@ func runRemoveAccountLocalWithMatrixLock(cmd *cobra.Command, args []string, matr
 		}
 		fmt.Println("\nRebuilding analytics cache...")
 		_, refreshErr := buildCacheLocked(
+			cmd.Context(),
 			cfg.DatabaseDSN(),
 			cfg.AnalyticsDir(),
 			true,
 			false,
-			publishLockHeld,
 			analyticsBuilderOverrides(cfg.Analytics),
 		)
 		return errors.Join(
@@ -415,10 +419,8 @@ func runRemoveAccountLocalWithMatrixLock(cmd *cobra.Command, args []string, matr
 			)
 		}
 	case sourceTypeMSMail:
-		if err := newGraphMailManager(state).DeleteToken(source.Identifier); err != nil {
-			fmt.Fprintf(os.Stderr,
-				"Warning: could not remove Microsoft Graph mail token: %v\n", err,
-			)
+		if err := removeMicrosoftMailTokens(s, cfg, logger, source, source.Identifier, true); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove Microsoft Graph mail token: %v\n", err)
 		}
 	case sourceTypeDiscord:
 		// Discord credential cleanup is part of the lifecycle-locked cascade
@@ -462,23 +464,18 @@ func runRemoveAccountLocalWithMatrixLock(cmd *cobra.Command, args []string, matr
 				"Warning: could not remove Circleback token: %v\n", err,
 			)
 		}
+	case sourceTypeInline:
+		if err := inline.NewOAuthManager("", cfg.TokensDir(), logger).DeleteToken(source.Identifier); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove Inline OAuth credentials: %v\n", err)
+		}
 	case sourceTypeIMAP:
 		if source.SyncConfig.Valid && source.SyncConfig.String != "" {
 			imapCfg, parseErr := imaplib.ConfigFromJSON(source.SyncConfig.String)
 			if parseErr == nil {
 				switch imapCfg.EffectiveAuthMethod() {
 				case imaplib.AuthXOAuth2:
-					msMgr := microsoft.NewManager(
-						cfg.Microsoft.ClientID,
-						cfg.Microsoft.EffectiveTenantID(),
-						cfg.Microsoft.EffectiveRedirectURI(),
-						cfg.TokensDir(),
-						logger,
-					)
-					if err := msMgr.DeleteToken(imapCfg.Username); err != nil {
-						fmt.Fprintf(os.Stderr,
-							"Warning: could not remove Microsoft token: %v\n", err,
-						)
+					if err := removeMicrosoftMailTokens(s, cfg, logger, source, imapCfg.Username, false); err != nil {
+						fmt.Fprintf(os.Stderr, "Warning: could not remove Microsoft token: %v\n", err)
 					}
 				default:
 					credPath := imaplib.CredentialsPath(
@@ -633,7 +630,7 @@ func deleteOrphanedAttachmentFiles(
 
 	lockErr := s.WithExclusiveLock(ctx, func() error {
 		// Catch a sync started after source deletion released its lock.
-		running, err := s.HasAnyActiveSync()
+		running, err := s.HasAnyActiveSync(ctx)
 		if err != nil {
 			fmt.Fprintf(os.Stderr,
 				"Warning: could not check for active syncs: %v; "+
@@ -718,4 +715,121 @@ func removeAccountSelector(cmd *cobra.Command, args []string) (sourceops.Selecto
 
 func init() {
 	rootCmd.AddCommand(newRemoveAccountCmd())
+}
+
+func removeMicrosoftMailTokens(s *store.Store, cfg *config.Config, logger *slog.Logger, source *store.Source, email string, graph bool) error {
+	dirs := []string{cfg.TokensDir()}
+	root := filepath.Join(cfg.TokensDir(), "microsoft-apps")
+	entries, err := os.ReadDir(root)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("list Microsoft token directories: %w", err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, filepath.Join(root, entry.Name()))
+		}
+	}
+	var current *microsoft.Manager
+	if !graph {
+		current, _ = newMicrosoftIMAPManager(cfg, logger, source)
+	}
+	for _, dir := range dirs {
+		path := microsoftTokenPath(dir, email, graph)
+		if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		used, err := microsoftMailTokenInUse(s, cfg, email, path, graph)
+		if err != nil {
+			return err
+		}
+		if used {
+			continue
+		}
+		if current != nil && filepath.Clean(current.TokenPath(email)) == filepath.Clean(path) {
+			err = current.DeleteToken(email)
+		} else {
+			err = os.Remove(path)
+		}
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+func microsoftMailTokenInUse(s *store.Store, cfg *config.Config, email, tokenPath string, graph bool) (bool, error) {
+	typ := sourceTypeIMAP
+	if graph {
+		typ = sourceTypeMSMail
+	}
+	sources, err := s.ListSources(typ)
+	if err != nil {
+		return false, fmt.Errorf("check remaining Microsoft sources: %w", err)
+	}
+	for _, source := range sources {
+		if source.MergedIntoSourceID != 0 {
+			continue
+		}
+		used, err := microsoftSourceUsesToken(cfg, source, email, tokenPath, graph)
+		if err != nil || used {
+			return used, err
+		}
+	}
+	return false, nil
+}
+
+func microsoftSourceUsesToken(cfg *config.Config, source *store.Source, email, tokenPath string, graph bool) (bool, error) {
+	username := source.Identifier
+	if !graph {
+		imapCfg, err := imaplib.ConfigFromJSON(source.SyncConfig.String)
+		if !source.SyncConfig.Valid || err != nil {
+			parsed, parseErr := imaplib.ParseIdentifier(source.Identifier)
+			if parseErr == nil && !strings.EqualFold(parsed.Username, email) {
+				return false, nil
+			}
+			return false, fmt.Errorf("cannot read IMAP authentication configuration for %s", source.Identifier)
+		}
+		if imapCfg.EffectiveAuthMethod() != imaplib.AuthXOAuth2 {
+			return false, nil
+		}
+		username = imapCfg.Username
+	}
+	if !strings.EqualFold(filepath.Base(tokenPath), filepath.Base(microsoftTokenPath(filepath.Dir(tokenPath), username, graph))) {
+		return false, nil
+	}
+	_, dir, err := microsoftMailApp(cfg, sourceOAuthApp(source))
+	if err != nil {
+		return false, err
+	}
+	return sameMicrosoftTokenFile(tokenPath, microsoftTokenPath(dir, username, graph))
+}
+
+func microsoftTokenPath(dir, email string, graph bool) string {
+	if graph {
+		return microsoft.NewGraphMailManager("", "", "", dir, nil).TokenPath(email)
+	}
+	return microsoft.NewManager("", "", "", dir, nil).TokenPath(email)
+}
+
+func sameMicrosoftTokenFile(first, second string) (bool, error) {
+	if filepath.Clean(first) == filepath.Clean(second) {
+		return true, nil
+	}
+	firstInfo, err := os.Stat(first)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	secondInfo, err := os.Stat(second)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return os.SameFile(firstInfo, secondInfo), nil
 }

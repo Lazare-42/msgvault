@@ -92,7 +92,7 @@ func ServeExecutor(ctx context.Context, cfg ExecutorConfig) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("inspect OCR socket: %w", err)
 	}
-	ln, err := net.Listen("unix", cfg.Socket)
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "unix", cfg.Socket)
 	if err != nil {
 		return fmt.Errorf("listen OCR socket: %w", err)
 	}

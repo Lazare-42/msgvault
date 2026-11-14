@@ -1,3 +1,6 @@
+import { addressFixture } from '../../../src/lib/directory/merge-fixtures.test-support';
+import { person, merge } from '../../../src/lib/directory/person-fixtures.test-support';
+import { stubOperationStatus } from '../../kit-ui';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -61,25 +64,6 @@ type MixedArchiveFixture = {
   firstPage: ExploreHTTPResponse;
 };
 
-export type CapturedTrackingRequest = {
-  method: 'GET' | 'PUT';
-  path: string;
-  includeSensitive?: boolean;
-  tracked?: boolean;
-};
-
-export type CapturedRelationshipReviewRequest = {
-  method: string;
-  path: string;
-  status: string | null;
-};
-
-type InstalledMixedArchive = MixedArchiveFixture & {
-  trackingRequests: CapturedTrackingRequest[];
-  failNextTrackingMutation: () => void;
-  failNextTrackingRead: () => void;
-};
-
 let fixturePromise: Promise<MixedArchiveFixture> | undefined;
 
 export function loadMixedArchive(): Promise<MixedArchiveFixture> {
@@ -110,13 +94,10 @@ export function loadMixedArchive(): Promise<MixedArchiveFixture> {
   return fixturePromise;
 }
 
-export async function installMixedArchive(page: Page): Promise<InstalledMixedArchive> {
+export async function installMixedArchive(page: Page): Promise<MixedArchiveFixture> {
   const fixture = await loadMixedArchive();
-  const trackingRequests: CapturedTrackingRequest[] = [];
   let tracked = false;
   let trackedAt: string | null = null;
-  let trackingMutationFailure = false;
-  let trackingReadFailure = false;
   await page.route('**/api/session', sessionRoute);
   await page.route('**/api/v1/settings', (route) =>
     route.fulfill({
@@ -288,17 +269,6 @@ export async function installMixedArchive(page: Page): Promise<InstalledMixedArc
   await page.route('**/api/v1/people/42/tracking', async (route) => {
     const request = route.request();
     if (request.method() === 'GET') {
-      trackingRequests.push({ method: 'GET', path: '/api/v1/people/42/tracking' });
-      if (trackingReadFailure) {
-        trackingReadFailure = false;
-        return route.fulfill({
-          status: 503,
-          json: {
-            error: 'tracking_unavailable',
-            message: 'forbidden-private-credential',
-          },
-        });
-      }
       return route.fulfill({ json: { person_id: 42, tracked, tracked_at: trackedAt } });
     }
     if (request.method() === 'PUT') {
@@ -306,71 +276,13 @@ export async function installMixedArchive(page: Page): Promise<InstalledMixedArc
       if (!body || typeof body.tracked !== 'boolean' || Object.keys(body).length !== 1) {
         return route.fulfill({ status: 400, json: { error: 'bad_request', message: 'Invalid synthetic body.' } });
       }
-      trackingRequests.push({ method: 'PUT', path: '/api/v1/people/42/tracking', tracked: body.tracked });
       tracked = body.tracked;
       trackedAt = tracked ? FIXTURE_TIME : null;
-      if (trackingMutationFailure) {
-        trackingMutationFailure = false;
-        return route.fulfill({
-          status: 503,
-          json: {
-            error: 'tracking_unavailable',
-            message: 'forbidden-private-credential',
-          },
-        });
-      }
       return route.fulfill({ json: { person_id: 42, tracked, tracked_at: trackedAt } });
     }
     return route.fulfill({
       status: 405,
       json: { error: 'method_not_allowed', message: 'Unsupported synthetic method.' },
-    });
-  });
-  await page.route('**/api/v1/person-fact-targets*', (route) => {
-    const url = new URL(route.request().url());
-    const includeSensitive = url.searchParams.get('include_sensitive') === 'true';
-    trackingRequests.push({
-      method: 'GET',
-      path: '/api/v1/person-fact-targets',
-      includeSensitive,
-    });
-    const common = {
-      kind: 'attribute',
-      revision: 'forbidden-target-revision',
-      value_type: 'text',
-      cardinality: 'single',
-      choices: null,
-      fields: null,
-      href: 'https://forbidden.example.test/profile',
-      credential: 'forbidden-private-credential',
-    };
-    return route.fulfill({
-      json: {
-        version: 'v1',
-        fingerprint: 'forbidden-catalog-fingerprint',
-        targets: [
-          {
-            ...common,
-            key: 'forbidden-target-key',
-            slug: 'timezone',
-            universal_id: 'forbidden-universal-id',
-            description: 'Time zone',
-            sensitive: false,
-          },
-          ...(includeSensitive
-            ? [
-                {
-                  ...common,
-                  key: 'forbidden-sensitive-target-key',
-                  slug: 'private-note',
-                  universal_id: 'forbidden-sensitive-universal-id',
-                  description: 'Private note',
-                  sensitive: true,
-                },
-              ]
-            : []),
-        ],
-      },
     });
   });
   await page.route('**/api/v1/people/42/profile', (route) =>
@@ -415,7 +327,7 @@ export async function installMixedArchive(page: Page): Promise<InstalledMixedArc
     route.fulfill({
       json: {
         person_id: 42,
-        cadence_status: 'current',
+        cadence_status: 'ok',
         computed_at: FIXTURE_TIME,
         interaction_count: 3,
         stale: false,
@@ -446,37 +358,38 @@ export async function installMixedArchive(page: Page): Promise<InstalledMixedArc
       },
     }),
   );
-  await page.route('**/api/v1/people/42/network*', (route) =>
-    route.fulfill({
-      json: {
-        root_person_id: 42,
-        depth: Number(new URL(route.request().url()).searchParams.get('depth') ?? 1),
-        truncated: false,
-        nodes: [
-          { id: 'person:42', kind: 'person', entity_id: 42, label: 'Archive Person', hop: 0 },
-          { id: 'person:43', kind: 'person', entity_id: 43, label: 'Curated Peer', hop: 1 },
-          { id: 'organization:21', kind: 'organization', entity_id: 21, label: 'Shared Organization', hop: 1 },
-        ],
-        edges: [
-          {
-            id: 'relationship:31',
-            kind: 'relationship',
-            source_node_id: 'person:42',
-            target_node_id: 'person:43',
-            relationship_type_slug: 'colleague',
-            label: 'works with',
-          },
-          {
-            id: 'employment:41',
-            kind: 'employment',
-            source_node_id: 'person:43',
-            target_node_id: 'organization:21',
-            label: 'Engineer',
-          },
-        ],
-      },
-    }),
-  );
+  await page.route('**/api/v1/people/42/network*', (route) => {
+    const depth = Number(new URL(route.request().url()).searchParams.get('depth') ?? 1);
+    const nodes = [
+      { id: 'person:42', kind: 'person', entity_id: 42, label: 'Archive Person', hop: 0 },
+      { id: 'person:43', kind: 'person', entity_id: 43, label: 'Curated Peer', hop: 1 },
+      { id: 'organization:21', kind: 'organization', entity_id: 21, label: 'Shared Organization', hop: 2 },
+    ].filter(node => node.hop <= depth);
+    const ids = new Set(nodes.map(node => node.id));
+    return route.fulfill({ json: {
+      root_person_id: 42, depth, truncated: false, nodes,
+      edges: [
+        {
+          id: 'relationship:31',
+          kind: 'relationship',
+          source_node_id: 'person:42',
+          target_node_id: 'person:43',
+          relationship_type_slug: 'colleague',
+          label: 'works with',
+        },
+        {
+          id: 'relationship:32', kind: 'relationship', source_node_id: 'person:42', target_node_id: 'person:43', relationship_type_slug: 'mentor', label: 'mentors',
+        },
+        {
+          id: 'employment:41',
+          kind: 'employment',
+          source_node_id: 'person:43',
+          target_node_id: 'organization:21',
+          label: 'Engineer',
+        },
+      ].filter(edge => ids.has(edge.source_node_id) && ids.has(edge.target_node_id)),
+    } });
+  });
   await page.route('**/api/v1/relationship-types', (route) => route.fulfill({ json: { relationship_types: [] } }));
   await page.route('**/api/v1/people/42/days*', (route) =>
     route.fulfill({
@@ -601,18 +514,10 @@ export async function installMixedArchive(page: Page): Promise<InstalledMixedArc
     }),
   );
   await page.route('**/api/v1/saved-views', (route) => route.fulfill({ json: { saved_views: [] } }));
+  await stubOperationStatus(page);
   await page.route('**/api/v1/sources/status', (route) => route.fulfill({ json: { sources: [] } }));
   await page.route('**/api/v1/deletions', (route) => route.fulfill({ json: { manifests: [] } }));
-  return {
-    ...fixture,
-    trackingRequests,
-    failNextTrackingMutation(): void {
-      trackingMutationFailure = true;
-    },
-    failNextTrackingRead(): void {
-      trackingReadFailure = true;
-    },
-  };
+  return fixture;
 }
 
 type IdentityMatchCandidate = IdentityMatchCandidate;
@@ -625,27 +530,6 @@ export type CapturedReviewRequest = {
   headers: Record<string, string>;
 };
 
-export const FACT_LEDGER_FORBIDDEN_MARKERS = [
-  'forbidden-target-key',
-  'forbidden-target-revision',
-  'forbidden-catalog-fingerprint',
-  'forbidden-evidence-key',
-  'forbidden-content-sha',
-  'forbidden-source-ref',
-  'forbidden-source-url',
-  'forbidden-source-version',
-  'forbidden-subject-ref',
-  'forbidden-claim-key',
-  'forbidden-program-id',
-  'forbidden-program-version',
-  'forbidden-program-fingerprint',
-  'forbidden-value-fingerprint',
-  'forbidden-decision-key',
-  'forbidden-competing-claim-key',
-  'forbidden-pin-actor',
-  'forbidden-private-error',
-  'forbidden-extension-field',
-] as const;
 
 const FACT_TARGET_REVISION = `sha256:${'d'.repeat(64)}`;
 
@@ -653,7 +537,7 @@ function reviewCandidate(id: number, overrides: Partial<IdentityMatchCandidate> 
   return {
     id,
     left_id: id * 10,
-    left_kind: 'beeper_user',
+    left_kind: 'participant',
     right_id: id * 10 + 1,
     right_kind: 'participant',
     basis: 'stable_provider_id',
@@ -696,31 +580,28 @@ function reviewCandidate(id: number, overrides: Partial<IdentityMatchCandidate> 
  */
 export async function installDirectoryReviewArchive(page: Page) {
   const archive = await installMixedArchive(page);
-  const candidates = [reviewCandidate(17), reviewCandidate(18), reviewCandidate(19)];
+  const candidates = [reviewCandidate(17), reviewCandidate(18), reviewCandidate(19, { left_id: 701, right_id: 901, actionable: false, blocker: 'person_merge_required' })];
   const people = new Map([
     [7, reviewPerson(7, 4, 'Synthetic One')],
     [9, reviewPerson(9, 2, 'Synthetic Two')],
   ]);
   let phase: 'premerge' | 'postmerge' | 'postsplit' = 'premerge';
   const requests: CapturedReviewRequest[] = [];
-  const decisionGates = new Map<number, { promise: Promise<void>; release: () => void }>();
-  const decisionFailures = new Map<number, string>();
-  const relationshipRequests: CapturedRelationshipReviewRequest[] = [];
-  let failNextRelationshipRead = false;
   let factCatalogMode: 'ready' | 'deferred' | 'failed' | 'malformed' = 'ready';
   let factCatalogGate: Promise<void> | null = null;
+
+  await page.route(/\/api\/v1\/participants\/(?:701|702|901)$/, (route) => {
+    const id = Number(new URL(route.request().url()).pathname.split('/').at(-1));
+    const profile = [...people.values()].find(person => person.participant_ids?.includes(id));
+    return route.fulfill({ json: { ...archivePerson, id, display_label: profile?.display_name, display_name: profile?.display_name, identifiers: [], profile } });
+  });
 
   await page.route(/\/api\/v1\/person-relationship-reviews(?:\?.*)?$/, (route) => {
     const request = route.request();
     const url = new URL(request.url());
     const status = url.searchParams.get('status');
-    relationshipRequests.push({ method: request.method(), path: url.pathname, status });
-    if (failNextRelationshipRead) {
-      failNextRelationshipRead = false;
-      return route.fulfill({ status: 503, json: { error: 'unavailable', message: 'forbidden-remote-error-marker' } });
-    }
     const reviews =
-      status === 'pending'
+      status === 'pending' || status === null && url.searchParams.get('person_id') === '7'
         ? [
             {
               id: 41,
@@ -955,8 +836,8 @@ export async function installDirectoryReviewArchive(page: Page) {
     const offset = Number(url.searchParams.get('offset') ?? 0);
     return route.fulfill({
       json: {
-        candidates: candidates.filter((candidate) => candidate.state === state),
-        limit: 100,
+        candidates: candidates.filter((candidate) => state.split(',').includes(candidate.state)).slice(offset, offset + Number(url.searchParams.get('limit') ?? 100)),
+        limit: Number(url.searchParams.get('limit') ?? 100),
         offset,
       },
     });
@@ -984,16 +865,6 @@ export async function installDirectoryReviewArchive(page: Page) {
       });
     }
 
-    const gate = decisionGates.get(candidateID);
-    if (gate) {
-      decisionGates.delete(candidateID);
-      await gate.promise;
-    }
-    const failure = decisionFailures.get(candidateID);
-    if (failure) {
-      decisionFailures.delete(candidateID);
-      return route.fulfill({ status: 503, json: { error: 'unavailable', message: failure } });
-    }
     if (candidateID === 19 && decision === 'accept') {
       return route.fulfill({
         status: 409,
@@ -1097,6 +968,7 @@ export async function installDirectoryReviewArchive(page: Page) {
         mergedCandidate.decided_by = 'synthetic-reviewer';
         mergedCandidate.updated_at = mergedCandidate.decided_at;
       }
+      for (const candidate of candidates) candidate.review_token = `review-${candidate.id}-postmerge`;
       phase = 'postmerge';
       return route.fulfill({
         headers: { ETag: '"person-7-r5"' },
@@ -1126,6 +998,7 @@ export async function installDirectoryReviewArchive(page: Page) {
       const restored = reviewPerson(19, 1, 'Synthetic Restored');
       restored.participant_ids = [901];
       people.set(19, restored);
+      for (const candidate of candidates) candidate.review_token = `review-${candidate.id}-postsplit`;
       phase = 'postsplit';
       return route.fulfill({
         headers: { ETag: '"person-7-r6"', 'X-New-Person-ETag': '"person-19-r1"' },
@@ -1145,7 +1018,7 @@ export async function installDirectoryReviewArchive(page: Page) {
     if (suffix === '' && request.method() === 'GET') {
       return route.fulfill({ headers: { ETag: `"person-${person.id}-r${person.revision}"` }, json: person });
     }
-    if (suffix === '/profile') {
+    if (suffix === '/profile' || suffix === '/profile/history') {
       return route.fulfill({
         headers: { ETag: `"person-${person.id}-r${person.revision}"` },
         json: {
@@ -1156,6 +1029,7 @@ export async function installDirectoryReviewArchive(page: Page) {
           dates: [],
           categories: [],
           media: [],
+          ...(suffix === '/profile/history' ? { observations: [] } : {}),
         },
       });
     }
@@ -1164,7 +1038,7 @@ export async function installDirectoryReviewArchive(page: Page) {
       return route.fulfill({
         json: {
           person_id: person.id,
-          cadence_status: 'current',
+          cadence_status: 'ok',
           computed_at: FIXTURE_TIME,
           interaction_count: 2,
           stale: false,
@@ -1202,10 +1076,6 @@ export async function installDirectoryReviewArchive(page: Page) {
     archive,
     candidates,
     requests,
-    relationshipRequests,
-    failNextRelationshipRead(): void {
-      failNextRelationshipRead = true;
-    },
     deferFactCatalog(): () => void {
       let release = () => undefined;
       factCatalogMode = 'deferred';
@@ -1220,57 +1090,39 @@ export async function installDirectoryReviewArchive(page: Page) {
     malformFactCatalog(): void {
       factCatalogMode = 'malformed';
     },
-    holdNextDecision(candidateID: number): () => void {
-      let release = () => undefined;
-      const promise = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      decisionGates.set(candidateID, { promise, release });
-      return release;
-    },
-    failNextDecision(candidateID: number, message: string): void {
-      decisionFailures.set(candidateID, message);
-    },
   };
 }
 
 function reviewPerson(id: number, revision: number, displayName: string): Person {
   return {
-    id,
-    revision,
-    display_name: displayName,
-    participant_ids: id === 7 ? [701, 702] : [901],
-    vcard_uid: `synthetic-${id}`,
+    ...person(id, revision, id === 7 ? [701, 702] : [901], displayName),
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-02T00:00:00Z',
   };
 }
 
 function reviewMerge(): PersonMerge {
-  return {
-    id: 41,
-    survivor_person_id: 7,
-    absorbed_person_id: 9,
-    current_person_id: 7,
-    survivor_vcard_uid: 'synthetic-7',
-    absorbed_vcard_uid: 'synthetic-9',
-    survivor_revision_before: 4,
-    absorbed_revision_before: 2,
-    survivor_revision_after: 5,
-    actor: 'web',
-    snapshot_version: 1,
-    snapshot_sha256: 'synthetic-digest',
-    created_at: '2026-01-03T12:00:00Z',
-  };
+  return { ...merge(person(7, 5)), created_at: '2026-01-03T12:00:00Z' };
+}
+
+function reviewIdentifier(participant_id: number) {
+  return { participant_id, type: 'email', value: `person${participant_id}@example.org`, normalized_value: `person${participant_id}@example.org`, display_value: '', service_slug: 'email', service_label: 'Email', scope_kind: '', scope_value: '' };
+}
+
+/** The review merge's participants. */
+function reviewParticipants(splitCompleted: boolean): PersonMergeDetail['participants'] {
+  return [
+    { merge_id: 41, participant_id: 901, origin_side: 'absorbed', ...(splitCompleted ? { split_id: 55 } : {}) },
+    { merge_id: 41, participant_id: 701, origin_side: 'survivor' },
+    { merge_id: 41, participant_id: 702, origin_side: 'survivor' },
+  ];
 }
 
 function reviewMergeDetail(splitCompleted = false): PersonMergeDetail {
   return {
     merge: reviewMerge(),
-    participants: [
-      { merge_id: 41, participant_id: 901, origin_side: 'absorbed', ...(splitCompleted ? { split_id: 55 } : {}) },
-      { merge_id: 41, participant_id: 701, origin_side: 'survivor' },
-    ],
+    labels: { ...reviewMergeSummary(splitCompleted).labels, participants: undefined },
+    participants: reviewParticipants(splitCompleted),
     rows: [
       {
         merge_id: 41,
@@ -1292,7 +1144,16 @@ function reviewMergeDetail(splitCompleted = false): PersonMergeDetail {
 function reviewMergeSummary(splitCompleted = false): PersonMergeSummary {
   return {
     merge: reviewMerge(),
-    participant_count: 2,
+    labels: {
+      profiles: [{ id: 7, display_name: 'Synthetic One', participant_ids: [701, 702] }, { id: 9, display_name: 'Synthetic Two', participant_ids: [901] }],
+      participants: reviewParticipants(splitCompleted),
+      participant_ids: [701, 702, 901], absorbed_address_count: 2, incomplete: false,
+      addresses: [701, 702, 901].flatMap(id => [
+        addressFixture(id, 'email', reviewIdentifier(id).value),
+        ...(id === 901 ? [addressFixture(id, 'phone', '+1 (202) 555-0123', { normalized_value: '+12025550123' })] : []),
+      ]),
+    },
+    participant_count: 3,
     pending_candidate_count: 0,
     row_action_counts: { copied: 1 },
     row_count: 1,
@@ -1310,7 +1171,7 @@ function reviewSplit(): PersonSplit {
     source_revision_before: 5,
     source_revision_after: 6,
     exact_reversal: false,
-    actor: 'web',
+    actor: 'user',
     created_at: '2026-01-04T12:00:00Z',
   };
 }

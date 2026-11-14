@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-10-01"
+last_edited: "2026-11-11"
 title: Architecture Overview
 description: How msgvault captures communications, preserves the archive, and serves people, search, and automation.
 ---
@@ -26,6 +26,8 @@ inference without making a model provider the system of record.
   coordinates mutations. CLI, TUI, and MCP clients can use a local or remote daemon.
 - SQLite archives have Parquet analytics, packed attachment storage, and
   verifiable backup repositories.
+
+The daemon also serves [native MCP endpoints](../usage/chat.md#native-daemon-endpoints).
 
 ## Current boundaries
 
@@ -62,13 +64,29 @@ records. Attachments are addressed by their SHA-256 content hash so occurrences
 can share the same stored bytes. Repeated imports and syncs use source identity
 to update or skip records according to that provider's rules.
 
+Gmail sync commits a message's raw MIME together with a record of the files it
+still has to save. It then writes the attachment and remote-image files,
+records them against the message, and only then marks the work done. The
+database and the filesystem cannot commit together, so a sync that stops
+partway leaves that record behind for a later sync to finish. The
+[Gmail durability protocol](storage.md#gmail-durability-protocol) covers who
+owns each step, how sync picks work to retry, what cancellation interrupts,
+and what a completed run does not prove.
+
+Meeting providers use the shared meeting archiver to write messages, raw
+evidence, search text, and meeting projections. Pocket discovers and reconciles
+recordings through REST, verifies the personal account through MCP, and binds
+each source to the authenticated email and stable user ID. Its recoverable
+attempt state rotates detail fetches across limited and failed runs. See the
+[meeting workflow](../usage/meetings.md#pocket) for the content contract and limits.
+
 On SQLite, analytics exports message metadata to Parquet. DuckDB queries those
 files for grouping and drill-down without scanning message bodies. FTS5 indexes
 message text for keyword search. Semantic search stores vectors in a separate
 SQLite index; PostgreSQL uses its own full-text search and optional pgvector.
 See [storage](storage.md) and [search ranking](search-ranking.md).
 
-Opt-in [calendar control](../usage/calendar.md#control-events-unreleased) runs
+Opt-in [calendar control](../usage/calendar.md#control-events) runs
 through the daemon's serialized mutation gate. The daemon verifies source policy,
 delegated grants, OAuth scope, and live calendar access before sending a provider
 write. Successful changes use calendar sync's Store persistence path immediately,
@@ -84,7 +102,7 @@ reported separately so clients can reconcile a partial failure.
 | Ingestion | Source authorization, provider mapping, imports, checkpoints, and retry behavior | Provider packages in `internal/`, `internal/importer`, `internal/meetingarchive` |
 | Store | Archive schema, transactions, messages, provenance, profiles, and durable job state | `internal/store`, `internal/sqldialect` |
 | Attachment storage | Shared bytes, streaming reads, media policies, and packed/loose layouts | `internal/attachmentstore`, `internal/attachmentpolicy`, shared pack engine |
-| Search and analytics | Search parsing, query engines, caches, vector generations, and document indexes | `internal/search`, `internal/query`, `internal/vector`, `internal/documentindex` |
+| Search and analytics | Search parsing, query engines, caches, vector generations, and Docbank document search | `internal/search`, `internal/query`, `internal/vector`, `internal/docbankmedia` |
 | People | Observed identity links, curated facts, profiles, activity, consented maintenance, and contact sync | `internal/identityindex`, `internal/personfacts`, `internal/activity`, `internal/peoplesweep`, `internal/personenrichment`, `internal/carddav` |
 | Preservation and removal | Backups, duplicate handling, deletion manifests, and explicit execution | `internal/backupapp`, `internal/dedup`, `internal/deletion` |
 

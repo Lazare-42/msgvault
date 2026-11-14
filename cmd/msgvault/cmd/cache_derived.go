@@ -31,10 +31,9 @@ var derivedRefreshBeforeSnapshotHook func()
 func refreshDerivedDatasetsOnly(
 	ctx context.Context,
 	dbPath, analyticsDir string,
-	locking cachePublishLocking,
 	repairRelated bool,
 	builderOverrides ...duckdbutil.BuilderOverrides,
-) (*buildResult, error) {
+) (result *buildResult, buildErr error) {
 	readiness, err := query.InspectCacheReadiness(analyticsDir)
 	if err != nil {
 		return nil, fmt.Errorf("%w: inspect committed cache: %w",
@@ -66,7 +65,7 @@ func refreshDerivedDatasetsOnly(
 	}
 	defer func() { _ = staging.cleanup() }()
 
-	st, err := store.Open(dbPath)
+	st, err := store.OpenContext(ctx, dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open store for derived cache refresh: %w", err)
 	}
@@ -75,7 +74,7 @@ func refreshDerivedDatasetsOnly(
 		_ = st.Close()
 		return nil, fmt.Errorf("read identity revision: %w", err)
 	}
-	derivedDataRevision, err := st.DerivedDataRevision()
+	derivedDataRevision, err := st.DerivedDataRevisionContext(ctx)
 	if err != nil {
 		_ = st.Close()
 		return nil, fmt.Errorf("read derived-data revision: %w", err)
@@ -103,7 +102,7 @@ func refreshDerivedDatasetsOnly(
 		return nil, fmt.Errorf("%w: account identity revision changed",
 			ErrDerivedRefreshRequiresFullBuild)
 	}
-	participantIdentifierRevision, err := st.ParticipantIdentifierRevision()
+	participantIdentifierRevision, err := st.ParticipantIdentifierRevisionContext(ctx)
 	if err != nil {
 		_ = st.Close()
 		return nil, fmt.Errorf("read participant identifier revision: %w", err)
@@ -118,7 +117,7 @@ func refreshDerivedDatasetsOnly(
 		_ = st.Close()
 		return nil, fmt.Errorf("read person display-name revision: %w", err)
 	}
-	clusters, err := st.ParticipantClusters()
+	clusters, err := st.ParticipantClusters(ctx)
 	if err != nil {
 		_ = st.Close()
 		return nil, fmt.Errorf("read participant clusters: %w", err)
@@ -128,10 +127,12 @@ func refreshDerivedDatasetsOnly(
 	}
 
 	spillDir := filepath.Join(staging.root, "duckdb-tmp")
-	duckDB, err := duckdbutil.Open(ctx, duckdbutil.BuilderPolicyWithOverrides(
+	policy := duckdbutil.BuilderPolicyWithOverrides(
 		spillDir,
 		firstBuilderOverrides(builderOverrides),
-	))
+	)
+	defer func() { buildErr = duckdbutil.BuilderError(buildErr, policy) }()
+	duckDB, err := duckdbutil.Open(ctx, policy)
 	if err != nil {
 		return nil, fmt.Errorf("open bounded DuckDB for derived refresh: %w", err)
 	}
@@ -144,12 +145,13 @@ func refreshDerivedDatasetsOnly(
 	if derivedRefreshBeforeSnapshotHook != nil {
 		derivedRefreshBeforeSnapshotHook()
 	}
-	sourceSnapshot, err := openCacheSourceSnapshot(duckDB, dbPath)
+	sourceSnapshot, err := openCacheSourceSnapshot(ctx, duckDB, dbPath)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = sourceSnapshot.Close() }()
 	datasets := []string{
+		"cache_unsent_messages",
 		tableMessages,
 		tableConversations,
 		tableConversationParticipants,
@@ -164,7 +166,7 @@ func refreshDerivedDatasetsOnly(
 		// A late terminal sync can add children to an already-exported parent.
 		// Acknowledge its addition counter only from the same snapshot used to
 		// repair those children. Changed facts or interrupted runs remain full repairs.
-		counters, err := readCacheSyncCounters(sourceSnapshot)
+		counters, err := readCacheSyncCountersContext(ctx, sourceSnapshot)
 		if err != nil {
 			return nil, fmt.Errorf("read related-refresh sync counters: %w", err)
 		}
@@ -176,21 +178,21 @@ func refreshDerivedDatasetsOnly(
 				ErrDerivedRefreshRequiresFullBuild)
 		}
 		if counters.additions != state.LastCacheAdditionCount {
-			if err := verifyRelatedOnlyAdditions(sourceSnapshot, state); err != nil {
+			if err := verifyRelatedOnlyAdditions(ctx, sourceSnapshot, state); err != nil {
 				return nil, err
 			}
 		}
 		state.LastCacheAdditionCount = counters.additions
-		if err := sourceSnapshot.QueryRow(`SELECT COALESCE((SELECT seq FROM sqlite_sequence
+		if err := sourceSnapshot.QueryRowContext(ctx, `SELECT COALESCE((SELECT seq FROM sqlite_sequence
 			WHERE name = 'cache_related_change_journal'), 0)`).Scan(&relatedChangeSeq); err != nil {
 			return nil, fmt.Errorf("read related-change boundary: %w", err)
 		}
-		if err := inspectRelatedSnapshotColumns(sourceSnapshot); err != nil {
+		if err := inspectRelatedSnapshotColumns(ctx, sourceSnapshot); err != nil {
 			return nil, err
 		}
 		// The CSV fallback closes its SQLite transaction during preparation.
 		// Read journal metadata while that snapshot is still available.
-		relatedKinds, err = inspectRelatedChangeKinds(sourceSnapshot,
+		relatedKinds, err = inspectRelatedChangeKinds(ctx, sourceSnapshot,
 			state.LastRelatedChangeSeq, relatedChangeSeq, state.LastMessageID)
 		if err != nil {
 			return nil, err
@@ -209,7 +211,7 @@ func refreshDerivedDatasetsOnly(
 			relatedReplacements[dataset] = true
 		}
 	}
-	if err := sourceSnapshot.PrepareDatasets(datasets...); err != nil {
+	if err := sourceSnapshot.PrepareDatasets(ctx, state.LastMessageID, datasets...); err != nil {
 		return nil, err
 	}
 	exportDB := sourceSnapshot.DuckDB()
@@ -231,12 +233,18 @@ func refreshDerivedDatasetsOnly(
 		return nil, err
 	}
 
+	unsentFingerprint, err := stageUnsentMessages(ctx, sourceSnapshot, state.LastMessageID)
+	if err != nil {
+		return nil, err
+	}
+
 	if !repairRelated && identityRevision == state.IdentityRevision &&
 		participantIdentifierRevision == state.ParticipantIdentifierRevision &&
 		participantDisplayNameRevision == state.ParticipantDisplayNameRevision &&
 		personDisplayNameRevision == state.PersonDisplayNameRevision &&
 		conversationFingerprint == state.ConversationParticipantsFingerprint &&
-		typesFingerprint == state.ConversationTypesFingerprint {
+		typesFingerprint == state.ConversationTypesFingerprint &&
+		unsentFingerprint == state.UnsentFingerprint {
 		// Nothing the derived datasets read has changed (the account-identity
 		// revision was already verified equal above). Republishing would only
 		// advance PublishedAt, invalidating readers' cache revision — and with
@@ -249,7 +257,8 @@ func refreshDerivedDatasetsOnly(
 		participantDisplayNameRevision == state.ParticipantDisplayNameRevision &&
 		personDisplayNameRevision == state.PersonDisplayNameRevision &&
 		conversationFingerprint == state.ConversationParticipantsFingerprint &&
-		typesFingerprint == state.ConversationTypesFingerprint {
+		typesFingerprint == state.ConversationTypesFingerprint &&
+		unsentFingerprint == state.UnsentFingerprint {
 		// Labels and attachment metadata do not enter relationship_activity.
 		// Publish their child rows and marker directly, avoiding a scan of the
 		// expanded relationship population for a small metadata correction.
@@ -269,11 +278,11 @@ func refreshDerivedDatasetsOnly(
 			Append:  map[string]bool{},
 			Replace: relatedReplacements,
 		}
-		if err := publishDerivedCache(staging, analyticsDir, plan, state, locking); err != nil {
+		if err := publishDerivedCache(staging, analyticsDir, plan, state); err != nil {
 			return nil, err
 		}
 		reportCacheTextRepairs(os.Stderr, textRepairs)
-		warnRelatedChangePrune(dbPath, relatedChangeSeq, derivedDataRevision)
+		warnRelatedChangePrune(ctx, dbPath, relatedChangeSeq, derivedDataRevision)
 		return &buildResult{OutputDir: analyticsDir, IdentityOnly: true}, nil
 	}
 
@@ -346,6 +355,7 @@ func refreshDerivedDatasetsOnly(
 
 	derived, err := identityindex.Build(ctx, exportDB, identityindex.BuildOptions{
 		Mode:           identityindex.ModeIndexOnly,
+		UnsentMessages: "tmp_unsent_messages",
 		CommittedRoot:  analyticsDir,
 		StagedBaseRoot: staging.root,
 		OutputRoot:     staging.root,
@@ -372,6 +382,7 @@ func refreshDerivedDatasetsOnly(
 	state.PersonDisplayNameRevision = personDisplayNameRevision
 	state.ConversationParticipantsFingerprint = conversationFingerprint
 	state.ConversationTypesFingerprint = typesFingerprint
+	state.UnsentFingerprint = unsentFingerprint
 	if repairRelated {
 		state.LastRelatedChangeSeq = relatedChangeSeq
 	}
@@ -389,12 +400,12 @@ func refreshDerivedDatasetsOnly(
 			plan.Replace[dataset] = true
 		}
 	}
-	if err := publishDerivedCache(staging, analyticsDir, plan, state, locking); err != nil {
+	if err := publishDerivedCache(staging, analyticsDir, plan, state); err != nil {
 		return nil, err
 	}
 	reportCacheTextRepairs(os.Stderr, textRepairs)
 	if repairRelated {
-		warnRelatedChangePrune(dbPath, relatedChangeSeq, derivedDataRevision)
+		warnRelatedChangePrune(ctx, dbPath, relatedChangeSeq, derivedDataRevision)
 	}
 	return &buildResult{OutputDir: analyticsDir, IdentityOnly: true}, nil
 }
@@ -473,17 +484,31 @@ func stageParticipantClusters(ctx context.Context, db sqlRunner, clusters map[in
 	if len(clusters) == 0 {
 		return nil
 	}
-	values := make([]string, 0, len(clusters))
+	values := make([]string, 0, participantClusterMaxBatchRows)
+	flush := func() error {
+		if len(values) == 0 {
+			return nil
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO tmp_participant_clusters VALUES `+strings.Join(values, ",")); err != nil {
+			return fmt.Errorf("populate participant clusters temp table: %w", err)
+		}
+		values = values[:0]
+		return nil
+	}
 	for participantID, canonicalID := range clusters {
 		values = append(values, fmt.Sprintf("(%d,%d)", participantID, canonicalID))
+		if len(values) >= participantClusterMaxBatchRows {
+			if err := flush(); err != nil {
+				return err
+			}
+		}
 	}
-	if _, err := db.ExecContext(ctx, `INSERT INTO tmp_participant_clusters VALUES `+strings.Join(values, ",")); err != nil {
-		return fmt.Errorf("populate participant clusters temp table: %w", err)
-	}
-	return nil
+	return flush()
 }
 
 const participantClustersSelectSQL = `SELECT participant_id, canonical_id FROM tmp_participant_clusters`
+
+const participantClusterMaxBatchRows = 1024
 
 func conversationParticipantsSelectSQL(maxMessageID int64) string {
 	return fmt.Sprintf(`SELECT cp.conversation_id, cp.participant_id
@@ -554,7 +579,6 @@ func publishDerivedCache(
 	analyticsDir string,
 	plan cachePublishPlan,
 	state query.CacheSyncState,
-	locking cachePublishLocking,
 ) error {
 	data, err := json.Marshal(state, json.Deterministic(true))
 	if err != nil {
@@ -566,7 +590,6 @@ func publishDerivedCache(
 		plan,
 		data,
 		derivedPublishBeforeMarkerHook,
-		locking,
 	)
 }
 
@@ -577,9 +600,9 @@ func publishDerivedCache(
 // exportable message above it. The staleness check ignores a message deleted
 // at the source when it looks for new messages, so such a message above the
 // boundary would otherwise stay out of the cache.
-func verifyRelatedOnlyAdditions(snapshot *cacheSourceSnapshot, state syncState) error {
+func verifyRelatedOnlyAdditions(ctx context.Context, snapshot *cacheSourceSnapshot, state syncState) error {
 	var coveredCount int64
-	if err := snapshot.QueryRow(coveredCacheMessageCountSQL(), state.LastMessageID).
+	if err := snapshot.QueryRowContext(ctx, coveredCacheMessageCountSQL(), state.LastMessageID).
 		Scan(&coveredCount); err != nil {
 		return fmt.Errorf("check related-refresh message population: %w", err)
 	}
@@ -588,7 +611,7 @@ func verifyRelatedOnlyAdditions(snapshot *cacheSourceSnapshot, state syncState) 
 			ErrDerivedRefreshRequiresFullBuild)
 	}
 	var uncachedExportable bool
-	if err := snapshot.QueryRow(`SELECT EXISTS (SELECT 1 FROM messages WHERE id > ? AND `+
+	if err := snapshot.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM messages WHERE id > ? AND `+
 		exportableMessageWhere("")+`)`, state.LastMessageID).Scan(&uncachedExportable); err != nil {
 		return fmt.Errorf("check related-refresh message boundary: %w", err)
 	}
@@ -597,4 +620,23 @@ func verifyRelatedOnlyAdditions(snapshot *cacheSourceSnapshot, state syncState) 
 			ErrDerivedRefreshRequiresFullBuild)
 	}
 	return nil
+}
+
+// stageUnsentMessages materializes the pinned SQLite result once for the build
+// and its marker, preserving SQLite's indexes on both snapshot paths.
+func stageUnsentMessages(ctx context.Context, snapshot *cacheSourceSnapshot, through int64) (string, error) {
+	query := unsentMessagesSQL(through)
+	relation := "sqlite_db.cache_unsent_messages"
+	if !snapshot.csvSnapshot {
+		relation = "sqlite_query('sqlite_db', '" + strings.ReplaceAll(query, "'", "''") + "')"
+	}
+	db := snapshot.DuckDB()
+	if _, err := db.ExecContext(ctx, "CREATE TEMP TABLE tmp_unsent_messages AS SELECT message_id::BIGINT AS message_id FROM "+relation); err != nil {
+		return "", fmt.Errorf("stage unsent messages: %w", err)
+	}
+	fingerprint, err := messageIDsFingerprint(ctx, db, "SELECT message_id FROM tmp_unsent_messages ORDER BY message_id")
+	if err != nil {
+		return "", fmt.Errorf("fingerprint staged unsent messages: %w", err)
+	}
+	return fingerprint, nil
 }

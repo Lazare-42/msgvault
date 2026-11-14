@@ -22,7 +22,7 @@ func TestPostgreSQLCardDAVDiscoveryReplacementsSerializeCompleteSnapshots(t *tes
 	if !st.IsPostgreSQL() {
 		t.Skip("PostgreSQL row locks are required for the CardDAV snapshot serialization regression")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 	t.Cleanup(cancel)
 
 	blocker, err := st.DB().BeginTx(ctx, &sql.TxOptions{})
@@ -47,7 +47,8 @@ func TestPostgreSQLCardDAVDiscoveryReplacementsSerializeCompleteSnapshots(t *tes
 	require.Eventually(func() bool {
 		err := st.DB().QueryRowContext(ctx, `SELECT COUNT(*)
 			FROM pg_stat_activity
-			WHERE cardinality(pg_blocking_pids(pid)) > 0
+			WHERE datname = current_database()
+			  AND cardinality(pg_blocking_pids(pid)) > 0
 			  AND POSITION('carddav_discovery_lock' IN query) > 0`).Scan(&blockedWriters)
 		return err == nil && blockedWriters == 2
 	}, 5*time.Second, 10*time.Millisecond,

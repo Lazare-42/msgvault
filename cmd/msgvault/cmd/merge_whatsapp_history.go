@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -104,7 +105,7 @@ func runMergeWhatsAppHistory(cmd *cobra.Command, _ []string) error {
 	}
 	defer func() { _ = fromStore.Close() }()
 
-	intoStore, releaseIntoLock, err := openMergeTargetStore(intoCfg, mergeWhatsAppHistoryApply)
+	intoStore, releaseIntoLock, err := openMergeTargetStore(cmd.Context(), intoCfg, mergeWhatsAppHistoryApply)
 	if err != nil {
 		return err
 	}
@@ -175,7 +176,7 @@ func runMergeWhatsAppHistory(cmd *cobra.Command, _ []string) error {
 // (see cmd/msgvault/cmd/write_lock.go) — non-blocking, so a live bridge
 // already holding it fails this call immediately with an actionable error
 // instead of the two processes racing on the database file.
-func openMergeTargetStore(intoCfg *config.Config, apply bool) (*store.Store, func(), error) {
+func openMergeTargetStore(ctx context.Context, intoCfg *config.Config, apply bool) (*store.Store, func(), error) {
 	if !apply {
 		st, err := store.OpenReadOnly(intoCfg.DatabaseDSN())
 		if err != nil {
@@ -199,7 +200,7 @@ func openMergeTargetStore(intoCfg *config.Config, apply bool) (*store.Store, fun
 	lock, err := tryAcquireWriteOwnerLock(intoCfg.Data.DataDir)
 	if err != nil {
 		if _, ok := errors.AsType[writeOwnerLockHeldError](err); ok {
-			return nil, nil, archiveOwnedError(intoCfg.Data.DataDir)
+			return nil, nil, archiveOwnedError(ctx, intoCfg.Data.DataDir)
 		}
 		return nil, nil, fmt.Errorf("acquire --into write lock: %w", err)
 	}

@@ -143,16 +143,17 @@ const forcedDiscoveryFailure = "forced identity discovery failure"
 // so the failure seam has to intercept that update rather than an insert.
 func installFailingIdentityDiscovery(t *testing.T, env *TestEnv, trigger string) {
 	t.Helper()
-	_, err := env.Store.DB().Exec(`
-		CREATE TRIGGER ` + trigger + `
+	_, err := env.Store.DB().ExecContext(t.Context(), `
+		CREATE TRIGGER `+trigger+`
 		BEFORE UPDATE ON account_identities
 		BEGIN
-			SELECT RAISE(ABORT, '` + forcedDiscoveryFailure + `');
+			SELECT RAISE(ABORT, '`+forcedDiscoveryFailure+`');
 		END
 	`)
 	require.NoError(t, err, "install identity discovery failure seam")
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		_, _ = env.Store.DB().Exec("DROP TRIGGER IF EXISTS " + trigger)
+		_, _ = env.Store.DB().ExecContext(context.WithoutCancel(t.Context()), "DROP TRIGGER IF EXISTS "+trigger)
 	})
 }
 
@@ -175,11 +176,6 @@ func (a *supersedingProfileAPI) GetProfile(ctx context.Context) (*gmail.Profile,
 
 func (a *staticLabelsAPI) ListLabels(_ context.Context) ([]*gmail.Label, error) {
 	return a.labels, nil
-}
-
-func recordSyncRunItems(t *testing.T, env *TestEnv, sourceID int64, status string, items ...store.SyncRunItem) {
-	t.Helper()
-	recordSyncRunItemsOfType(t, env, sourceID, "full", status, items...)
 }
 
 func recordIncrementalSyncRunItems(t *testing.T, env *TestEnv, sourceID int64, status string, items ...store.SyncRunItem) {
@@ -247,7 +243,7 @@ func TestIncrementalSyncReplayRecordsEachErrorResultClass(t *testing.T) {
 	assert.Equal(int64(2), summary.Errors, "each result class records one error")
 	assert.Equal(int64(0), summary.MessagesAdded, "failed messages are not archived")
 
-	run, err := env.Store.GetLastSuccessfulSyncByType(source.ID, "incremental")
+	run, err := env.Store.GetLastSuccessfulSyncByType(t.Context(), source.ID, "incremental")
 	require.NoError(err, "latest completed incremental run")
 	recorded, err := env.Store.ListSyncRunItems(run.ID, store.SyncRunItemStatusError, 10)
 	require.NoError(err, "ListSyncRunItems")
@@ -288,7 +284,7 @@ func TestFullSyncBatchFetchErrorUpdatesFailedSyncErrorCount(t *testing.T) {
 	_, err := env.Syncer.Full(env.Context, testEmail)
 	require.Error(err, "full sync should fail on whole-batch fetch error")
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	run, err := env.Store.GetLatestSync(source.ID)
 	require.NoError(err, "GetLatestSync")
@@ -369,7 +365,7 @@ func TestFullSyncClassifiesGmailChatMessages(t *testing.T) {
 		{sourceMessageID: "email-message", messageType: "email", conversationType: "email_thread"},
 	} {
 		var messageType, conversationType string
-		err := env.Store.DB().QueryRow(env.Store.Rebind(`
+		err := env.Store.DB().QueryRowContext(t.Context(), env.Store.Rebind(`
 			SELECT m.message_type, c.conversation_type
 			FROM messages m
 			JOIN conversations c ON c.id = m.conversation_id
@@ -408,7 +404,7 @@ func TestFullSyncProviderHookFailureWarnsOnceAfterSuccessfulCompletion(t *testin
 	assertions.Contains(logs.String(), "provider identity refresh")
 	assertions.Contains(logs.String(), hookFailure,
 		"a warning without the cause leaves the operator nothing to act on")
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	requirements.NoError(err)
 	run, err := env.Store.GetLatestSync(source.ID)
 	requirements.NoError(err)
@@ -463,9 +459,8 @@ func TestFullSyncCompletionFailureMarksRunFailed(t *testing.T) {
 	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
-	testutil.SkipIfPostgres(t, "uses a SQLite trigger to inject the completion failure")
 	env := newTestEnv(t)
-	_, err := env.Store.DB().Exec(`
+	_, err := env.Store.DB().ExecContext(t.Context(), `
 		CREATE TRIGGER fail_sync_completion
 		BEFORE UPDATE OF status ON sync_runs
 		FOR EACH ROW WHEN NEW.status = 'completed'
@@ -474,15 +469,16 @@ func TestFullSyncCompletionFailureMarksRunFailed(t *testing.T) {
 		END
 	`)
 	require.NoError(err)
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		_, _ = env.Store.DB().Exec("DROP TRIGGER IF EXISTS fail_sync_completion")
+		_, _ = env.Store.DB().ExecContext(context.WithoutCancel(t.Context()), "DROP TRIGGER IF EXISTS fail_sync_completion")
 	})
 
 	summary, err := env.Syncer.Full(env.Context, testEmail)
 
 	require.ErrorContains(err, "forced sync completion failure")
 	assert.Nil(summary)
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err)
 	run, err := env.Store.GetLatestSync(source.ID)
 	require.NoError(err)
@@ -573,7 +569,8 @@ func TestSyncLabelsPersistsRoleFromCanonicalGmailIDNotName(t *testing.T) {
 	require.NoError(err, "sync labels")
 
 	roles := make(map[string]sql.NullString)
-	rows, err := env.Store.DB().Query(
+	rows, err := env.Store.DB().QueryContext(
+		t.Context(),
 		"SELECT name, system_role FROM labels WHERE source_id = ?", source.ID,
 	)
 	require.NoError(err, "query label roles")
@@ -608,7 +605,7 @@ func TestSyncPageRefreshesOnlyUnambiguousSentAliasesOnce(t *testing.T) { //nolin
 		require.NoError(env.Store.AddAccountIdentity(source.ID, address, "manual"), "seed confirmed identity")
 	}
 
-	labelMap, err := env.Store.EnsureLabelsBatch(source.ID, map[string]store.LabelInfo{
+	labelMap, err := env.Store.EnsureLabelsBatch(t.Context(), source.ID, map[string]store.LabelInfo{
 		"Envoyes": {
 			Name:       "Envoyes",
 			Type:       "system",
@@ -699,7 +696,7 @@ func TestSyncPageDoesNotTrustNameOnlySentMailbox(t *testing.T) {
 
 	_, err := env.Syncer.Full(env.Context, testEmail)
 	require.NoError(err, "full sync")
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	identities, err := env.Store.ListAccountIdentities(source.ID)
 	require.NoError(err, "ListAccountIdentities")
@@ -729,7 +726,7 @@ func TestSyncPageRetryAfterCheckpointFailureIsCaseFoldedAndIdempotent(t *testing
 		From("other-sender@example.test").
 		Bytes(), []string{"INBOX"})
 
-	_, err := env.Store.DB().Exec(`
+	_, err := env.Store.DB().ExecContext(t.Context(), `
 		CREATE TRIGGER fail_sync_checkpoint
 		BEFORE UPDATE ON sync_runs
 		WHEN NEW.messages_processed <> OLD.messages_processed
@@ -738,8 +735,9 @@ func TestSyncPageRetryAfterCheckpointFailureIsCaseFoldedAndIdempotent(t *testing
 		END
 	`)
 	require.NoError(err, "install checkpoint failure seam")
+	// Cleanup runs after t.Context() is canceled.
 	t.Cleanup(func() {
-		_, _ = env.Store.DB().Exec("DROP TRIGGER IF EXISTS fail_sync_checkpoint")
+		_, _ = env.Store.DB().ExecContext(context.WithoutCancel(t.Context()), "DROP TRIGGER IF EXISTS fail_sync_checkpoint")
 	})
 
 	env.Syncer = New(&cancelOnSecondListAPI{MockAPI: env.Mock}, env.Store, nil)
@@ -760,7 +758,7 @@ func TestSyncPageRetryAfterCheckpointFailureIsCaseFoldedAndIdempotent(t *testing
 	revisionAfterFirstPage, err := env.Store.AccountIdentityRevision()
 	require.NoError(err, "AccountIdentityRevision after first page")
 
-	_, err = env.Store.DB().Exec("DROP TRIGGER fail_sync_checkpoint")
+	_, err = env.Store.DB().ExecContext(t.Context(), "DROP TRIGGER fail_sync_checkpoint")
 	require.NoError(err, "restore checkpoint updates")
 	env.Syncer = New(env.Mock, env.Store, nil)
 	summary, err := env.Syncer.Full(env.Context, testEmail)
@@ -832,7 +830,7 @@ func TestFullSyncCanceledFailsRunAndKeepsCheckpointResumable(t *testing.T) {
 	_, err := env.Syncer.Full(env.Context, testEmail)
 	require.ErrorIs(err, context.Canceled, "sync should surface cancellation")
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	run, err := env.Store.GetLatestSync(source.ID)
 	require.NoError(err, "GetLatestSync")
@@ -1024,7 +1022,7 @@ func TestFullSyncCompletesAndSetsBacklogWhenDiscoveryFails(t *testing.T) { //nol
 	assert.Equal([]string{"msg-sent"}, ackClient.acknowledged,
 		"a durably archived message is acknowledged once its discovery debt is recorded")
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	run, err := env.Store.GetLatestSync(source.ID)
 	require.NoError(err, "GetLatestSync")
@@ -1067,7 +1065,7 @@ func TestFullSyncSettlesBacklogItParkedOnceDiscoveryRecovers(t *testing.T) { //n
 			return
 		}
 		recovered = true
-		_, err := env.Store.DB().Exec("DROP TRIGGER IF EXISTS fail_identity_discovery")
+		_, err := env.Store.DB().ExecContext(t.Context(), "DROP TRIGGER IF EXISTS fail_identity_discovery")
 		require.NoError(err, "let discovery recover for the next page")
 	})
 	env.Syncer = New(env.Mock, env.Store, DefaultOptions()).WithLogger(logs.logger())
@@ -1117,7 +1115,7 @@ func TestFullSyncDiscoveryRetriesTransientFailureWithoutBacklog(t *testing.T) { 
 			return
 		}
 		retries++
-		_, err := env.Store.DB().Exec("DROP TRIGGER IF EXISTS fail_identity_discovery")
+		_, err := env.Store.DB().ExecContext(t.Context(), "DROP TRIGGER IF EXISTS fail_identity_discovery")
 		require.NoError(err, "clear the transient discovery failure")
 	})
 	env.Syncer = New(env.Mock, env.Store, DefaultOptions()).WithLogger(logs.logger())
@@ -1128,7 +1126,7 @@ func TestFullSyncDiscoveryRetriesTransientFailureWithoutBacklog(t *testing.T) { 
 	require.NoError(err, "full sync")
 	assert.Equal(1, retries, "one failed attempt is retried")
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	found, _, err := env.Store.IdentityDiscoveryBacklogContext(env.Context, source.ID)
 	require.NoError(err, "IdentityDiscoveryBacklogContext")
@@ -1171,14 +1169,14 @@ func TestSyncCancellationDuringDiscoveryStaysResumable(t *testing.T) { //nolint:
 	require.NoError(err, "GetLatestSync")
 	assert.Equal(store.SyncStatusFailed, run.Status, "a cancelled worker leaves a resumable failed run")
 
-	found, _, err := env.Store.IdentityDiscoveryBacklogContext(context.Background(), source.ID)
+	found, _, err := env.Store.IdentityDiscoveryBacklogContext(t.Context(), source.ID)
 	require.NoError(err, "IdentityDiscoveryBacklogContext")
 	assert.False(found, "cancellation is not a discovery failure")
 
-	_, err = env.Store.DB().Exec("DROP TRIGGER fail_identity_discovery")
+	_, err = env.Store.DB().ExecContext(t.Context(), "DROP TRIGGER fail_identity_discovery")
 	require.NoError(err, "restore identity discovery")
 	env.Syncer = New(env.Mock, env.Store, DefaultOptions())
-	_, err = env.Syncer.Full(context.Background(), testEmail)
+	_, err = env.Syncer.Full(t.Context(), testEmail)
 	require.NoError(err, "resumed sync")
 
 	run, err = env.Store.GetLatestSync(source.ID)
@@ -1211,7 +1209,7 @@ func TestNextSyncDrainsIdentityDiscoveryBacklog(t *testing.T) { //nolint:paralle
 	require.NoError(err, "IdentityDiscoveryBacklogContext")
 	require.True(found, "the first sync parks the discovery debt")
 
-	_, err = env.Store.DB().Exec("DROP TRIGGER fail_identity_discovery")
+	_, err = env.Store.DB().ExecContext(t.Context(), "DROP TRIGGER fail_identity_discovery")
 	require.NoError(err, "restore identity discovery")
 	env.Mock.Profile.HistoryID = 12346
 	env.Mock.MessagePages = [][]string{{"msg-inbox"}}
@@ -1251,7 +1249,7 @@ func TestNoOpIncrementalSyncDrainsIdentityDiscoveryBacklog(t *testing.T) {
 		Bytes(), []string{"SENT"})
 	runFullSync(t, env)
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	require.NoError(env.Store.AddAccountIdentity(source.ID, "sent-alias@example.test", "manual"),
 		"confirm the identity after the archive already holds its Sent evidence")
@@ -1309,7 +1307,7 @@ func TestFullSyncDoesNotConfirmFirstTimeIdentity(t *testing.T) {
 	require.NoError(err, "full sync")
 	assertMessageCount(t, env.Store, 1)
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	identities, err := env.Store.ListAccountIdentities(source.ID)
 	require.NoError(err, "ListAccountIdentities")
@@ -1329,7 +1327,7 @@ func TestFullSyncWithErrors(t *testing.T) {
 	summary := runFullSync(t, env)
 	assertSummary(t, summary, WantSummary{Added: new(int64(2)), Errors: new(int64(1))})
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	run, err := env.Store.GetLastSuccessfulSync(source.ID)
 	require.NoError(err, "GetLastSuccessfulSync")
@@ -1605,7 +1603,7 @@ func TestIncrementalSyncFiltersFetchReplayCandidates(t *testing.T) {
 	env.Mock.MessagePages = [][]string{{presentID}}
 	_, err := env.Syncer.Full(env.Context, testEmail)
 	require.NoError(err, "seed present archive row")
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "source after full sync")
 	require.NoError(env.Store.UpdateSourceSyncCursor(source.ID, "1000"), "set current cursor")
 	source, err = env.Store.GetSourceByID(source.ID)
@@ -1613,44 +1611,21 @@ func TestIncrementalSyncFiltersFetchReplayCandidates(t *testing.T) {
 	env.Mock.GetMessageCalls = nil
 
 	const (
-		olderID       = "replay-older"
-		failedID      = "replay-failed-run"
 		eligibleID    = "replay-eligible"
 		batchEligible = "replay-batch-eligible"
 	)
-	recordIncrementalSyncRunItems(t, env, source.ID, store.SyncStatusCompleted, store.SyncRunItem{
-		SourceMessageID: olderID,
-		Phase:           syncItemPhaseFetch,
-		Status:          store.SyncRunItemStatusError,
-		ErrorKind:       syncItemKindFetchError,
-	})
-	recordSyncRunItems(t, env, source.ID, store.SyncStatusFailed, store.SyncRunItem{
-		SourceMessageID: failedID,
-		Phase:           syncItemPhaseFetch,
-		Status:          store.SyncRunItemStatusError,
-		ErrorKind:       syncItemKindFetchError,
-	})
 	recordIncrementalSyncRunItems(t, env, source.ID, store.SyncStatusCompleted,
 		store.SyncRunItem{SourceMessageID: eligibleID, Phase: syncItemPhaseFetch, Status: store.SyncRunItemStatusError, ErrorKind: syncItemKindFetchError},
 		store.SyncRunItem{SourceMessageID: eligibleID, Phase: syncItemPhaseFetch, Status: store.SyncRunItemStatusError, ErrorKind: syncItemKindBatchFetchError},
 		store.SyncRunItem{SourceMessageID: batchEligible, Phase: syncItemPhaseFetch, Status: store.SyncRunItemStatusError, ErrorKind: syncItemKindBatchFetchError},
-		store.SyncRunItem{SourceMessageID: "replay-ingest", Phase: syncItemPhaseIngest, Status: store.SyncRunItemStatusError, ErrorKind: syncItemKindIngestError},
-		store.SyncRunItem{SourceMessageID: "replay-delete", Phase: syncItemPhaseDelete, Status: store.SyncRunItemStatusError, ErrorKind: syncItemKindDeleteError},
-		store.SyncRunItem{SourceMessageID: "replay-skipped", Phase: syncItemPhaseFetch, Status: store.SyncRunItemStatusSkipped, ErrorKind: syncItemKindGmailNotFound},
 		store.SyncRunItem{SourceMessageID: "", Phase: syncItemPhaseFetch, Status: store.SyncRunItemStatusError, ErrorKind: syncItemKindFetchError},
 		store.SyncRunItem{SourceMessageID: "(unknown)", Phase: syncItemPhaseFetch, Status: store.SyncRunItemStatusError, ErrorKind: syncItemKindBatchFetchError},
 		store.SyncRunItem{SourceMessageID: presentID, Phase: syncItemPhaseFetch, Status: store.SyncRunItemStatusError, ErrorKind: syncItemKindFetchError},
 	)
-	// A later filtered or limited full run completes without establishing full
-	// Gmail coverage, so it neither contributes debt nor hides the incremental run.
-	recordSyncRunItems(t, env, source.ID, store.SyncStatusCompleted, store.SyncRunItem{
-		SourceMessageID: "replay-full-run",
-		Phase:           syncItemPhaseFetch,
-		Status:          store.SyncRunItemStatusError,
-		ErrorKind:       syncItemKindFetchError,
-	})
-	env.Mock.AddMessage(eligibleID, testMIME(), []string{"INBOX"})
-	env.Mock.AddMessage(batchEligible, testMIME(), []string{"INBOX"})
+	fetchIDs := []string{batchEligible, eligibleID}
+	for _, id := range fetchIDs {
+		env.Mock.AddMessage(id, testMIME(), []string{"INBOX"})
+	}
 	env.SetHistory(1000)
 
 	summary, err := env.Syncer.Incremental(env.Context, source)
@@ -1658,7 +1633,17 @@ func TestIncrementalSyncFiltersFetchReplayCandidates(t *testing.T) {
 	assert.Equal(int64(2), summary.MessagesFound, "eligible replay processed")
 	assert.Equal(int64(2), summary.MessagesAdded, "eligible replay added")
 	assert.Equal(int64(0), summary.Errors, "eligible replay errors")
-	assert.Equal([]string{batchEligible, eligibleID}, env.Mock.GetMessageCalls, "only latest eligible absent IDs fetched")
+	assert.Equal(fetchIDs, env.Mock.GetMessageCalls, "all unresolved absent IDs fetched")
+	items, err := env.Store.ListSyncRunItems(summary.SyncRunID, store.SyncRunItemStatusResolved, 20)
+	require.NoError(err)
+	var presentResolutions int
+	for _, item := range items {
+		if item.SourceMessageID == presentID {
+			presentResolutions++
+			assert.Equal(syncItemKindAcquired, item.ErrorKind)
+		}
+	}
+	assert.Equal(1, presentResolutions, "present row settles debt without adding or fetching it")
 }
 
 func TestIncrementalSyncFetchReplayPreservesCursorAndFence(t *testing.T) {
@@ -1723,7 +1708,7 @@ func TestFullSyncSkipsGmailNotFoundBeforeFetch(t *testing.T) {
 	summary := runFullSync(t, env)
 	assertSummary(t, summary, WantSummary{Added: new(int64(2)), Errors: new(int64(0)), Skipped: new(int64(1))})
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	run, err := env.Store.GetLastSuccessfulSync(source.ID)
 	require.NoError(err, "GetLastSuccessfulSync")
@@ -1746,7 +1731,7 @@ func TestStoreAttachment_ComputesHashWhenMissing(t *testing.T) {
 	})
 
 	src := env.CreateSource(t)
-	convID, err := env.Store.EnsureConversation(src.ID, "t1", "Thread")
+	convID, err := env.Store.EnsureConversation(t.Context(), src.ID, "t1", "Thread")
 	require.NoError(err, "EnsureConversation")
 	messageID, err := env.Store.UpsertMessage(&store.Message{
 		ConversationID:  convID,
@@ -1769,11 +1754,11 @@ func TestStoreAttachment_ComputesHashWhenMissing(t *testing.T) {
 		ContentHash: "",
 		Content:     content,
 	}
-	require.NoError(env.Syncer.storeAttachment(messageID, &att), "storeAttachment")
+	require.NoError(env.Syncer.storeAttachment(t.Context(), messageID, &att), "storeAttachment")
 	require.Equal(wantHash, att.ContentHash, "ContentHash")
 
 	var gotHash, storagePath, role, roleSource, sourcePartKey string
-	require.NoError(env.Store.DB().QueryRow(`
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `
 		SELECT content_hash, storage_path, attachment_role, role_source, source_part_key
 		FROM attachments WHERE message_id = ?`, messageID).
 		Scan(&gotHash, &storagePath, &role, &roleSource, &sourcePartKey), "select attachment")
@@ -1794,7 +1779,7 @@ func TestStoreAttachmentPersistsInlineMIMEEvidence(t *testing.T) {
 	env := newTestEnv(t)
 	env.SetOptions(t, func(o *Options) { o.AttachmentsDir = filepath.Join(env.TmpDir, "attachments") })
 	src := env.CreateSource(t)
-	convID, err := env.Store.EnsureConversation(src.ID, "inline-thread", "Thread")
+	convID, err := env.Store.EnsureConversation(t.Context(), src.ID, "inline-thread", "Thread")
 	require.NoError(err)
 	messageID, err := env.Store.UpsertMessage(&store.Message{
 		ConversationID: convID, SourceID: src.ID, SourceMessageID: "inline-message", MessageType: "email",
@@ -1805,10 +1790,10 @@ func TestStoreAttachmentPersistsInlineMIMEEvidence(t *testing.T) {
 		Filename: "inline.png", ContentType: "image/png", Content: []byte("png"),
 		Disposition: "inline", PartKey: "mime:3", ContentID: "inline-1", IsInline: true,
 	}
-	require.NoError(env.Syncer.storeAttachment(messageID, &att))
+	require.NoError(env.Syncer.storeAttachment(t.Context(), messageID, &att))
 
 	var role, roleSource, sourcePartKey, contentID string
-	require.NoError(env.Store.DB().QueryRow(`
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `
 		SELECT attachment_role, role_source, source_part_key, content_id
 		FROM attachments WHERE message_id = ?`, messageID).
 		Scan(&role, &roleSource, &sourcePartKey, &contentID))
@@ -1829,7 +1814,7 @@ func TestStoreAttachment_InvalidContentHash_ReturnsError(t *testing.T) {
 	})
 
 	src := env.CreateSource(t)
-	convID, err := env.Store.EnsureConversation(src.ID, "t1", "Thread")
+	convID, err := env.Store.EnsureConversation(t.Context(), src.ID, "t1", "Thread")
 	require.NoError(err, "EnsureConversation")
 	messageID, err := env.Store.UpsertMessage(&store.Message{
 		ConversationID:  convID,
@@ -1847,13 +1832,13 @@ func TestStoreAttachment_InvalidContentHash_ReturnsError(t *testing.T) {
 		ContentHash: "nope", // malformed
 		Content:     content,
 	}
-	require.Error(env.Syncer.storeAttachment(messageID, &att), "expected error")
+	require.Error(env.Syncer.storeAttachment(t.Context(), messageID, &att), "expected error")
 
 	_, statErr := os.Stat(attachmentsDir)
 	require.Error(statErr, "attachments dir should not have been created for invalid content hash")
 
 	var count int
-	require.NoError(env.Store.DB().QueryRow(`SELECT COUNT(*) FROM attachments WHERE message_id = ?`, messageID).Scan(&count), "count attachments")
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments WHERE message_id = ?`, messageID).Scan(&count), "count attachments")
 	require.Zero(count, "count")
 }
 
@@ -2024,7 +2009,7 @@ func TestIncrementalSyncDiscoversOnlySuccessfulChangesBeforeAdvancingCursor(t *t
 		historyAdded("new-failed"),
 	)
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier before incremental sync")
 	// Confirming all three addresses keeps the failed fetch observable: if its
 	// page reached discovery, failed-alias would gain Sent evidence too.
@@ -2074,7 +2059,7 @@ func TestIncrementalSyncCompletesAndSetsBacklogWhenDiscoveryFails(t *testing.T) 
 		Bytes(), []string{"INBOX"})
 	runFullSync(t, env)
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier before incremental sync")
 	require.NoError(env.Store.AddAccountIdentity(source.ID, "existing-alias@example.test", "manual"),
 		"seed confirmed identity")
@@ -2147,7 +2132,7 @@ func TestRecoverExpiredHistoryMarksOnlyMissingSourceMetadata(t *testing.T) {
 	seedMessages(env, 2, 1000, "present", "missing")
 	runFullSync(t, env)
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(t, err, "GetSourceByIdentifier")
 
 	delete(env.Mock.Messages, "missing")
@@ -2185,22 +2170,24 @@ func (a *recoveryProfileSequenceAPI) GetProfile(context.Context) (*gmail.Profile
 }
 
 func TestFullRecoversCheckpointAfterSyncOwnerExit(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	t.Parallel()
 	requirements := require.New(t)
 	checks := assert.New(t)
 	dbPath := filepath.Join(t.TempDir(), "owner-exit.db")
-	first, err := store.OpenForTest(dbPath)
+	first, err := store.OpenForTest(t.Context(), dbPath)
 	requirements.NoError(err)
 	requirements.NoError(first.InitSchema())
 	source, err := first.GetOrCreateSource("gmail", "owner-exit@example.com")
 	requirements.NoError(err)
 	_, err = first.CreateSyncOperation(source.ID, "owner-exit-operation")
 	requirements.NoError(err)
-	abandonedRun, err := first.StartSyncOperation(source.ID, "owner-exit-operation")
+	abandonedRun, err := first.StartSyncOperation(t.Context(), source.ID, "owner-exit-operation")
 	requirements.NoError(err)
 	fingerprint := New(gmail.NewMockAPI(), first, nil).fullSyncRequestFingerprint()
-	_, err = first.DB().Exec(
-		`UPDATE sync_runs SET sync_type = 'full', request_fingerprint = ? WHERE id = ?`,
+	_, err = first.DB().ExecContext(
+		t.Context(),
+		`UPDATE sync_runs SET sync_type = 'full', cursor_after = '1000', request_fingerprint = ? WHERE id = ?`,
 		fingerprint, abandonedRun,
 	)
 	requirements.NoError(err)
@@ -2211,7 +2198,7 @@ func TestFullRecoversCheckpointAfterSyncOwnerExit(t *testing.T) {
 	}))
 	requirements.NoError(first.Close())
 
-	second, err := store.OpenForTest(dbPath)
+	second, err := store.OpenForTest(t.Context(), dbPath)
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = second.Close() })
 	mock := gmail.NewMockAPI()
@@ -2239,7 +2226,7 @@ func TestRecoverExpiredHistoryConsumesChangesAfterSnapshotCursor(t *testing.T) {
 	seedMessages(env, 1, 1000, "present")
 	runFullSync(t, env)
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 
 	env.Mock.MessagePages = [][]string{{"present"}}
@@ -2268,9 +2255,9 @@ func TestRecoverExpiredHistoryRetainsSourceOwnershipThroughCatchup(t *testing.T)
 	env := newTestEnv(t)
 	seedMessages(env, 1, 1000, "present")
 	runFullSync(t, env)
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	requirements.NoError(err)
-	competitor, err := store.OpenForTest(filepath.Join(env.TmpDir, "test.db"))
+	competitor, err := store.OpenForTest(t.Context(), filepath.Join(env.TmpDir, "test.db"))
 	requirements.NoError(err)
 	t.Cleanup(func() { _ = competitor.Close() })
 
@@ -2331,7 +2318,7 @@ func TestRecoverExpiredHistoryRejectsPartialEnumerationOptions(t *testing.T) {
 			env := newTestEnv(t)
 			seedMessages(env, 2, 1000, "present", "outside-partial-enumeration")
 			runFullSync(t, env)
-			source, err := env.Store.GetSourceByIdentifier(testEmail)
+			source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 			require.NoError(t, err, "GetSourceByIdentifier")
 
 			delete(env.Mock.Messages, "outside-partial-enumeration")
@@ -2373,7 +2360,7 @@ func TestRecoverExpiredHistoryDoesNotReconcileIncompleteSnapshot(t *testing.T) {
 	env := newTestEnv(t)
 	seedMessages(env, 2, 1000, "present", "not-yet-enumerated")
 	runFullSync(t, env)
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(t, err, "GetSourceByIdentifier")
 
 	delete(env.Mock.Messages, "not-yet-enumerated")
@@ -2395,7 +2382,7 @@ func TestRecoverExpiredHistoryRejectsUnmarkedActiveSync(t *testing.T) {
 	seedPagedMessages(env, 4)
 	runFullSync(t, env)
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	syncID, err := env.Store.StartSync(source.ID, "full")
 	require.NoError(err, "StartSync")
@@ -2502,7 +2489,7 @@ func setupInterruptedHistoryRecoveryWithPrefixChange(
 	env.Mock.Profile.HistoryID = 12345
 	seedPagedMessages(env, 4)
 	runFullSync(t, env)
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 
 	env.Mock.Profile.HistoryID = 15000
@@ -2599,9 +2586,9 @@ func TestIncrementalSyncLabelAddedToNewMessage(t *testing.T) {
 	t.Parallel()
 	env := newTestEnv(t)
 	source := env.CreateSourceWithHistory(t, "12340")
-	_, err := env.Store.EnsureLabel(source.ID, "INBOX", "Inbox", labelTypeSystem)
+	_, err := env.Store.EnsureLabel(t.Context(), source.ID, "INBOX", "Inbox", labelTypeSystem)
 	require.NoError(t, err, "EnsureLabel INBOX")
-	_, err = env.Store.EnsureLabel(source.ID, "STARRED", "Starred", labelTypeSystem)
+	_, err = env.Store.EnsureLabel(t.Context(), source.ID, "STARRED", "Starred", labelTypeSystem)
 	require.NoError(t, err, "EnsureLabel STARRED")
 
 	env.Mock.Profile.MessagesTotal = 1
@@ -2668,7 +2655,7 @@ func TestFullSyncPersistsListID(t *testing.T) {
 	assertSummary(t, summary, WantSummary{Added: new(int64(1)), Errors: new(int64(0))})
 
 	var listID sql.NullString
-	require.NoError(t, env.Store.DB().QueryRow(`
+	require.NoError(t, env.Store.DB().QueryRowContext(t.Context(), `
 		SELECT list_id FROM messages WHERE source_message_id = ?`, "list-id-message",
 	).Scan(&listID), "read synced list ID")
 	assert.True(t, listID.Valid, "list ID should be present")
@@ -3035,7 +3022,8 @@ func TestFullSyncWithFatalMIMEParseSalvagesHeaders(t *testing.T) {
 
 	var subject, sender string
 	var sentAt time.Time
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT m.subject, m.sent_at, p.email_address
 		 FROM messages m
 		 JOIN participants p ON p.id = m.sender_id
@@ -3048,7 +3036,8 @@ func TestFullSyncWithFatalMIMEParseSalvagesHeaders(t *testing.T) {
 	assert.Equal("sender@example.test", sender)
 
 	var recipients int
-	err = env.Store.DB().QueryRow(
+	err = env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*)
 		 FROM message_recipients mr
 		 JOIN messages m ON m.id = mr.message_id
@@ -3109,8 +3098,9 @@ func TestFullSyncResumeWithCursor(t *testing.T) {
 
 	syncID, err := env.Store.StartSync(source.ID, "full")
 	require.NoError(err, "StartSync")
-	_, err = env.Store.DB().Exec(
-		`UPDATE sync_runs SET request_fingerprint = ? WHERE id = ?`,
+	_, err = env.Store.DB().ExecContext(
+		t.Context(),
+		`UPDATE sync_runs SET cursor_after = '12345', request_fingerprint = ? WHERE id = ?`,
 		env.Syncer.fullSyncRequestFingerprint(), syncID,
 	)
 	require.NoError(err, "record request fingerprint")
@@ -3133,7 +3123,7 @@ func TestFullSyncResumeWithCursor(t *testing.T) {
 	assertMessageCount(t, env.Store, 4)
 }
 
-func TestFullSyncResumesLegacyUnfilteredCheckpoint(t *testing.T) {
+func TestFullSyncRestartsLegacyUnfilteredCheckpoint(t *testing.T) {
 	t.Parallel()
 	requirements := require.New(t)
 	checks := assert.New(t)
@@ -3160,9 +3150,9 @@ func TestFullSyncResumesLegacyUnfilteredCheckpoint(t *testing.T) {
 	requirements.NoError(env.Store.FailSync(syncID, "worker stopped"))
 
 	summary := runFullSync(t, env)
-	checks.True(summary.WasResumed)
-	checks.Equal("page_1", summary.ResumedFromToken)
-	checks.Equal(1, env.Mock.ListMessagesCalls)
+	checks.False(summary.WasResumed)
+	checks.Empty(summary.ResumedFromToken)
+	checks.Equal(2, env.Mock.ListMessagesCalls)
 	assertMessageCount(t, env.Store, 4)
 }
 
@@ -3270,7 +3260,7 @@ func TestFullSyncEmptyRawMIME(t *testing.T) {
 	summary := runFullSync(t, env)
 	assertSummary(t, summary, WantSummary{Added: new(int64(1)), Errors: new(int64(1))})
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err, "GetSourceByIdentifier")
 	run, err := env.Store.GetLastSuccessfulSync(source.ID)
 	require.NoError(err, "GetLastSuccessfulSync")
@@ -3360,8 +3350,9 @@ func TestInitSyncState_Resume(t *testing.T) {
 	// Create a failed sync with a resumable checkpoint.
 	syncID, err := env.Store.StartSync(source.ID, "full")
 	require.NoError(err, "StartSync")
-	_, err = env.Store.DB().Exec(
-		`UPDATE sync_runs SET request_fingerprint = ? WHERE id = ?`,
+	_, err = env.Store.DB().ExecContext(
+		t.Context(),
+		`UPDATE sync_runs SET cursor_after = '1000', request_fingerprint = ? WHERE id = ?`,
 		env.Syncer.fullSyncRequestFingerprint(), syncID,
 	)
 	require.NoError(err, "record request fingerprint")
@@ -3387,44 +3378,7 @@ func TestInitSyncState_Resume(t *testing.T) {
 	assert.NotEqual(syncID, state.syncID, "resume starts a new run")
 	assert.Equal(int64(50), state.checkpoint.MessagesProcessed, "MessagesProcessed")
 	assert.Equal(int64(45), state.checkpoint.MessagesAdded, "MessagesAdded")
-}
-
-func TestLegacyFullCheckpointCompatibilityIsUnfilteredOnly(t *testing.T) {
-	t.Parallel()
-	legacy := &store.SyncRun{
-		CursorBefore: sql.NullString{String: "page_1", Valid: true},
-	}
-	pinnedRecovery := *legacy
-	pinnedRecovery.CursorAfter = sql.NullString{String: "12345", Valid: true}
-
-	tests := []struct {
-		name   string
-		run    *store.SyncRun
-		modify func(*Options)
-		want   bool
-	}{
-		{name: "default Gmail", run: legacy, modify: func(*Options) {}, want: true},
-		{name: "filtered Gmail", run: legacy, modify: func(options *Options) {
-			options.Query = "after:2024/01/01"
-		}},
-		{name: "limited Gmail", run: legacy, modify: func(options *Options) {
-			options.Limit = 10
-		}},
-		{name: "IMAP", run: legacy, modify: func(options *Options) {
-			options.SourceType = "imap"
-		}},
-		{name: "pinned recovery", run: &pinnedRecovery, modify: func(*Options) {}},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			options := DefaultOptions()
-			test.modify(options)
-			syncer := &Syncer{opts: options}
-			assert.Equal(t, test.want,
-				syncer.fullCheckpointMatchesRequest(test.run, "current-request"))
-		})
-	}
+	assert.Equal("1000", state.handoffCursor, "restore the History boundary with the page token")
 }
 
 func TestInitSyncState_NoResumeOption(t *testing.T) {
@@ -3480,7 +3434,7 @@ func TestProcessBatch_AllNew(t *testing.T) {
 	assert := assert.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
-	labelMap, _ := env.Store.EnsureLabelsBatch(source.ID, map[string]store.LabelInfo{
+	labelMap, _ := env.Store.EnsureLabelsBatch(t.Context(), source.ID, map[string]store.LabelInfo{
 		"INBOX": {Name: "Inbox", Type: labelTypeSystem},
 	})
 	checkpoint := &store.Checkpoint{}
@@ -3515,7 +3469,7 @@ func TestProcessBatch_AllExisting(t *testing.T) {
 	runFullSync(t, env)
 
 	source, _ := env.Store.GetOrCreateSource("gmail", testEmail)
-	labelMap, _ := env.Store.EnsureLabelsBatch(source.ID, map[string]store.LabelInfo{
+	labelMap, _ := env.Store.EnsureLabelsBatch(t.Context(), source.ID, map[string]store.LabelInfo{
 		"INBOX": {Name: "Inbox", Type: labelTypeSystem},
 	})
 	checkpoint := &store.Checkpoint{}
@@ -3547,7 +3501,7 @@ func TestProcessBatch_MixedNewAndExisting(t *testing.T) {
 	runFullSync(t, env)
 
 	source, _ := env.Store.GetOrCreateSource("gmail", testEmail)
-	labelMap, _ := env.Store.EnsureLabelsBatch(source.ID, map[string]store.LabelInfo{
+	labelMap, _ := env.Store.EnsureLabelsBatch(t.Context(), source.ID, map[string]store.LabelInfo{
 		"INBOX": {Name: "Inbox", Type: labelTypeSystem},
 	})
 	checkpoint := &store.Checkpoint{}
@@ -3577,7 +3531,7 @@ func TestProcessBatch_OldestDatePropagation(t *testing.T) {
 	assert := assert.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
-	labelMap, _ := env.Store.EnsureLabelsBatch(source.ID, map[string]store.LabelInfo{
+	labelMap, _ := env.Store.EnsureLabelsBatch(t.Context(), source.ID, map[string]store.LabelInfo{
 		"INBOX": {Name: "Inbox", Type: labelTypeSystem},
 	})
 	checkpoint := &store.Checkpoint{}
@@ -3625,7 +3579,7 @@ func TestProcessBatch_ErrorsCount(t *testing.T) {
 	assert := assert.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
-	labelMap, _ := env.Store.EnsureLabelsBatch(source.ID, map[string]store.LabelInfo{
+	labelMap, _ := env.Store.EnsureLabelsBatch(t.Context(), source.ID, map[string]store.LabelInfo{
 		"INBOX": {Name: "Inbox", Type: labelTypeSystem},
 	})
 	checkpoint := &store.Checkpoint{}
@@ -3662,7 +3616,7 @@ func TestProcessBatch_GmailNotFoundIsSkipped(t *testing.T) {
 	assert := assert.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSource(t)
-	labelMap, _ := env.Store.EnsureLabelsBatch(source.ID, map[string]store.LabelInfo{
+	labelMap, _ := env.Store.EnsureLabelsBatch(t.Context(), source.ID, map[string]store.LabelInfo{
 		"INBOX": {Name: "Inbox", Type: labelTypeSystem},
 	})
 	checkpoint := &store.Checkpoint{}
@@ -4082,7 +4036,8 @@ func TestIncrementalSyncKeepsSiblingPayloadsDistinctWhenAddsRepeatAsLabelChanges
 	internalIDs := make(map[string]int64, len(wants))
 	for sourceMessageID, want := range wants {
 		var internalID int64
-		err := env.Store.DB().QueryRow(
+		err := env.Store.DB().QueryRowContext(
+			t.Context(),
 			env.Store.Rebind(`SELECT id FROM messages WHERE source_id = (SELECT id FROM sources WHERE identifier = ?) AND source_message_id = ?`),
 			testEmail,
 			sourceMessageID,
@@ -4148,7 +4103,7 @@ func TestIncrementalSyncReusesPersistedGmailDraftMessageID(t *testing.T) {
 	requirements := require.New(t)
 	env := newTestEnv(t)
 	source := env.CreateSourceWithHistory(t, "1000")
-	conversationID, err := env.Store.EnsureConversation(source.ID, "thread-draft", "Draft thread")
+	conversationID, err := env.Store.EnsureConversation(t.Context(), source.ID, "thread-draft", "Draft thread")
 	requirements.NoError(err)
 	const sourceMessageID = "gmail-draft-message"
 	_, err = env.Store.PersistMessageContext(t.Context(), &store.MessagePersistData{
@@ -4167,7 +4122,7 @@ func TestIncrementalSyncReusesPersistedGmailDraftMessageID(t *testing.T) {
 	assertions.Equal(int64(0), summary.MessagesAdded)
 	assertions.Empty(env.Mock.GetMessageCalls, "sync skips the persisted message body")
 	var count int
-	requirements.NoError(env.Store.DB().QueryRow(env.Store.Rebind(`
+	requirements.NoError(env.Store.DB().QueryRowContext(t.Context(), env.Store.Rebind(`
 		SELECT COUNT(*) FROM messages WHERE source_id = ? AND source_message_id = ?
 	`), source.ID, sourceMessageID).Scan(&count))
 	assertions.Equal(1, count)
@@ -4298,7 +4253,7 @@ func TestIMAPThreading(t *testing.T) {
 	// Verify conversation grouping: thread msgs share 1 conversation,
 	// standalone gets its own.
 	var convCount int
-	err := env.Store.DB().QueryRow(`SELECT COUNT(DISTINCT conversation_id) FROM messages`).Scan(&convCount)
+	err := env.Store.DB().QueryRowContext(t.Context(), `SELECT COUNT(DISTINCT conversation_id) FROM messages`).Scan(&convCount)
 	require.NoError(t, err, "count conversations")
 	assert.Equal(t, 2, convCount, "expected 2 conversations (1 thread + 1 standalone)")
 }
@@ -4343,7 +4298,8 @@ func TestIMAPCrossSyncDedup(t *testing.T) {
 
 	// Only one message should exist in the database
 	var count int
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT COUNT(*) FROM messages`).Scan(&count)
 	require.NoError(err, "count messages")
 	assert.Equal(1, count, "expected 1 message (duplicate imported)")
@@ -4351,7 +4307,8 @@ func TestIMAPCrossSyncDedup(t *testing.T) {
 	// The existing row's source_message_id should be updated to the
 	// new composite ID so future syncs don't re-download the message.
 	var srcMsgID string
-	err = env.Store.DB().QueryRow(
+	err = env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&srcMsgID)
 	require.NoError(err, "get source_message_id")
@@ -4391,7 +4348,8 @@ func TestIMAPFullRescanWithoutAllReconcilesMovedMessage(t *testing.T) {
 	assertSummary(t, summary, WantSummary{Added: new(int64(0))})
 
 	var sourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -4422,7 +4380,8 @@ func TestIMAPFullRescanWithoutAllPreservesExistingIDForOverlappingFolders(t *tes
 	require.NoError(firstClient.Close())
 
 	var originalSourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&originalSourceMessageID)
 	require.NoError(err)
@@ -4435,7 +4394,8 @@ func TestIMAPFullRescanWithoutAllPreservesExistingIDForOverlappingFolders(t *tes
 	assertSummary(t, summary, WantSummary{Added: new(int64(0))})
 
 	var rescannedSourceMessageID string
-	err = env.Store.DB().QueryRow(
+	err = env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&rescannedSourceMessageID)
 	require.NoError(err)
@@ -4469,7 +4429,8 @@ func TestIMAPCompleteSnapshotAdoptsAllMailCanonicalID(t *testing.T) {
 	assertSummary(t, summary, WantSummary{Added: new(int64(1))})
 
 	var sourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -4481,7 +4442,8 @@ func TestIMAPCompleteSnapshotAdoptsAllMailCanonicalID(t *testing.T) {
 	summary = runFullSync(t, env)
 	assertSummary(t, summary, WantSummary{Updated: new(int64(1))})
 
-	err = env.Store.DB().QueryRow(
+	err = env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -4522,7 +4484,8 @@ func TestIMAPUnsupportedQresyncMoveUsesFullFallback(t *testing.T) {
 	})
 
 	var sourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -4579,7 +4542,8 @@ func TestIMAPUIDValidityReusePreservesOldAndArchivesNewMessage(t *testing.T) {
 		sourceMessageID string
 	}
 	identities := make(map[string]archivedIdentity)
-	rows, err := env.Store.DB().Query(
+	rows, err := env.Store.DB().QueryContext(
+		t.Context(),
 		`SELECT id, source_message_id, rfc822_message_id FROM messages`,
 	)
 	require.NoError(err)
@@ -4624,7 +4588,8 @@ func TestIMAPUIDValidityReusePreservesOldAndArchivesNewMessage(t *testing.T) {
 	})
 
 	var currentSourceMessageID string
-	err = env.Store.DB().QueryRow(
+	err = env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages
 		 WHERE rfc822_message_id = ?`,
 		"<"+newRFC822ID+">",
@@ -4679,7 +4644,8 @@ func TestIMAPNoResumeUIDValidityReuseArchivesReplacement(t *testing.T) {
 		sourceMessageID string
 	}
 	identities := make(map[string]archivedIdentity)
-	rows, err := env.Store.DB().Query(
+	rows, err := env.Store.DB().QueryContext(
+		t.Context(),
 		`SELECT id, source_message_id, rfc822_message_id FROM messages`,
 	)
 	require.NoError(err)
@@ -4834,7 +4800,7 @@ func TestIMAPLegacyOnlyIdentityValidationGetsRawBeforeDedup(t *testing.T) {
 
 	source, err := env.Store.GetOrCreateSource("imap", testEmail)
 	require.NoError(err)
-	conversationID, err := env.Store.EnsureConversation(source.ID, "legacy-dedup", "archived message")
+	conversationID, err := env.Store.EnsureConversation(t.Context(), source.ID, "legacy-dedup", "archived message")
 	require.NoError(err)
 	archivedID, err := env.Store.UpsertMessage(&store.Message{
 		SourceID: source.ID, ConversationID: conversationID, SourceMessageID: "Z-archive|1",
@@ -4856,7 +4822,7 @@ func TestIMAPLegacyOnlyIdentityValidationGetsRawBeforeDedup(t *testing.T) {
 	storedRaw, err := env.Store.GetMessageRaw(archivedID)
 	require.NoError(err)
 	assert.Equal(raw, storedRaw)
-	storedSourceMessageID, err := env.Store.GetMessageSourceID(archivedID)
+	storedSourceMessageID, err := env.Store.GetMessageSourceID(t.Context(), archivedID)
 	require.NoError(err)
 	assert.Equal("Z-archive|1", storedSourceMessageID)
 }
@@ -4899,10 +4865,11 @@ func TestIMAPLegacyOnlyIdentityRawMismatchPreservesReusedUID(t *testing.T) {
 
 	source, err := env.Store.GetOrCreateSource("imap", testEmail)
 	require.NoError(err)
-	oldID, err := env.Store.GetMessageIDByRFC822ID(source.ID, "<"+messageID+">")
+	oldID, err := env.Store.GetMessageIDByRFC822ID(t.Context(), source.ID, "<"+messageID+">")
 	require.NoError(err)
 	require.NotZero(oldID)
-	_, err = env.Store.DB().Exec(
+	_, err = env.Store.DB().ExecContext(
+		t.Context(),
 		`UPDATE messages SET rfc822_message_id = ? WHERE id = ?`,
 		"<"+messageID,
 		oldID,
@@ -4923,18 +4890,18 @@ func TestIMAPLegacyOnlyIdentityRawMismatchPreservesReusedUID(t *testing.T) {
 	})
 	assertMessageCount(t, env.Store, 2)
 
-	oldSourceID, err := env.Store.GetMessageSourceID(oldID)
+	oldSourceID, err := env.Store.GetMessageSourceID(t.Context(), oldID)
 	require.NoError(err)
 	assert.Equal(invalidatedIMAPSourceID(oldID), oldSourceID)
 	oldRaw, err := env.Store.GetMessageRaw(oldID)
 	require.NoError(err)
 	assert.Equal(archivedRaw, oldRaw)
 
-	replacementID, err := env.Store.GetMessageIDByRFC822ID(source.ID, "<"+messageID+">")
+	replacementID, err := env.Store.GetMessageIDByRFC822ID(t.Context(), source.ID, "<"+messageID+">")
 	require.NoError(err)
 	assert.NotZero(replacementID)
 	assert.NotEqual(oldID, replacementID)
-	replacementSourceID, err := env.Store.GetMessageSourceID(replacementID)
+	replacementSourceID, err := env.Store.GetMessageSourceID(t.Context(), replacementID)
 	require.NoError(err)
 	assert.Equal("Archive|1", replacementSourceID)
 	storedReplacementRaw, err := env.Store.GetMessageRaw(replacementID)
@@ -4963,7 +4930,8 @@ func TestIMAPAsymmetricMessageIDUsesRawComparison(t *testing.T) {
 	assertSummary(t, summary, WantSummary{Added: new(int64(1))})
 	require.NoError(firstClient.Close())
 
-	_, err := env.Store.DB().Exec(
+	_, err := env.Store.DB().ExecContext(
+		t.Context(),
 		`UPDATE messages SET rfc822_message_id = NULL`,
 	)
 	require.NoError(err)
@@ -5040,7 +5008,7 @@ func assertMissingIDArchiveState(
 		raw             string
 	}
 	var archived []archivedMessage
-	rows, err := st.DB().Query(`SELECT id, source_message_id FROM messages`)
+	rows, err := st.DB().QueryContext(t.Context(), `SELECT id, source_message_id FROM messages`)
 	require.NoError(err)
 	defer func() { require.NoError(rows.Close()) }()
 	for rows.Next() {
@@ -5117,7 +5085,8 @@ func TestIMAPFilteredMoveReconcilesBeforeAdvancingFolderState(t *testing.T) {
 	require.NoError(secondClient.Close())
 
 	var sourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -5135,7 +5104,8 @@ func TestIMAPFilteredMoveReconcilesBeforeAdvancingFolderState(t *testing.T) {
 		Updated: new(int64(1)),
 	})
 
-	err = env.Store.DB().QueryRow(
+	err = env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -5186,7 +5156,8 @@ func TestIMAPUnsupportedQresyncRenameUsesFullFallback(t *testing.T) {
 	})
 
 	var sourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -5221,7 +5192,8 @@ func TestIMAPHighWaterOverlapPreservesValidID(t *testing.T) {
 	require.NotEmpty(saved)
 
 	var originalSourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&originalSourceMessageID)
 	require.NoError(err)
@@ -5238,7 +5210,8 @@ func TestIMAPHighWaterOverlapPreservesValidID(t *testing.T) {
 	})
 
 	var rescannedSourceMessageID string
-	err = env.Store.DB().QueryRow(
+	err = env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&rescannedSourceMessageID)
 	require.NoError(err)
@@ -5271,7 +5244,8 @@ func TestIMAPCompleteCrossPageOverlapPreservesValidID(t *testing.T) {
 	require.NoError(firstClient.Close())
 
 	var originalSourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages
 		 WHERE rfc822_message_id = ?`,
 		"<"+messageID+">",
@@ -5301,7 +5275,8 @@ func TestIMAPCompleteCrossPageOverlapPreservesValidID(t *testing.T) {
 	})
 
 	var rescannedSourceMessageID string
-	err = env.Store.DB().QueryRow(
+	err = env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages
 		 WHERE rfc822_message_id = ?`,
 		"<"+messageID+">",
@@ -5388,7 +5363,8 @@ func TestIMAPHighWaterValidationFailureRemainsRetryable(t *testing.T) {
 	})
 
 	var sourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -5544,7 +5520,8 @@ func TestIMAPFilteredRescanPreservesCanonicalIDAndMergesLabels(t *testing.T) {
 	assertSummary(t, summary, WantSummary{Added: new(int64(0))})
 
 	var sourceMessageID string
-	err := env.Store.DB().QueryRow(
+	err := env.Store.DB().QueryRowContext(
+		t.Context(),
 		`SELECT source_message_id FROM messages LIMIT 1`,
 	).Scan(&sourceMessageID)
 	require.NoError(err)
@@ -5697,7 +5674,7 @@ func TestIMAPCompleteRescanReplacesExactIDLabels(t *testing.T) {
 	assertMessageHasLabel(t, env.Store, sourceMessageID, "[Gmail]/All Mail")
 	assertMessageNotHasLabel(t, env.Store, sourceMessageID, "Archive")
 
-	source, err := env.Store.GetSourceByIdentifier(testEmail)
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
 	require.NoError(err)
 	run, err := env.Store.GetLatestSync(source.ID)
 	require.NoError(err)
@@ -5811,7 +5788,7 @@ func TestIncrementalSyncLabelRemovedWithMissingRaw(t *testing.T) {
 	assertRawDataExists(t, env.Store, "msg1")
 
 	// Delete raw MIME data to simulate missing raw
-	_, err := env.Store.DB().Exec(`
+	_, err := env.Store.DB().ExecContext(t.Context(), `
 		DELETE FROM message_raw WHERE message_id = (
 			SELECT id FROM messages WHERE source_message_id = 'msg1'
 		)`)
@@ -5956,4 +5933,217 @@ func TestIMAPGoneUIDIsArchivedOnceTheServerReturnsIt(t *testing.T) {
 	assert.Equal(int64(0), summary.Errors)
 	assertMessageCount(t, env.Store, 2)
 	require.NoError(secondClient.Close())
+}
+
+func TestIncrementalSyncReplaysEarlierRunFailures(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	env := newTestEnv(t)
+	seedMessages(env, 3, 1000, "lost-fetch", "lost-ingest", "good")
+	env.Mock.GetMessageError["lost-fetch"] = errors.New("temporary fetch failure")
+	env.Mock.Messages["lost-ingest"] = &gmail.RawMessage{ID: "lost-ingest", ThreadID: "thread-lost-ingest", LabelIDs: []string{"INBOX"}, Raw: []byte{}}
+	summary := runFullSync(t, env)
+	assertSummary(t, summary, WantSummary{Added: new(int64(1)), Errors: new(int64(2))})
+
+	delete(env.Mock.GetMessageError, "lost-fetch")
+	for _, id := range []string{"lost-fetch", "lost-ingest"} {
+		env.Mock.AddMessage(id, testMIME(), []string{"INBOX"})
+	}
+	source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
+	require.NoError(err)
+	env.SetHistory(1000)
+	env.Mock.GetMessageCalls = nil
+	summary, err = env.Syncer.Incremental(env.Context, source)
+	require.NoError(err)
+	assert.Equal(int64(2), summary.MessagesAdded)
+	assert.Equal(int64(0), summary.Errors)
+	assert.ElementsMatch([]string{"lost-fetch", "lost-ingest"}, env.Mock.GetMessageCalls)
+	existing, err := env.Store.MessageExistsBatch(source.ID, []string{"lost-fetch", "lost-ingest"})
+	require.NoError(err)
+	assert.Len(existing, 2)
+
+	env.Mock.GetMessageCalls = nil
+	_, err = env.Syncer.Incremental(env.Context, source)
+	require.NoError(err)
+	assert.Empty(env.Mock.GetMessageCalls)
+}
+
+func TestAcquisitionResolutionCommitsWithMessage(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	env := newTestEnv(t)
+	source := seedReplaySource(t, env, "recovered")
+	seedMessages(env, 2, 1001, "keep", "recovered")
+	env.Mock.MessagePages = [][]string{{"keep", "recovered"}}
+
+	// A failed resolution must roll back the recovered message as well.
+	_, err := env.Store.DB().ExecContext(t.Context(), `
+		CREATE TRIGGER fail_acquisition_resolution BEFORE INSERT ON sync_run_items
+		WHEN NEW.source_message_id = 'recovered' AND NEW.status = 'resolved'
+		  AND NEW.error_kind = 'acquired'
+		BEGIN
+			SELECT RAISE(ABORT, 'synthetic acquisition resolution failure');
+		END
+	`)
+	require.NoError(err)
+	summary := runFullSync(t, env)
+	existing, err := env.Store.MessageExistsBatch(source.ID, []string{"recovered"})
+	require.NoError(err)
+	assert.Empty(existing, "a recovered message must not commit without its resolution")
+	assert.Equal(int64(1), summary.Errors)
+	_, err = env.Store.DB().ExecContext(t.Context(), `DROP TRIGGER fail_acquisition_resolution`)
+	require.NoError(err)
+
+	summary = runFullSync(t, env)
+	assert.Zero(summary.Errors)
+	existing, err = env.Store.MessageExistsBatch(source.ID, []string{"keep", "recovered"})
+	require.NoError(err)
+	assert.Len(existing, 2)
+	var resolutions int
+	require.NoError(env.Store.DB().QueryRowContext(t.Context(), `
+		SELECT COUNT(*) FROM sync_run_items
+		WHERE source_message_id = 'recovered' AND status = 'resolved'
+	`).Scan(&resolutions))
+	assert.Equal(1, resolutions)
+}
+
+func TestIncrementalSyncDoesNotReacquirePurgedMessage(t *testing.T) {
+	for _, recovery := range []string{"full", "history", "replay"} {
+		t.Run(recovery, func(t *testing.T) {
+			t.Parallel()
+			require := require.New(t)
+			assert := assert.New(t)
+			env := newTestEnv(t)
+			const messageID = "recovered-purged"
+			if recovery == "full" {
+				seedMessages(env, 1, 1000, messageID)
+				env.Mock.GetMessageError[messageID] = errors.New("temporary fetch failure")
+				summary := runFullSync(t, env)
+				require.Equal(int64(1), summary.Errors)
+				delete(env.Mock.GetMessageError, messageID)
+			} else {
+				seedReplaySource(t, env, messageID)
+			}
+
+			if recovery == "history" {
+				// Replay still fails; the later History fetch succeeds.
+				env.Mock.GetMessageError[messageID] = errors.New("temporary fetch failure")
+				api := &replayControlAPI{MockAPI: env.Mock}
+				api.beforeResults = func() { delete(env.Mock.GetMessageError, messageID) }
+				env.Syncer = New(api, env.Store, nil)
+				env.SetHistory(1002, historyAdded(messageID))
+			}
+			var summary *gmail.SyncSummary
+			if recovery == "full" {
+				summary = runFullSync(t, env)
+			} else {
+				summary = runIncrementalSync(t, env)
+			}
+			require.Equal(int64(1), summary.MessagesAdded)
+			if recovery == "history" {
+				require.Equal(int64(1), summary.Errors, "replay failed before History recovered the message")
+			} else {
+				require.Zero(summary.Errors)
+			}
+			source, err := env.Store.GetSourceByIdentifier(t.Context(), testEmail)
+			require.NoError(err)
+			_, err = env.Store.DB().ExecContext(t.Context(), `UPDATE messages SET deleted_at = CURRENT_TIMESTAMP, delete_batch_id = ? WHERE source_id = ? AND source_message_id = ?`, "purge-recovered", source.ID, messageID)
+			require.NoError(err)
+			deleted, err := env.Store.DeleteDedupedBatch("purge-recovered")
+			require.NoError(err)
+			require.Equal(int64(1), deleted)
+			existing, err := env.Store.MessageExistsBatch(source.ID, []string{messageID})
+			require.NoError(err)
+			require.Empty(existing)
+
+			env.SetHistory(env.Mock.Profile.HistoryID)
+			env.Mock.GetMessageCalls = nil
+			summary = runIncrementalSync(t, env)
+			assert.Equal(int64(0), summary.Errors)
+			assert.Equal(int64(0), summary.MessagesAdded)
+			assert.Empty(env.Mock.GetMessageCalls)
+		})
+	}
+}
+
+// recoveringFetchAPI fails a message's first raw fetch, then serves it.
+type recoveringFetchAPI struct {
+	*gmail.MockAPI
+}
+
+func (a *recoveringFetchAPI) GetMessageRaw(ctx context.Context, id string) (*gmail.RawMessage, error) {
+	raw, err := a.MockAPI.GetMessageRaw(ctx, id)
+	delete(a.GetMessageError, id)
+	return raw, err
+}
+
+func TestIncrementalSyncSameRunRecoveryThenPurge(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	env := newTestEnv(t)
+	source := env.CreateSourceWithHistory(t, "1000")
+	const id = "same-run-purged"
+	env.Mock.AddMessage(id, testMIME(), []string{"INBOX"})
+	env.Mock.GetMessageError[id] = errors.New("temporary fetch failure")
+	env.Syncer = New(&recoveringFetchAPI{env.Mock}, env.Store, nil)
+	event := gmail.HistoryRecord{LabelsAdded: []gmail.HistoryLabelChange{{Message: gmail.MessageID{ID: id, ThreadID: "thread"}, LabelIDs: []string{"INBOX"}}}}
+	env.SetHistory(1001, event, event)
+	summary := runIncrementalSync(t, env)
+	require.Equal(int64(1), summary.Errors)
+	require.Equal(int64(1), summary.MessagesAdded)
+	assert.Equal([]string{id, id}, env.Mock.GetMessageCalls)
+	items, err := env.Store.ListSyncRunItems(summary.SyncRunID, store.SyncRunItemStatusResolved, 10)
+	require.NoError(err)
+	assert.Len(items, 1)
+	_, err = env.Store.DB().ExecContext(t.Context(), `UPDATE messages SET deleted_at = CURRENT_TIMESTAMP, delete_batch_id = ? WHERE source_id = ?`, "same-run", source.ID)
+	require.NoError(err)
+	deleted, err := env.Store.DeleteDedupedBatch("same-run")
+	require.NoError(err)
+	require.Equal(int64(1), deleted)
+	env.SetHistory(1001)
+	env.Mock.GetMessageCalls = nil
+	summary = runIncrementalSync(t, env)
+	assert.Zero(summary.MessagesAdded)
+	assert.Empty(env.Mock.GetMessageCalls)
+}
+
+// failingRefetchAPI serves a message's first raw fetch, then fails later ones.
+type failingRefetchAPI struct {
+	*gmail.MockAPI
+}
+
+func (a *failingRefetchAPI) GetMessageRaw(ctx context.Context, id string) (*gmail.RawMessage, error) {
+	raw, err := a.MockAPI.GetMessageRaw(ctx, id)
+	a.GetMessageError[id] = errors.New("temporary fetch failure")
+	return raw, err
+}
+
+func TestIncrementalSyncRepeatedLabelAddAfterIngestThenPurge(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	env := newTestEnv(t)
+	source := env.CreateSourceWithHistory(t, "1000")
+	const id = "label-added-twice"
+	env.Mock.AddMessage(id, testMIME(), []string{"INBOX"})
+	env.Syncer = New(&failingRefetchAPI{env.Mock}, env.Store, nil)
+	event := gmail.HistoryRecord{LabelsAdded: []gmail.HistoryLabelChange{{Message: gmail.MessageID{ID: id, ThreadID: "thread"}, LabelIDs: []string{"INBOX"}}}}
+	env.SetHistory(1001, event, event)
+	summary := runIncrementalSync(t, env)
+	require.Zero(summary.Errors)
+	require.Equal(int64(1), summary.MessagesAdded)
+	assert.Equal([]string{id}, env.Mock.GetMessageCalls)
+	_, err := env.Store.DB().ExecContext(t.Context(), `UPDATE messages SET deleted_at = CURRENT_TIMESTAMP, delete_batch_id = ? WHERE source_id = ?`, "label-twice", source.ID)
+	require.NoError(err)
+	deleted, err := env.Store.DeleteDedupedBatch("label-twice")
+	require.NoError(err)
+	require.Equal(int64(1), deleted)
+	env.SetHistory(1001)
+	env.Mock.GetMessageCalls = nil
+	summary = runIncrementalSync(t, env)
+	assert.Zero(summary.MessagesAdded)
+	assert.Empty(env.Mock.GetMessageCalls)
 }

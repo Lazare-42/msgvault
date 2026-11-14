@@ -1,10 +1,13 @@
 <script lang="ts">
+  import { createBrowserRequestID } from '../../api/request-id';
   import { createOrLinkMessageTask as generatedCreateOrLinkMessageTask } from '../../api/generated/api/api';
-  import { Button, Modal, SelectDropdown, TextInput } from '@kenn-io/kit-ui';
+  import { Disclosure, Button, SelectDropdown, TextInput } from '@kenn-io/kit-ui';
   import { untrack } from 'svelte';
   import type { APIClient } from '../../api/client';
   let {
     client,
+    pending = $bindable(false),
+    disabled = false,
     messageId,
     project,
     defaultTitle,
@@ -20,6 +23,8 @@
     onclose = () => undefined,
   }: {
     client: APIClient;
+    pending?: boolean;
+    disabled?: boolean;
     messageId: number;
     project: string;
     defaultTitle: string;
@@ -35,12 +40,11 @@
     onclose?: () => void;
   } = $props();
   let title = $state(untrack(() => defaultTitle));
-  let description = $state('');
+  let description = $state(untrack(() => `${location.origin}/messages/${messageId}`));
   let priority = $state('');
   let labels = $state('');
-  let pending = $state(false);
   let error = $state('');
-  let browserRequestID = globalThis.crypto.randomUUID();
+  let browserRequestID = createBrowserRequestID();
   let addedAt = $state(new Date().toISOString());
   let lastAttemptFingerprint = $state<string>();
   const priorityOptions = [
@@ -58,7 +62,7 @@
     lastAttemptFingerprint = undefined;
   });
   async function create(): Promise<void> {
-    if (!title.trim() || pending) return;
+    if (!title.trim() || pending || disabled) return;
     const payload = currentPayload();
     const fingerprint = JSON.stringify(payload);
     lastAttemptFingerprint = fingerprint;
@@ -85,7 +89,7 @@
     }
   }
   function rotateRetryIdentity(): void {
-    browserRequestID = globalThis.crypto.randomUUID();
+    browserRequestID = createBrowserRequestID();
     const now = new Date().toISOString();
     addedAt = now > addedAt ? now : new Date(Date.parse(addedAt) + 1).toISOString();
   }
@@ -114,17 +118,12 @@
       ? value.message
       : 'Unable to create task.';
   }
-  /** Every dismissal path (Cancel, Escape, backdrop, the × button) funnels
-   * through here: while the create request is in flight the dialog must stay
-   * visible until the outcome is known — hiding it would let the task be
-   * created (or fail) invisibly. */
   function requestClose(): void {
     if (pending) return;
     onclose();
   }
 </script>
 
-<Modal title="Create task" onclose={requestClose}>
   <form
     aria-busy={pending}
     onsubmit={(event) => {
@@ -154,8 +153,7 @@
         block
       /></label
     >
-    <details>
-      <summary>Metadata leaving the archive</summary>
+    <Disclosure variant="plain">{#snippet summary()}Metadata leaving the archive{/snippet}
       <dl>
         <div>
           <dt>Archive UID</dt>
@@ -198,28 +196,30 @@
           <dd>{addedAt}</dd>
         </div>
       </dl>
-      <p>Bodies and attachments are never sent.</p>
-    </details>
+    </Disclosure>
+    <p class="disclosure">Bodies and attachments are never sent.</p>
     {#if error}<p role="alert">{error}</p>{/if}
     <div class="actions">
       <Button surface="soft" label="Cancel" disabled={pending} onclick={requestClose} />
-      <Button type="submit" tone="info" surface="solid" label="Create task" disabled={pending || !title.trim()} />
+      <Button type="submit" tone="info" surface="solid" label="Create task" disabled={pending || disabled || !title.trim()} />
     </div>
   </form>
-</Modal>
 
 <style>
   form {
+    --field-text-size: 16px;
     display: grid;
-    gap: var(--space-4);
-    min-width: min(28rem, 80vw);
+    gap: var(--space-6);
+    min-width: 0;
   }
+  .disclosure { margin: 0; color: var(--text-secondary); font-size: 12px; }
   label {
     display: grid;
-    gap: var(--space-1);
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
+    gap: var(--space-2);
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
   }
+  label :global(.kit-text-input__control), label :global(.kit-select-dropdown__trigger) { font-size: 16px; }
   textarea {
     min-height: 6rem;
     resize: vertical;
@@ -229,13 +229,8 @@
     background: var(--bg-canvas);
     color: var(--text-primary);
   }
-  .project {
-    display: flex;
-    justify-content: space-between;
-    margin: 0;
-  }
-  .project span,
-  details {
+  .project { display: flex; justify-content: space-between; margin: 0; }
+  .project span, form :global(.kit-disclosure) {
     color: var(--text-muted);
     font-size: var(--font-size-xs);
   }
@@ -259,6 +254,6 @@
   .actions {
     display: flex;
     justify-content: flex-end;
-    gap: var(--space-2);
+    gap: var(--space-4);
   }
 </style>

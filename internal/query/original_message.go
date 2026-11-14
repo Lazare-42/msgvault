@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/sourcescope"
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -316,6 +317,7 @@ type ThreadPage struct {
 // ListThread lists the live messages of one conversation ordered by
 // sent_at (undated last), then ID. Source-deleted messages are included
 // because they remain archive data. HasRaw reports stored original MIME.
+// SQLite compares instants to the millisecond, with ties in message-ID order.
 func (e *SQLiteEngine) ListThread(ctx context.Context, q ThreadQuery) (*ThreadPage, error) {
 	anchors := 0
 	for _, set := range []bool{q.ID != 0, q.SourceMessageID != "", q.ThreadID != ""} {
@@ -367,7 +369,7 @@ func (e *SQLiteEngine) ListThread(ctx context.Context, q ThreadQuery) (*ThreadPa
 		       ) THEN 1 ELSE 0 END
 		FROM messages m
 		WHERE ` + where + `
-		ORDER BY CASE WHEN ` + e.dialect.DateOrderExpression("m.sent_at") + ` IS NULL THEN 1 ELSE 0 END, ` + e.dialect.DateOrderExpression("m.sent_at") + `, m.id`
+		ORDER BY ` + e.dialect.DateOrderExpression("m.sent_at") + ` NULLS LAST, m.id`
 	if !q.All {
 		statement += " LIMIT ? OFFSET ?"
 		args = append(args, limit, offset)
@@ -479,7 +481,7 @@ func (e *SQLiteEngine) fillThreadParticipants(ctx context.Context, messages []Th
 		SELECT message_id, recipient_type, address, display_name
 		FROM (
 			SELECT mr.message_id, mr.recipient_type,
-			       COALESCE(NULLIF(p.email_address, ''), NULLIF(p.phone_number, ''), '') AS address,
+			       COALESCE(NULLIF(`+identityindex.SenderAddressExpr("mr", "p")+`, ''), NULLIF(p.phone_number, ''), '') AS address,
 			       %[1]s AS display_name, mr.id AS recipient_id
 			FROM message_recipients mr
 			JOIN participants p ON p.id = mr.participant_id

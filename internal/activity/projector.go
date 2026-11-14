@@ -37,6 +37,7 @@ var (
 type projectorStore interface {
 	ActivityProjectionCursorContext(ctx context.Context, pass, target string) (int64, error)
 	SetActivityProjectionCursorContext(ctx context.Context, pass, target string, afterID int64) error
+	ExpandActivityConversationQueueContext(ctx context.Context, checkpoint func() error) (bool, error)
 	LoadQueuedActivityCandidatesContext(ctx context.Context, limit int) ([]store.ActivityCandidate, error)
 	ScanForActivityProjectionContext(ctx context.Context, afterID int64, limit int) ([]store.ActivityCandidate, error)
 	ScanAllActivityCandidatesContext(ctx context.Context, afterID int64, limit int) ([]store.ActivityCandidate, error)
@@ -519,7 +520,7 @@ func (p *Projector) reconcileRevisions(
 	directTransition store.ActivityDirectLimitTransition,
 	result *RunResult,
 ) error {
-	for range projectorPassRetries {
+	for attempt := 0; attempt < projectorPassRetries; attempt++ {
 		current, err := p.store.ContactRevisionsContext(ctx)
 		if err != nil {
 			return err
@@ -553,11 +554,13 @@ func (p *Projector) reconcileRevisions(
 			}
 			return err
 		}
-		token := fmt.Sprintf("%d/%d", target.IdentityRevision, target.AccountIdentityRevision)
-		afterID, err := p.store.ActivityProjectionCursorContext(ctx, "revisions", token)
+		// Keep committed progress across identity changes. Row revision stamps,
+		// the final scan from zero, and the revision CAS establish freshness.
+		afterID, err := p.store.ActivityProjectionCursorContext(ctx, "revisions", "")
 		if err != nil {
 			return err
 		}
+		resumed := afterID > 0
 		restart := false
 		for {
 			candidates, loadErr := p.store.ScanForActivityProjectionContext(
@@ -578,7 +581,7 @@ func (p *Projector) reconcileRevisions(
 				return err
 			}
 			afterID = candidates[len(candidates)-1].MessageID
-			if err := p.store.SetActivityProjectionCursorContext(ctx, "revisions", token, afterID); err != nil {
+			if err := p.store.SetActivityProjectionCursorContext(ctx, "revisions", "", afterID); err != nil {
 				return err
 			}
 		}
@@ -599,8 +602,13 @@ func (p *Projector) reconcileRevisions(
 			return err
 		}
 		if len(remaining) != 0 {
-			if err := p.store.SetActivityProjectionCursorContext(ctx, "revisions", token, 0); err != nil {
+			if err := p.store.SetActivityProjectionCursorContext(ctx, "revisions", "", 0); err != nil {
 				return err
+			}
+			// A resumed walk gets one wrap without spending an epoch retry.
+			// A walk starting at zero still consumes a retry if it stays stale.
+			if resumed {
+				attempt--
 			}
 			continue
 		}
@@ -695,12 +703,22 @@ func (p *Projector) drainQueue(
 	result *RunResult,
 ) error {
 	for {
+		expanded, err := p.store.ExpandActivityConversationQueueContext(ctx, func() error { return projectionCheckpoint(ctx) })
+		if err != nil {
+			return err
+		}
+		if expanded {
+			useProjectionBatch(ctx)
+		}
 		candidates, err := p.store.LoadQueuedActivityCandidatesContext(
 			ctx, p.batchSize)
 		if err != nil {
 			return err
 		}
 		if len(candidates) == 0 {
+			if expanded {
+				continue
+			}
 			return nil
 		}
 		if err := p.projectCandidates(

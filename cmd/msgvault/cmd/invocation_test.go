@@ -27,7 +27,10 @@ func testConfigValue() *config.Config { return config.NewDefaultConfig() }
 func testDiscardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 func testInvocationWithConfig(cfg *config.Config) *invocation {
-	return &invocation{cfg: cfg, logger: testDiscardLogger()}
+	state := newInvocation()
+	state.cfg = cfg
+	state.logger = testDiscardLogger()
+	return state
 }
 
 func testLoggerValue() *slog.Logger { return slog.New(slog.DiscardHandler) }
@@ -44,7 +47,7 @@ func TestInvocationBoundJobRun(t *testing.T) {
 	require := require.New(t)
 	state := newInvocation()
 	state.cfg = testConfigValue()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	job := scheduler.Job{
 		Run: invocationBoundJobRun(state, func(ctx context.Context) error {
@@ -81,9 +84,9 @@ func TestInvocationIsolation(t *testing.T) {
 	})
 
 	root.SetArgs([]string{"--home", explicitHome, "--no-log-file", "probe"})
-	require.NoError(executeRootContext(context.Background(), root))
+	require.NoError(executeRootContext(t.Context(), root))
 	root.SetArgs([]string{"probe"})
-	require.NoError(executeRootContext(context.Background(), root))
+	require.NoError(executeRootContext(t.Context(), root))
 
 	require.Len(homes, 2)
 	assert.Equal(explicitHome, homes[0])
@@ -119,9 +122,9 @@ func TestInvocationRepeatedExecution(t *testing.T) {
 	t.Cleanup(func() { root.RemoveCommand(probe) })
 
 	root.SetArgs([]string{"--home", explicitHome, "--no-log-file", "invocation-probe"})
-	require.NoError(executeRootContext(context.Background(), root))
+	require.NoError(executeRootContext(t.Context(), root))
 	root.SetArgs([]string{"invocation-probe"})
-	require.NoError(executeRootContext(context.Background(), root))
+	require.NoError(executeRootContext(t.Context(), root))
 
 	require.Len(seenHomes, 2)
 	assert.Equal(explicitHome, seenHomes[0])
@@ -169,7 +172,7 @@ func TestInvocationLogLifecycle(t *testing.T) {
 		root.SetArgs([]string{
 			"--home", home, "--log-file", logPath, "probe", test.mode,
 		})
-		err := executeRootContext(context.Background(), root)
+		err := executeRootContext(t.Context(), root)
 		if test.outcome == "ok" {
 			require.NoError(err)
 		} else {
@@ -187,7 +190,7 @@ func TestInvocationLogLifecycle(t *testing.T) {
 
 	skippedHome := t.TempDir()
 	root.SetArgs([]string{"--home", skippedHome, "version"})
-	require.NoError(executeRootContext(context.Background(), root))
+	require.NoError(executeRootContext(t.Context(), root))
 	assert.False(skippedConfig)
 	assert.False(skippedResult)
 	assert.NoDirExists(filepath.Join(skippedHome, "logs"))
@@ -196,7 +199,7 @@ func TestInvocationLogLifecycle(t *testing.T) {
 	badConfig := filepath.Join(t.TempDir(), "bad.toml")
 	require.NoError(os.WriteFile(badConfig, []byte("not = [valid"), 0o600))
 	root.SetArgs([]string{"--config", badConfig, "probe", "ok"})
-	require.Error(executeRootContext(context.Background(), root))
+	require.Error(executeRootContext(t.Context(), root))
 	inv := invocationFromContext(root.Context())
 	require.NotNil(inv)
 	assert.Nil(inv.logResult, "a failed load must not reuse a prior logging result")
@@ -207,7 +210,7 @@ func TestInvocationPanicCleanup(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	logPath := filepath.Join(t.TempDir(), "panic.log")
-	cmd := exec.Command(os.Args[0], "-test.run=^TestInvocationPanicHelper$") //nolint:gosec // test binary and fixed test selector.
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestInvocationPanicHelper$") //nolint:gosec // test binary and fixed test selector.
 	cmd.Env = append(os.Environ(),
 		"MSGVAULT_INVOCATION_PANIC_HELPER=1",
 		"MSGVAULT_INVOCATION_PANIC_LOG="+logPath,
@@ -237,7 +240,7 @@ func TestInvocationPanicHelper(t *testing.T) {
 		"--home", filepath.Dir(os.Getenv("MSGVAULT_INVOCATION_PANIC_LOG")),
 		"--log-file", os.Getenv("MSGVAULT_INVOCATION_PANIC_LOG"), "panic",
 	})
-	_ = executeRootContext(context.Background(), root)
+	_ = executeRootContext(t.Context(), root)
 	os.Exit(3)
 }
 
@@ -272,7 +275,7 @@ func TestInvocationUsageContract(t *testing.T) {
 		root.SetErr(&stderr)
 		root.AddCommand(command)
 		root.SetArgs(args)
-		err := executeRootContext(context.Background(), root)
+		err := executeRootContext(t.Context(), root)
 		return stderr.String(), err
 	}
 
@@ -337,7 +340,7 @@ func TestInvocationMCPStatusOptions(t *testing.T) {
 		var output bytes.Buffer
 		root.SetOut(&output)
 		root.SetArgs(args)
-		require.NoError(executeRootContext(context.Background(), root))
+		require.NoError(executeRootContext(t.Context(), root))
 		var endpoints []mcpdiscovery.Endpoint
 		require.NoError(json.Unmarshal(output.Bytes(), &endpoints))
 		require.Len(endpoints, 1)

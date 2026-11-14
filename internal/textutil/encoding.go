@@ -86,6 +86,14 @@ func SanitizeUTF8(s string) string {
 	return sb.String()
 }
 
+// ReplaceNUL replaces U+0000 with U+FFFD in display/search projections, so both
+// backends represent a character that PostgreSQL TEXT cannot store the same way.
+// It does not repair invalid UTF-8. Never apply this lossy conversion to identity
+// keys or original payload bytes.
+func ReplaceNUL(s string) string {
+	return strings.ReplaceAll(s, "\x00", "\ufffd")
+}
+
 // GetEncodingByName returns an encoding for the given IANA charset name.
 func GetEncodingByName(name string) encoding.Encoding {
 	switch name {
@@ -146,6 +154,22 @@ func PrefixRunes(s string, n int) string {
 		return s
 	}
 	return string(runes[:n])
+}
+
+// PrefixBytes returns the longest prefix of s that fits in maxBytes without
+// splitting a UTF-8 sequence, or s when it already fits.
+func PrefixBytes(s string, maxBytes int) string {
+	if len(s) <= maxBytes {
+		return s
+	}
+	if maxBytes <= 0 {
+		return ""
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(s[end]) {
+		end--
+	}
+	return s[:end]
 }
 
 // FirstLine returns the first line of a string, capped at 200 runes.

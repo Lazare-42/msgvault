@@ -12,13 +12,14 @@ import (
 	"slices"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gofrs/flock"
 	"github.com/spf13/cobra"
+
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/textutil"
 	apiclient "go.kenn.io/msgvault/pkg/client"
 	"go.kenn.io/msgvault/pkg/client/generated"
 )
@@ -84,11 +85,11 @@ func runStartupMigrationsForIngest(s *store.Store) error {
 	return nil
 }
 
-func runPostSourceCreateMigrationsForInvocation(s *store.Store, state *invocation) error {
+func runPostSourceCreateMigrationsForInvocation(ctx context.Context, s *store.Store, state *invocation) error {
 	if state == nil {
 		return errors.New("invocation state is required")
 	}
-	return runStartupMigrationsContext(context.Background(), s, state)
+	return runStartupMigrationsContext(ctx, s, state)
 }
 
 func invocationConfigLogger(state *invocation) (*config.Config, *slog.Logger) {
@@ -286,6 +287,7 @@ func openHTTPStoreWithStartupCacheIntent(
 	if err != nil {
 		return nil, HTTPStoreInfo{}, err
 	}
+	reportRetainedDaemonVersion(ctx, os.Stderr, rt)
 	return st, HTTPStoreInfo{
 		Kind:                     HTTPStoreLocalDaemon,
 		URL:                      url,
@@ -410,7 +412,7 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 	if err := os.MkdirAll(c.Data.DataDir, 0o700); err != nil {
 		return nil, localDaemonStartupInfo{}, fmt.Errorf("create data directory: %w", err)
 	}
-	if rt := findDaemonRuntime(c.Data.DataDir); rt != nil &&
+	if rt := findDaemonRuntime(ctx, c.Data.DataDir); rt != nil &&
 		!shouldUpgradeDaemonRuntimeWithPolicy(rt, Version, restartPolicy) {
 		if err := probeLocalDaemonAuth(ctx, rt, c); err != nil {
 			return nil, localDaemonStartupInfo{}, err
@@ -421,7 +423,7 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 	// No usable daemon was found. If a direct CLI writer owns the archive,
 	// fail fast with a clear message instead of spawning a daemon that cannot
 	// claim the held write-owner lock.
-	if err := daemonAutostartPreflight(c); err != nil {
+	if err := daemonAutostartPreflight(ctx, c); err != nil {
 		return nil, localDaemonStartupInfo{}, err
 	}
 
@@ -472,7 +474,7 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 	if !autoStart {
 		incompatibleGuidance = "restart or upgrade the supervised service"
 	}
-	prep, err := prepareBackgroundDaemonStart(c, restartPolicy, incompatibleGuidance, loggerFromContext(ctx))
+	prep, err := prepareBackgroundDaemonStart(ctx, c, restartPolicy, incompatibleGuidance, loggerFromContext(ctx))
 	if errors.Is(err, errIncompatibleDaemon) && configErr != nil && autoStart {
 		return nil, localDaemonStartupInfo{}, daemonConfigStartError(configErr)
 	}
@@ -498,6 +500,7 @@ func ensureLocalDaemonRuntimeWithStartupCacheIntent(
 		options = state.options
 	}
 	proc, err := startServeBackgroundProcessForRun(c, backgroundServeStartOptions{
+		Persistent:       prep.Persistent,
 		CacheBuildIntent: intent,
 		Invocation:       &options,
 	})
@@ -924,11 +927,7 @@ func truncateDaemonLogLine(line string) string {
 	if len(line) <= maxDaemonLogLineLen {
 		return line
 	}
-	cut := maxDaemonLogLineLen
-	for cut > 0 && !utf8.RuneStart(line[cut]) {
-		cut--
-	}
-	return line[:cut] + "…"
+	return textutil.PrefixBytes(line, maxDaemonLogLineLen) + "…"
 }
 
 // parseLogfmt is a tolerant parser for slog's text output: space
@@ -1183,7 +1182,7 @@ func waitForUsableBackgroundRuntimeOrLaunchLock(
 // is already returned by the loop-top probe; an incompatible or
 // upgrade-eligible one is stopped by prepareBackgroundDaemonStart).
 func daemonStartInProgress(ctx context.Context, dataDir string) (bool, error) {
-	records, err := listLiveDaemonRuntimeRecords(dataDir)
+	records, err := listLiveDaemonRuntimeRecordsContext(ctx, dataDir)
 	if err != nil {
 		return false, err
 	}

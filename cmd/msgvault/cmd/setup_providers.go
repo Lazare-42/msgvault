@@ -20,8 +20,8 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
+	"go.kenn.io/kit/embedlocal"
 	"go.kenn.io/msgvault/internal/config"
-	"go.kenn.io/msgvault/internal/documentindex"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/providercredentials"
 )
@@ -33,9 +33,10 @@ const (
 	planActionSkip    = "skip"
 	planActionOnboard = "onboard"
 
-	// Consent gates: one explicit answer per hosted provider.
+	// Consent gates: one explicit answer per hosted provider, plus a local
+	// switch that leaves semantic search down until a full rebuild.
+	gateLocal      = "local"
 	gateVoyage     = "voyage"
-	gateMistral    = "mistral"
 	gateOpenAI     = "openai"
 	gateOpenRouter = "openrouter"
 	gateVenice     = "venice"
@@ -48,12 +49,11 @@ const (
 
 // setupProvidersOptions are the command flags.
 type setupProvidersOptions struct {
+	localEmbeddings        bool
 	yes                    bool
 	dryRun                 bool
 	jsonOutput             bool
 	allowSensitive         bool
-	documentRetention      string
-	documentTraining       string
 	retentionPosture       string
 	trainingPosture        string
 	personRetentionPosture string
@@ -66,6 +66,7 @@ type setupProvidersOptions struct {
 
 // ollamaProbeResult is what a local Ollama server reports about itself.
 type ollamaProbeResult struct {
+	Catalog   bool
 	Reachable bool
 	Models    []string
 }
@@ -84,6 +85,8 @@ type setupProvidersDeps struct {
 	remoteConfigured  func() bool
 	isTerminal        func(*cobra.Command) bool
 	probeOllama       func(context.Context, string) ollamaProbeResult
+	localEndpoint     func(context.Context, embedlocal.Options) (string, error)
+	localInstall      func(context.Context, embedlocal.InstallOptions) (embedlocal.Installation, error)
 	consentState      func(context.Context, *config.Config) *setupConsentState
 	daemonAlive       func(context.Context, *config.Config) bool
 	personProvider    func() personProviderCommandDeps
@@ -146,6 +149,8 @@ func defaultSetupProvidersDeps(contexts ...context.Context) setupProvidersDeps {
 		remoteConfigured: func() bool { return false },
 		isTerminal:       commandStdinIsTerminal,
 		probeOllama:      probeOllamaServer,
+		localEndpoint:    embedlocal.Endpoint,
+		localInstall:     embedlocal.Install,
 		consentState:     readSetupConsentState,
 		daemonAlive: func(ctx context.Context, loaded *config.Config) bool {
 			return findAnyDaemonRuntimeContext(ctx, loaded.Data.DataDir) != nil
@@ -205,7 +210,7 @@ func probeOllamaServer(ctx context.Context, server string) ollamaProbeResult {
 	if err := json.UnmarshalRead(io.LimitReader(response.Body, ollamaProbeMaxBody), &payload); err != nil {
 		return ollamaProbeResult{Reachable: true}
 	}
-	result := ollamaProbeResult{Reachable: true}
+	result := ollamaProbeResult{Reachable: true, Catalog: payload.Models != nil}
 	for _, model := range payload.Models {
 		if name := strings.TrimSpace(model.Name); name != "" {
 			result.Models = append(result.Models, name)
@@ -227,10 +232,11 @@ func (r ollamaProbeResult) hasModel(name string) bool {
 // the local Ollama server offers, which probe manifests are already written,
 // and which vector backend the archive selects.
 type setupDetection struct {
+	localEmbeddings     bool
+	embeddingEndpoint   string
+	embeddingError      error
 	configKeys          toml.MetaData
 	voyageKey           bool
-	mistralKey          bool
-	mistralKeyEnv       string
 	openAIKey           bool
 	ollama              ollamaProbeResult
 	ollamaEndpoint      string
@@ -239,19 +245,17 @@ type setupDetection struct {
 	voyageManifestError string
 	visualKey           bool
 	visualUnavailable   string
-	mistralManifest     string
 	backend             string
 	backendUnavailable  string
 }
 
-func detectSetupProviders(ctx context.Context, loaded *config.Config, deps setupProvidersDeps) setupDetection {
+func detectSetupProviders(ctx context.Context, loaded *config.Config, deps setupProvidersDeps, options setupProvidersOptions) setupDetection {
 	env := setupEnvironment{lookupEnv: deps.lookupEnv, fileExists: deps.fileExists}
 	detection := setupDetection{
-		voyageKey:     env.hasEnv(setupVoyageKeyEnv),
-		mistralKeyEnv: loaded.Attachments.Documents.APIKeyEnv,
-		openAIKey:     env.hasEnv(setupOpenAIKeyEnv),
+		voyageKey: env.hasEnv(setupVoyageKeyEnv),
+		openAIKey: env.hasEnv(setupOpenAIKeyEnv),
 	}
-	detection.mistralKey = env.hasEnv(detection.mistralKeyEnv)
+	detection.localEmbeddings = options.localEmbeddings
 	detection.backend, detection.backendUnavailable = setupVectorBackend(loaded)
 	// A disabled lane retains operator settings. Validate those settings and
 	// resolve its own credential before proposing to enable it; the standard
@@ -278,19 +282,28 @@ func detectSetupProviders(ctx context.Context, loaded *config.Config, deps setup
 	} else {
 		detection.voyageManifest = setupVoyageManifestPath(loaded)
 	}
-	if path := setupMistralManifestPath(loaded); env.exists(path) {
-		detection.mistralManifest = path
-	}
 	// The local server is consulted only when nothing hosted is available
 	// for the lane it would fill, so a key holder never waits on a probe.
 	textUnconfigured := !loaded.Vector.Enabled && loaded.Vector.Embeddings.Endpoint == ""
 	needsLocalText := textUnconfigured && !detection.voyageKey && !detection.openAIKey
 	needsLocalInference := !loaded.People.Sweep.Enabled && !detection.openAIKey
+	skipOllama := detection.localEmbeddings
 	if (needsLocalText || needsLocalInference) && deps.probeOllama != nil {
 		server := strings.TrimRight(strings.TrimSpace(loaded.Chat.Server), "/")
 		detection.ollama = deps.probeOllama(ctx, server)
 		detection.ollamaEndpoint = server + "/v1"
 		detection.ollamaLoopback = embeddingProviderName(server) == "local"
+		skipOllama = skipOllama || server == "http://localhost:11434" || server == "http://127.0.0.1:11434"
+	}
+	if needsLocalText && !detection.localEmbeddings && detection.ollamaLoopback && detection.ollama.Reachable && detection.ollama.hasModel(setupOllamaTextModel) {
+		detection.embeddingEndpoint = detection.ollamaEndpoint
+	} else if detection.localEmbeddings || needsLocalText {
+		dir, err := localEmbeddingsDir()
+		if err != nil {
+			detection.embeddingError = fmt.Errorf("local embedding directory: %w", err)
+		} else {
+			detection.embeddingEndpoint, detection.embeddingError = deps.localEndpoint(ctx, embedlocal.Options{DataDir: dir, SkipOllama: skipOllama})
+		}
 	}
 	return detection
 }
@@ -305,6 +318,7 @@ type setupLanePlan struct {
 	Model    string `json:"model,omitempty"`
 	Reason   string `json:"reason"`
 	Gate     string `json:"consent_gate,omitempty"`
+	local    bool
 	edits    []config.TableEdit
 	next     []string
 }
@@ -339,7 +353,7 @@ func (p *setupProvidersPlan) gates() []string {
 		}
 	}
 	ordered := []string{}
-	for _, gate := range []string{gateVoyage, gateMistral, gateOpenAI, gateOpenRouter, gateVenice} {
+	for _, gate := range []string{gateLocal, gateVoyage, gateOpenAI, gateOpenRouter, gateVenice} {
 		if seen[gate] {
 			ordered = append(ordered, gate)
 		}
@@ -381,10 +395,8 @@ func (p *setupProvidersPlan) refreshDependencies(loaded *config.Config, detectio
 		switch lane.Lane {
 		case lanePersonSearch:
 			p.Lanes[i] = planPersonSearch(loaded, p, options)
-		case laneDocumentVectors:
-			p.Lanes[i] = planDocumentVectors(loaded, p)
 		case lanePeopleInference:
-			p.Lanes[i], p.inference = planPeopleInference(loaded, detection, p, options, now)
+			p.Lanes[i], p.inference = planPeopleInference(loaded, detection, options, now)
 		}
 	}
 }
@@ -428,12 +440,6 @@ func validateSetupProvidersOptions(options setupProvidersOptions) error {
 			return errors.New("--api-key-stdin and --credential-env are mutually exclusive")
 		}
 	}
-	if options.documentRetention != documentindex.RetentionStandard && options.documentRetention != documentindex.RetentionZDR {
-		return fmt.Errorf("--document-retention must be %q or %q", documentindex.RetentionStandard, documentindex.RetentionZDR)
-	}
-	if options.documentTraining != documentindex.TrainingDefaultOptOut && options.documentTraining != documentindex.TrainingOptedOut {
-		return fmt.Errorf("--document-training must be %q or %q", documentindex.TrainingDefaultOptOut, documentindex.TrainingOptedOut)
-	}
 	for name, value := range map[string]string{
 		"--retention-posture": options.retentionPosture, "--training-posture": options.trainingPosture,
 	} {
@@ -449,17 +455,13 @@ func validateSetupProvidersOptions(options setupProvidersOptions) error {
 // model even when a different key appears, because switching the embedding
 // policy invalidates the index and is the operator's call.
 func planSetupProviders(loaded *config.Config, detection setupDetection, options setupProvidersOptions, now time.Time) setupProvidersPlan {
-	// Later lanes read the plan so far: people search and document vectors
-	// depend on the text lane, and the sweep's evidence sources depend on the
-	// document lane, so the lanes are appended in dependency order.
+	// People search depends on the text lane, so plan it next.
 	plan := setupProvidersPlan{Lanes: []setupLanePlan{planTextSearch(loaded, detection)}}
 	person := planPersonSearch(loaded, &plan, options)
 	visual := planVisualSearch(loaded, detection)
-	documents := planDocuments(loaded, detection, options)
-	plan.Lanes = append(plan.Lanes, person, visual, documents)
-	vectors := planDocumentVectors(loaded, &plan)
-	inferenceLane, inference := planPeopleInference(loaded, detection, &plan, options, now)
-	plan.Lanes = append(plan.Lanes, vectors, inferenceLane)
+	plan.Lanes = append(plan.Lanes, person, visual)
+	inferenceLane, inference := planPeopleInference(loaded, detection, options, now)
+	plan.Lanes = append(plan.Lanes, inferenceLane)
 	plan.inference = inference
 	return plan
 }
@@ -502,16 +504,20 @@ func setupScheduleEdits(keys toml.MetaData, lane string) []config.TableEdit {
 }
 
 func planTextSearch(loaded *config.Config, detection setupDetection) setupLanePlan {
-	lane := setupLanePlan{Lane: laneTextSearch, Label: "Text search"}
+	lane := setupLanePlan{Lane: laneTextSearch, Label: "Search by meaning"}
 	embeddings := loaded.Vector.Embeddings
 	switch {
-	case loaded.Vector.Enabled:
+	case loaded.Vector.Enabled && !detection.localEmbeddings:
 		lane.Action = planActionKeep
-		lane.Provider = embeddingProviderName(embeddings.Endpoint)
+		lane.Provider = textEmbeddingProviderName(embeddings)
 		lane.Model = embeddings.Model
 		lane.Reason = "already configured; switching the embedding policy requires `msgvault embeddings build --full-rebuild`"
+		if !embeddings.LocalOnly && embeddings.LocalCompatible() && embeddingProviderName(embeddings.Endpoint) == "local" {
+			lane.Reason = "switch to the shared local server with `msgvault setup providers --local-embeddings`; a matching Nomic recipe keeps the message index"
+			lane.next = []string{"msgvault setup providers --local-embeddings"}
+		}
 		return lane
-	case embeddings.Endpoint != "" || embeddings.Model != "":
+	case !detection.localEmbeddings && (embeddings.LocalOnly || embeddings.Endpoint != "" || embeddings.Model != ""):
 		lane.Action = planActionSkip
 		lane.Reason = "configured but disabled; set [vector] enabled = true to turn it on"
 		return lane
@@ -522,7 +528,7 @@ func planTextSearch(loaded *config.Config, detection setupDetection) setupLanePl
 	}
 	vectorEdit := config.TableEdit{Path: []string{tomlTableVector}, Values: map[string]any{"enabled": true, "backend": detection.backend}}
 	switch {
-	case detection.voyageKey:
+	case detection.voyageKey && !detection.localEmbeddings:
 		lane.Action, lane.Provider, lane.Model, lane.Gate = planActionEnable, "voyage", setupVoyageTextModel, gateVoyage
 		lane.Reason = "contextual embeddings: chats embed as conversation windows, meetings as turn-aware chunks, email on the same generation"
 		lane.edits = append([]config.TableEdit{vectorEdit, {
@@ -532,7 +538,7 @@ func planTextSearch(loaded *config.Config, detection setupDetection) setupLanePl
 				"api_key_env": setupVoyageKeyEnv, "model": setupVoyageTextModel, "dimension": setupVoyageTextDim,
 			},
 		}}, setupScheduleEdits(detection.configKeys, "embed")...)
-	case detection.openAIKey:
+	case detection.openAIKey && !detection.localEmbeddings:
 		lane.Action, lane.Provider, lane.Model, lane.Gate = planActionEnable, "openai", setupOpenAITextModel, gateOpenAI
 		lane.Reason = "per-message vectors; no conversation-window context and no visual lane, both are Voyage-only"
 		lane.edits = append([]config.TableEdit{vectorEdit, {
@@ -542,36 +548,44 @@ func planTextSearch(loaded *config.Config, detection setupDetection) setupLanePl
 				"api_key_env": setupOpenAIKeyEnv, "model": setupOpenAITextModel, "dimension": setupOpenAITextDim,
 			},
 		}}, setupScheduleEdits(detection.configKeys, "embed")...)
-	case detection.ollama.Reachable && !detection.ollamaLoopback:
-		// A reachable server that is not on this machine would receive
-		// message text without a credential or a disclosure; only the operator
-		// may configure that, explicitly, in [vector.embeddings].
-		lane.Action = planActionSkip
-		lane.Reason = "Ollama at " + detection.ollamaEndpoint + " is not loopback; setup only selects a local server, configure [vector.embeddings] explicitly to send text off this machine"
-		return lane
-	case detection.ollama.Reachable && detection.ollama.hasModel(setupOllamaTextModel):
-		lane.Action, lane.Provider, lane.Model = planActionEnable, "local", setupOllamaTextModel
-		lane.Reason = "local Ollama embeddings; message text stays on this machine"
-		lane.edits = append([]config.TableEdit{vectorEdit, {
-			Path: []string{tomlTableVector, "embeddings"},
-			Values: map[string]any{
-				"api_format": "openai", "endpoint": detection.ollamaEndpoint,
-				"api_key_env": "",
-				"model":       setupOllamaTextModel, "dimension": setupOllamaTextDim,
-				"document_prefix": setupOllamaDocPrefix, "query_prefix": setupOllamaQueryPrefix,
-				"max_input_chars": setupOllamaMaxInput,
-			},
-		}}, setupScheduleEdits(detection.configKeys, "embed")...)
-	case detection.ollama.Reachable:
-		lane.Action = planActionSkip
-		lane.Reason = "Ollama is reachable but has no " + setupOllamaTextModel + "; run `ollama pull " + setupOllamaTextModel + "` or set " + setupVoyageKeyEnv
-		return lane
 	default:
-		lane.Action = planActionSkip
-		lane.Reason = "no embedding provider: set " + setupVoyageKeyEnv + " (recommended) or " + setupOpenAIKeyEnv + ", or run Ollama with " + setupOllamaTextModel
-		return lane
+		if detection.embeddingError != nil && !errors.Is(detection.embeddingError, embedlocal.ErrNotFound) {
+			lane.Action, lane.Reason = planActionPending, detection.embeddingError.Error()
+			return lane
+		}
+		localOnly := detection.localEmbeddings || (detection.embeddingEndpoint != detection.ollamaEndpoint && detection.embeddingEndpoint != "http://127.0.0.1:11434/v1")
+		lane.local = localOnly
+		endpoint := detection.embeddingEndpoint
+		if localOnly {
+			endpoint = ""
+		}
+		lane.Action, lane.Provider, lane.Model = planActionEnable, "local", setupOllamaTextModel
+		lane.Reason = "local embeddings; message text stays on this machine"
+		if loaded.Vector.Enabled {
+			if embeddings.LocalCompatible() {
+				lane.Reason += "; keeps the message index when its Nomic recipe matches"
+			} else {
+				lane.Reason, lane.Gate = lane.Reason+"; different model: run `msgvault embeddings build --full-rebuild --yes`", gateLocal
+			}
+		}
+		values := map[string]any{
+			"api_format": "openai", "local_only": localOnly, "endpoint": endpoint, "api_key_env": "",
+			"model": setupOllamaTextModel, "dimension": setupOllamaTextDim,
+			"document_prefix": setupOllamaDocPrefix, "query_prefix": setupOllamaQueryPrefix,
+			"max_input_chars": setupOllamaMaxInput,
+		}
+		if embeddings.LocalCompatible() {
+			lane.Model, values["model"] = embeddings.Model, embeddings.Model
+			values["document_prefix"], values["query_prefix"] = embeddings.DocumentPrefix, embeddings.QueryPrefix
+			values["max_input_chars"] = embeddings.MaxInputChars
+		}
+		lane.edits = append([]config.TableEdit{vectorEdit, {Path: []string{tomlTableVector, "embeddings"}, Values: values}}, setupScheduleEdits(detection.configKeys, "embed")...)
 	}
-	lane.next = []string{"msgvault embeddings build --yes"}
+	build := "msgvault embeddings build --full-rebuild --yes"
+	if loaded.Vector.Enabled && embeddings.LocalCompatible() && embeddings.Model == lane.Model {
+		build = "msgvault embeddings build --yes"
+	}
+	lane.next = append([]string{build}, lane.next...)
 	return lane
 }
 
@@ -583,14 +597,14 @@ func planPersonSearch(loaded *config.Config, plan *setupProvidersPlan, options s
 		lane.Reason = "already enabled"
 	case !plan.laneOn(laneTextSearch):
 		lane.Action = planActionSkip
-		lane.Reason = "requires the text-search lane"
+		lane.Reason = "requires search by meaning"
 	case textLaneProvider(plan) == "custom":
 		lane.Action = planActionSkip
 		lane.Reason = "custom hosted provider: configure [vector.people] and its postures explicitly, then run `msgvault person provider consent --semantic-embeddings --yes`"
 	default:
 		lane.Action = planActionEnable
 		lane.Gate = textLaneGate(plan)
-		lane.Reason = "one curated, non-sensitive attribute document per person rides the text-search generation"
+		lane.Reason = "one curated, non-sensitive attribute document per person is embedded for search by meaning"
 		lane.edits = []config.TableEdit{{
 			Path: []string{tomlTableVector, "people"},
 			Values: map[string]any{
@@ -646,91 +660,9 @@ func planVisualSearch(loaded *config.Config, detection setupDetection) setupLane
 	return lane
 }
 
-func planDocuments(loaded *config.Config, detection setupDetection, options setupProvidersOptions) setupLanePlan {
-	documents := loaded.Attachments.Documents
-	lane := setupLanePlan{Lane: laneDocuments, Label: "Document attachments", Provider: documents.Provider, Model: documents.Model}
-	if documents.Provider == documentindex.ProviderDocling {
-		lane.Reason = "operator-controlled endpoint " + documents.Endpoint
-		if documents.Enabled {
-			lane.Action = planActionKeep
-			lane.Reason += "; already enabled"
-		} else {
-			lane.Action = planActionSkip
-			lane.Reason += "; set [attachments.documents] enabled = true, then record Docling consent"
-		}
-		return lane
-	}
-	manifest := setupMistralManifestPath(loaded)
-	switch {
-	case documents.Enabled && documents.RetentionPosture != documentindex.RetentionUnknown && documents.TrainingPosture != documentindex.TrainingUnknown:
-		lane.Action = planActionKeep
-		lane.Reason = "already enabled"
-	case !detection.mistralKey:
-		lane.Action = planActionSkip
-		lane.Provider, lane.Model = "", ""
-		lane.Reason = "needs " + detection.mistralKeyEnv
-	default:
-		lane.Action, lane.Gate = planActionEnable, gateMistral
-		lane.Reason = fmt.Sprintf("EU endpoint, %s; recorded postures retention=%s, training=%s (override with --document-retention/--document-training)",
-			documents.Model, options.documentRetention, options.documentTraining)
-		lane.edits = []config.TableEdit{{
-			Path: []string{"attachments", "documents"},
-			Values: map[string]any{
-				"enabled": true, "retention_posture": options.documentRetention, "training_posture": options.documentTraining,
-			},
-		}}
-		if detection.mistralManifest != "" {
-			lane.next = []string{
-				"msgvault documents consent-mistral --capabilities " + manifest + " --yes",
-				"msgvault documents build --capabilities " + manifest + " --yes",
-			}
-		} else {
-			lane.next = []string{
-				"msgvault documents probe-mistral --fixtures <private-fixture-dir> > " + manifest,
-				"msgvault documents consent-mistral --capabilities " + manifest + " --yes",
-				"msgvault documents build --capabilities " + manifest + " --yes",
-			}
-		}
-	}
-	return lane
-}
-
-func planDocumentVectors(loaded *config.Config, plan *setupProvidersPlan) setupLanePlan {
-	lane := setupLanePlan{Lane: laneDocumentVectors, Label: "Document semantic search"}
-	documents := loaded.Attachments.Documents
-	switch {
-	case documents.Enabled && documents.Index.Embeddings.Enabled:
-		lane.Action = planActionKeep
-		lane.Reason = "already enabled"
-	case !plan.laneOn(laneDocuments):
-		lane.Action = planActionSkip
-		lane.Reason = "requires the document lane"
-	case !plan.laneOn(laneTextSearch):
-		lane.Action = planActionSkip
-		lane.Reason = "requires the text-search lane"
-	case textLaneProvider(plan) == "custom":
-		lane.Action = planActionSkip
-		lane.Reason = "custom hosted provider: configure [attachments.documents.index.embeddings] explicitly and consent separately to document and query text"
-	default:
-		lane.Action = planActionEnable
-		lane.Gate = textLaneGate(plan)
-		lane.Reason = "document chunks and search query text are sent to the text-search provider after separate document and query consents"
-		lane.edits = []config.TableEdit{{
-			Path: []string{"attachments", "documents", "index", "embeddings"}, Values: map[string]any{"enabled": true},
-		}}
-		lane.next = []string{
-			"msgvault documents vectors consent --yes",
-			"msgvault documents vectors consent --purpose queries --yes",
-			"msgvault documents vectors build",
-		}
-	}
-	return lane
-}
-
 func planPeopleInference(
 	loaded *config.Config,
 	detection setupDetection,
-	plan *setupProvidersPlan,
 	options setupProvidersOptions,
 	now time.Time,
 ) (setupLanePlan, *setupInferencePlan) {
@@ -751,9 +683,6 @@ func planPeopleInference(
 		return lane, nil
 	}
 	sources := []string{string(peoplesweep.SourceConversationText), string(peoplesweep.SourceMeetingText)}
-	if plan.laneOn(laneDocuments) {
-		sources = append(sources, string(peoplesweep.SourceDocumentText))
-	}
 	since := time.Date(now.Year()-1, time.January, 1, 0, 0, 0, 0, time.UTC).Format(time.DateOnly)
 	base := personProviderAddOptions{
 		custom: true, protocol: string(peoplesweep.ProtocolOpenAIChat),
@@ -827,7 +756,7 @@ func planPeopleInference(
 // gateDisclosure states plainly what each hosted provider receives once the
 // operator answers yes.
 func gateDisclosure(gate string, plan *setupProvidersPlan) string {
-	var lines []string
+	lines := localSwitchDisclosure(gate)
 	switch gate {
 	case gateVoyage:
 		lines = append(lines, "Voyage AI ("+setupVoyageEndpoint+") receives:")
@@ -840,15 +769,6 @@ func gateDisclosure(gate string, plan *setupProvidersPlan) string {
 		if plan.laneOn(laneVisualSearch) {
 			lines = append(lines, "  - eligible image and video attachment bytes with bounded message context, after `msgvault multimodal build --yes`")
 		}
-		if plan.laneOn(laneDocumentVectors) && textLaneProvider(plan) == "voyage" {
-			lines = append(lines, "  - extracted document text, after `msgvault documents vectors consent --yes`",
-				"  - document search query text, after `msgvault documents vectors consent --purpose queries --yes`")
-		}
-	case gateMistral:
-		lines = append(lines,
-			"Mistral (EU region, "+documentindex.ModelMistralOCR+") receives:",
-			"  - complete original bytes of standalone document attachments, only after the probe manifest and `msgvault documents consent-mistral --yes`",
-			"  - postures recorded now: retention="+planValue(plan, laneDocuments, "retention_posture")+", training="+planValue(plan, laneDocuments, "training_posture"))
 	case gateOpenAI:
 		lines = append(lines, "OpenAI ("+setupOpenAIEndpoint+") receives:")
 		if plan.laneOn(laneTextSearch) && textLaneProvider(plan) == "openai" {
@@ -856,10 +776,6 @@ func gateDisclosure(gate string, plan *setupProvidersPlan) string {
 		}
 		if plan.laneOn(lanePersonSearch) && textLaneProvider(plan) == "openai" {
 			lines = append(lines, "  - one curated, non-sensitive attribute document per person")
-		}
-		if plan.laneOn(laneDocumentVectors) && textLaneProvider(plan) == "openai" {
-			lines = append(lines, "  - extracted document text, after `msgvault documents vectors consent --yes`",
-				"  - document search query text, after `msgvault documents vectors consent --purpose queries --yes`")
 		}
 		if plan.inference != nil && plan.inference.gate == gateOpenAI {
 			choice := plan.inference.options
@@ -890,24 +806,18 @@ func gateDisclosure(gate string, plan *setupProvidersPlan) string {
 	return strings.Join(lines, "\n")
 }
 
+// localSwitchDisclosure states what a different-model local switch costs.
+func localSwitchDisclosure(gate string) []string {
+	if gate != gateLocal {
+		return nil
+	}
+	return []string{"Semantic search stays unavailable until `msgvault embeddings build --full-rebuild --yes` finishes."}
+}
+
 func textLaneProvider(plan *setupProvidersPlan) string {
 	for _, item := range plan.Lanes {
 		if item.Lane == laneTextSearch {
 			return item.Provider
-		}
-	}
-	return ""
-}
-
-func planValue(plan *setupProvidersPlan, lane, key string) string {
-	for _, item := range plan.Lanes {
-		if item.Lane != lane {
-			continue
-		}
-		for _, edit := range item.edits {
-			if value, ok := edit.Values[key]; ok {
-				return fmt.Sprint(value)
-			}
 		}
 	}
 	return ""
@@ -938,15 +848,13 @@ func newSetupProvidersCommand(deps setupProvidersDeps) *cobra.Command {
 		Short: "Configure retrieval and people inference providers",
 		Long: `Read the environment and configure every lane that is still unset:
 
-  ` + setupVoyageKeyEnv + `   text search with Voyage contextual embeddings (conversation
+  ` + setupVoyageKeyEnv + `   search by meaning with Voyage contextual embeddings (conversation
                    windows for chats, turn-aware chunks for meetings), semantic
                    people search, and the visual attachment lane once its probe
                    manifest exists
-  ` + setupOpenAIKeyEnv + `   text search on the OpenAI-compatible path when no Voyage key
+  ` + setupOpenAIKeyEnv + `   search by meaning on the OpenAI-compatible path when no Voyage key
                    is present
-  MISTRAL_API_KEY  document attachment extraction, plus document vectors when a
-                   text lane is on
-  (no keys)        a local Ollama server at [chat].server when it is reachable
+  (no keys)        Ollama with nomic-embed-text, or the shared local embedding server
 
 Choose a hosted people inference provider with --provider openai, openrouter,
 or venice. Supply --model, a credential source, retention and training
@@ -960,7 +868,7 @@ flow.
 Hosted lanes require confirmation. Setup prints the planned changes and asks
 before writing them. Configured lanes keep their existing settings. Probe
 manifests are expected at
-<home>/` + setupVoyageManifestName + ` and <home>/` + setupMistralManifestName + `.
+<home>/` + setupVoyageManifestName + `.
 
 The people sweep can send archive excerpts and infer personal attributes.
 --allow-sensitive controls whether sensitive excerpts may be included.
@@ -974,15 +882,12 @@ The people sweep can send archive excerpts and infer personal attributes.
 		},
 	}
 	flags := command.Flags()
+	flags.BoolVar(&options.localEmbeddings, "local-embeddings", false, "Use the shared local embedding server for search by meaning")
 	flags.BoolVar(&options.yes, "yes", false, "Accept every provider disclosure without prompting")
 	flags.BoolVar(&options.dryRun, "dry-run", false, "Print the plan and the current lane report without writing anything")
 	flags.BoolVar(&options.jsonOutput, flagJSON, false, "Output structured JSON")
 	flags.BoolVar(&options.allowSensitive, "allow-sensitive", false,
 		"Allow the people sweep to send sensitive archive excerpts to its inference provider and infer sensitive personal attributes")
-	flags.StringVar(&options.documentRetention, "document-retention", documentindex.RetentionStandard,
-		"Mistral retention posture to record: standard or zdr")
-	flags.StringVar(&options.documentTraining, "document-training", documentindex.TrainingDefaultOptOut,
-		"Mistral training posture to record: default-opt-out or opted-out")
 	flags.StringVar(&options.retentionPosture, "retention-posture", setupPostureDeclared,
 		"Retention assertion recorded for embedding and inference providers")
 	flags.StringVar(&options.trainingPosture, "training-posture", setupPostureDeclared,
@@ -1026,7 +931,7 @@ func runSetupProviders(command *cobra.Command, deps setupProvidersDeps, options 
 	if options.providerID != "" && loaded.People.Sweep.Enabled {
 		return errors.New("people sweep is already enabled; use person provider add and person provider use to change providers")
 	}
-	// Read saved assertions before config defaults turn an absent document
+	// Read saved assertions before config defaults turn an absent
 	// posture into "unknown". Only the corresponding explicit flag replaces
 	// an existing assertion; inference still uses its own command defaults.
 	var saved config.Config
@@ -1036,13 +941,11 @@ func runSetupProviders(command *cobra.Command, deps setupProvidersDeps, options 
 	}
 	options.personRetentionPosture = setupPosture(saved.Vector.People.RetentionPosture, options.retentionPosture, command.Flags().Changed("retention-posture"))
 	options.personTrainingPosture = setupPosture(saved.Vector.People.TrainingPosture, options.trainingPosture, command.Flags().Changed("training-posture"))
-	options.documentRetention = setupPosture(saved.Attachments.Documents.RetentionPosture, options.documentRetention, command.Flags().Changed("document-retention"))
-	options.documentTraining = setupPosture(saved.Attachments.Documents.TrainingPosture, options.documentTraining, command.Flags().Changed("document-training"))
 	now := time.Now()
 	if deps.now != nil {
 		now = deps.now()
 	}
-	detection := detectSetupProviders(ctx, loaded, deps)
+	detection := detectSetupProviders(ctx, loaded, deps, options)
 	detection.configKeys = keys
 	plan := planSetupProviders(loaded, detection, options, now)
 	out := command.OutOrStdout()
@@ -1052,6 +955,7 @@ func runSetupProviders(command *cobra.Command, deps setupProvidersDeps, options 
 	}
 
 	var declined []string
+	reader := bufio.NewReader(command.InOrStdin())
 	gates := plan.gates()
 	if options.dryRun {
 		if !options.jsonOutput {
@@ -1065,10 +969,9 @@ func runSetupProviders(command *cobra.Command, deps setupProvidersDeps, options 
 	}
 	if len(gates) > 0 && !options.yes {
 		if deps.isTerminal == nil || !deps.isTerminal(command) || options.jsonOutput {
-			return fmt.Errorf("setup providers needs one consent per hosted provider (%s); review the plan with --dry-run, then re-run with --yes",
+			return fmt.Errorf("setup providers needs one consent per provider (%s); review the plan with --dry-run, then re-run with --yes",
 				strings.Join(gates, ", "))
 		}
-		reader := bufio.NewReader(command.InOrStdin())
 		for _, gate := range gates {
 			if !slices.Contains(plan.gates(), gate) {
 				continue
@@ -1093,10 +996,47 @@ func runSetupProviders(command *cobra.Command, deps setupProvidersDeps, options 
 		}
 	}
 
+	for i, lane := range plan.Lanes {
+		if !lane.local || lane.Action != planActionEnable || (detection.embeddingError == nil && detection.embeddingEndpoint != "") {
+			continue
+		}
+		err := installSetupLocalEmbeddings(command, deps, options, reader)
+		if err != nil {
+			plan.Lanes[i].Action, plan.Lanes[i].Reason = planActionPending, err.Error()
+			plan.Lanes[i].edits = nil
+			plan.Lanes[i].next = []string{"msgvault setup providers --local-embeddings"}
+			plan.refreshDependencies(loaded, detection, options, now)
+		}
+	}
 	if err := applySetupProvidersPlan(command, deps, before, &plan, options.jsonOutput); err != nil {
 		return err
 	}
 	return writeSetupProvidersResult(command, deps, nil, &plan, options, plan.writes(), declined)
+}
+
+func installSetupLocalEmbeddings(command *cobra.Command, deps setupProvidersDeps, options setupProvidersOptions, reader *bufio.Reader) error {
+	if !options.localEmbeddings && (options.yes || options.jsonOutput || deps.isTerminal == nil || !deps.isTerminal(command)) {
+		return errors.New("local embeddings need an explicit selection; run msgvault setup providers --local-embeddings")
+	}
+	dir, err := localEmbeddingsDir()
+	if err != nil {
+		return fmt.Errorf("local embedding directory: %w", err)
+	}
+	_, err = deps.localInstall(command.Context(), embedlocal.InstallOptions{DataDir: dir, Confirm: func(_ context.Context, size int64) (bool, error) {
+		if options.yes {
+			return true, nil
+		}
+		if options.jsonOutput || deps.isTerminal == nil || !deps.isTerminal(command) {
+			return false, errors.New("local embedding download needs confirmation; run msgvault setup providers --local-embeddings --yes")
+		}
+		_, _ = fmt.Fprintf(command.OutOrStdout(), "Download approximately %d bytes for local embeddings.\nDownload? [y/N]: ", size)
+		answer, err := reader.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return false, fmt.Errorf("read download answer: %w", err)
+		}
+		return isYesAnswer(strings.ToLower(strings.TrimSpace(answer))), nil
+	}})
+	return err
 }
 
 func setupPosture(saved, proposed string, override bool) string {
@@ -1201,6 +1141,15 @@ func writeSetupProvidersResult(
 		env.consent = deps.consentState(ctx, loaded)
 	}
 	report := buildLaneReport(loaded, env)
+	for _, lane := range plan.Lanes {
+		if lane.local && lane.Action == planActionPending && !loaded.Vector.Enabled {
+			for i := range report.Lanes {
+				if report.Lanes[i].Lane == lane.Lane {
+					report.Lanes[i].State, report.Lanes[i].Reason, report.Lanes[i].Next = laneStatePending, lane.Reason, lane.next
+				}
+			}
+		}
+	}
 	followUps := setupFollowUps(ctx, deps, loaded, plan, applied)
 	if options.jsonOutput {
 		encoder := jsontext.NewEncoder(command.OutOrStdout(), jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
@@ -1231,8 +1180,6 @@ func writeSetupProvidersResult(
 	return nil
 }
 
-// setupFollowUps orders the commands that finish what setup started: restart
-// a running daemon first so it loads the new lanes, then consents and builds.
 func setupFollowUps(ctx context.Context, deps setupProvidersDeps, loaded *config.Config, plan *setupProvidersPlan, applied bool) []string {
 	var steps []string
 	seen := map[string]bool{}
@@ -1261,11 +1208,11 @@ func setupFollowUps(ctx context.Context, deps setupProvidersDeps, loaded *config
 
 func followUpRank(step string) int {
 	switch {
-	case step == "msgvault daemon restart":
-		return 0
 	case strings.Contains(step, " probe"):
-		return 1
+		return 0
 	case strings.Contains(step, " consent"):
+		return 1
+	case step == "msgvault daemon restart":
 		return 2
 	case strings.Contains(step, "setup providers"):
 		return 3

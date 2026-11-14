@@ -1,6 +1,8 @@
 <script lang="ts">
   import { Table } from '@kenn-io/kit-ui';
 
+  import EmptyLine from '../common/EmptyLine.svelte';
+  import { formatMeetingDuration } from '../../meetings/format';
   import type { Metrics } from '../../api/generated/models';
 
   let { metrics }: { metrics: Metrics } = $props();
@@ -8,15 +10,6 @@
   const basisLabels: Record<string, string> = {
     provider: 'Provider duration', scheduled: 'Scheduled', transcript_span: 'Transcript span', unknown: 'Unknown'
   };
-
-  function duration(seconds: number | null): string {
-    if (seconds === null) return 'Unavailable';
-    const rounded = Math.round(seconds);
-    const hours = Math.floor(rounded / 3600);
-    const minutes = Math.floor((rounded % 3600) / 60);
-    const remainder = rounded % 60;
-    return [hours ? `${hours}h` : '', minutes ? `${minutes}m` : '', remainder ? `${remainder}s` : ''].filter(Boolean).join(' ') || '0s';
-  }
 </script>
 
 <section class="meeting-metrics" aria-label="Meeting metrics">
@@ -30,14 +23,14 @@
   <dl class="metric-grid">
     <div>
       <dt>Total known meeting time</dt>
-      <dd aria-label="Total known meeting time">{duration(metrics.totals.total_known_seconds)}</dd>
+      <dd aria-label="Total known meeting time">{formatMeetingDuration(metrics.totals.total_known_seconds)}</dd>
     </div>
     <div>
       <dt>Average known duration</dt>
-      <dd aria-label="Average known duration">{duration(metrics.totals.average_known_seconds)}</dd>
+      <dd aria-label="Average known duration">{formatMeetingDuration(metrics.totals.average_known_seconds)}</dd>
     </div>
   </dl>
-  <p class="note">Time includes provider duration, scheduled, and transcript span evidence where available. Unknown durations are excluded from the average.</p>
+  <EmptyLine message="Time includes provider duration, scheduled, and transcript span evidence where available. Unknown durations are excluded from the average." />
   {#if metrics.duration_by_basis.length > 0}
     <section class="evidence-section" aria-labelledby={`${headingID}-duration-evidence`}>
       <h4 id={`${headingID}-duration-evidence`}>Duration evidence</h4>
@@ -45,7 +38,7 @@
         <Table unsorted bare ariaLabel="Duration evidence">
           <thead><tr><th scope="col">Evidence</th><th scope="col">Meetings</th><th scope="col">Known time</th></tr></thead>
           <tbody>{#each metrics.duration_by_basis as basis (basis.basis)}
-            <tr><th scope="row">{basisLabels[basis.basis] ?? basis.basis}</th><td>{basis.count}</td><td>{basis.basis === 'unknown' ? 'Unavailable' : duration(basis.total_seconds)}</td></tr>
+            <tr><th scope="row">{basisLabels[basis.basis] ?? basis.basis}</th><td>{basis.count}</td><td>{basis.basis === 'unknown' ? 'Unavailable' : formatMeetingDuration(basis.total_seconds)}</td></tr>
           {/each}</tbody>
         </Table>
       </div>
@@ -58,7 +51,7 @@
         <Table unsorted bare ariaLabel="Monthly meeting activity">
           <thead><tr><th scope="col">Month</th><th scope="col">Meetings</th><th scope="col">Known</th><th scope="col">Unknown</th><th scope="col">Known time</th><th scope="col">Average</th></tr></thead>
           <tbody>{#each metrics.months as month (month.month)}
-            <tr><th scope="row">{month.month}</th><td>{month.totals.meeting_count}</td><td>{month.totals.known_duration_count}</td><td>{month.totals.unknown_duration_count}</td><td>{duration(month.totals.total_known_seconds)}</td><td>{duration(month.totals.average_known_seconds)}</td></tr>
+            <tr><th scope="row">{month.month}</th><td>{month.totals.meeting_count}</td><td>{month.totals.known_duration_count}</td><td>{month.totals.unknown_duration_count}</td><td>{formatMeetingDuration(month.totals.total_known_seconds)}</td><td>{formatMeetingDuration(month.totals.average_known_seconds)}</td></tr>
           {/each}</tbody>
         </Table>
       </div>
@@ -78,7 +71,7 @@
   h4 { color: var(--text-primary); font-size: var(--font-size-sm); }
   p, dl { font-size: var(--font-size-sm); color: var(--text-secondary); }
   .metric-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--space-3); }
-  .metric-grid > div { display: grid; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-left: 2px solid var(--border-strong); background: var(--bg-inset); }
+  .metric-grid > div { display: grid; gap: var(--space-2); padding: var(--space-3) var(--space-4); border-left: 2px solid var(--border-strong); border-start-start-radius: 0; border-end-start-radius: 0; background: var(--bg-inset); }
   dt { color: var(--text-muted); font-size: var(--font-size-xs); }
   dd { color: var(--text-primary); font-size: var(--font-size-lg); font-weight: 600; font-variant-numeric: tabular-nums; }
   .note { padding-top: var(--space-3); border-top: 1px solid var(--border-muted); color: var(--text-muted); font-size: var(--font-size-xs); line-height: 1.5; }

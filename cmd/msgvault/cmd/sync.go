@@ -72,7 +72,7 @@ func runSyncIncrementalLocal(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return usageErr(cmd, err)
 	}
-	s, cleanup, err := openWritableStoreAndInitForInvocation(state)
+	s, cleanup, err := openWritableStoreAndInitForInvocation(cmd.Context(), state)
 	if err != nil {
 		return err
 	}
@@ -190,7 +190,12 @@ func runSyncIncrementalLocal(cmd *cobra.Command, args []string) error {
 				}
 				imapTargets = append(imapTargets, src)
 			case sourceTypeMSMail:
-				if !newGraphMailManager(state).HasToken(src.Identifier) {
+				mgr, err := newGraphMailManager(state, src)
+				if err != nil {
+					syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
+					continue
+				}
+				if !mgr.HasToken(src.Identifier) {
 					fmt.Printf("Skipping %s (no Microsoft Graph token - run 'add-o365 %s --graph' first)\n", src.Identifier, src.Identifier)
 					continue
 				}
@@ -225,7 +230,7 @@ func runSyncIncrementalLocal(cmd *cobra.Command, args []string) error {
 			break
 		}
 		fmt.Printf("Syncing Microsoft Graph mail for %s\n", src.Identifier)
-		sum, err := runMSMailSync(ctx, s, src.Identifier, func(line string) { fmt.Println(line) }, state)
+		sum, err := runMSMailSync(ctx, s, src, func(line string) { fmt.Println(line) }, state)
 		if err != nil {
 			syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", src.Identifier, err))
 			continue
@@ -368,7 +373,7 @@ func runIncrementalSync(ctx context.Context, s *store.Store, getOAuthMgr func(ct
 
 func init() {
 	syncIncrementalCmd.Flags().Int64("source-id", 0, "Exact source ID to sync")
-	syncIncrementalCmd.Flags().StringArrayVar(&syncFolders, "folder", []string{}, "IMAP folder to scan (repeatable)")
-	syncIncrementalCmd.Flags().StringArrayVar(&syncSkipFolders, "skip-folder", []string{}, "IMAP folder to skip (repeatable)")
+	syncIncrementalCmd.Flags().StringArrayVar(&syncFolders, "folder", []string{}, "IMAP folder to scan; either folder flag replaces saved exclusions for this run (repeatable)")
+	syncIncrementalCmd.Flags().StringArrayVar(&syncSkipFolders, "skip-folder", []string{}, "IMAP folder to skip; either folder flag replaces saved exclusions for this run (repeatable)")
 	rootCmd.AddCommand(addManualSyncCacheFlags(syncIncrementalCmd))
 }

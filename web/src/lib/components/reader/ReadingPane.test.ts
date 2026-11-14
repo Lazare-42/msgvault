@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createAPIClient } from '../../api/client';
+import { meetingActions, meetingMetrics } from '../../meetings/fixtures.test-support';
 import type { EntryRow, ExploreFilter, ExplorePredicate } from '../../explore/models';
 import ReadingPane from './ReadingPane.svelte';
 
@@ -40,79 +41,15 @@ function renderPane(row: EntryRow) {
   });
 }
 
-describe('ReadingPane task gating', () => {
-  it('offers Tasks for a typed email entry', () => {
-    renderPane(entryRow());
-    expect(screen.getByLabelText('Tasks for this message')).toBeDefined();
-  });
-
-  it('offers Tasks for a legacy entry with a blank message type', () => {
-    renderPane(entryRow({ message_type: '' }));
-    expect(screen.getByLabelText('Tasks for this message')).toBeDefined();
-  });
-
-  it('hides Tasks for non-email entries', () => {
-    renderPane(entryRow({ message_type: 'imessage' }));
-    expect(screen.queryByLabelText('Tasks for this message')).toBeNull();
-  });
-
-  it('hides Tasks when the entry has no anchor message', () => {
-    renderPane(entryRow({ anchor_message_id: undefined }));
-    expect(screen.queryByLabelText('Tasks for this message')).toBeNull();
-  });
-});
-
 describe('ReadingPane header', () => {
-  function taskFetch(tasks: unknown[]) {
-    return vi.fn<typeof fetch>(async (input) => {
-      const request = input instanceof Request ? input : new Request(input);
-      if (request.url.endsWith('/integrations/tasks/status')) {
-        return Response.json({ state: 'ready', project: 'project', message: 'Ready' });
-      }
-      return Response.json({ state: 'ready', complete: true, last_scan: '2026-07-19T01:00:00Z', tasks });
-    });
-  }
-
-  it('opens the linked tasks from a Tasks button without a count', async () => {
-    const fetchFn = taskFetch([
-      { id: 'task-1', title: 'Follow up', revision: 'r1' },
-      { id: 'task-2', title: 'Reply', revision: 'r2' }
-    ]);
+  it('uses a plain title for a missing message selected by ID', () => {
     render(ReadingPane, {
-      props: {
-        client: createAPIClient(fetchFn),
-        selection: { kind: 'entry', row: entryRow() },
-        predicate: {} satisfies ExplorePredicate
-      }
+      client: createAPIClient(vi.fn<typeof fetch>()),
+      targetKey: 'recording:42001',
+      status: 'missing',
+      predicate: {},
     });
-    const button = screen.getByRole('button', { name: 'Tasks for this message' });
-    expect(button.getAttribute('aria-expanded')).toBe('false');
-    expect(button.textContent?.trim()).toBe('Tasks');
-
-    await fireEvent.click(button);
-    expect(button.getAttribute('aria-expanded')).toBe('true');
-    expect(await screen.findByRole('region', { name: 'Linked tasks' })).toBeDefined();
-    await screen.findByText('Reply');
-    expect(button.textContent?.trim()).toBe('Tasks');
-    expect(screen.getByRole('button', { name: 'Tasks for this message' })).toBe(button);
-  });
-
-  it('closes the sheet when the selection changes', async () => {
-    const fetchFn = taskFetch([{ id: 'task-1', title: 'Follow up', revision: 'r1' }]);
-    const view = render(ReadingPane, {
-      props: {
-        client: createAPIClient(fetchFn),
-        selection: { kind: 'entry', row: entryRow() },
-        predicate: {} satisfies ExplorePredicate
-      }
-    });
-    await fireEvent.click(screen.getByRole('button', { name: 'Tasks for this message' }));
-    await screen.findByText('Follow up');
-
-    await view.rerender({ selection: { kind: 'entry', row: entryRow({ key: 'entry-2', anchor_message_id: 43 }) } });
-    const button = screen.getByRole('button', { name: 'Tasks for this message' });
-    expect(button.getAttribute('aria-expanded')).toBe('false');
-    expect(screen.queryByRole('region', { name: 'Linked tasks' })).toBeNull();
+    expect(screen.getByRole('complementary', { name: 'Reading pane: Message' })).toBeDefined();
   });
 
   it.each([
@@ -126,72 +63,15 @@ describe('ReadingPane header', () => {
     expect(meta.startsWith(`${name} · `)).toBe(true);
     expect(meta).not.toContain(messageType === 'email' ? 'email ·' : messageType);
   });
-});
-
-describe('ReadingPane meeting evidence', () => {
-  it('uses only an exact meeting transcript anchor for context and archived actions', async () => {
-    const requests: Request[] = [];
-    const createObjectURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:reader-meeting-context');
-    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
-    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
-    const fetchFn = vi.fn<typeof fetch>(async (input) => {
-      const request = input instanceof Request ? input : new Request(input);
-      requests.push(request);
-      const path = new URL(request.url).pathname;
-      if (path.endsWith('/actions')) {
-        return Response.json({
-          schema_version: 1,
-          archive_uid: 'archive-test',
-          rows: [],
-          total_count: 0,
-          coverage: { meeting_count: 1, available: 1, partial: 0, unsupported: 0, unavailable: 0 },
-          scope: { kind: 'direct' },
-        });
-      }
-      return Response.json({
-        schema_version: 1,
-        format: 'json',
-        content: '{"meeting":42}',
-        content_bytes: 14,
-        truncated: false,
-        omitted_message_ids: [],
-      });
-    });
+  it('opens the header counterpart through onOpenPerson', async () => {
+    const onOpenPerson = vi.fn();
     render(ReadingPane, {
-      client: createAPIClient(fetchFn),
-      selection: {
-        kind: 'entry',
-        row: entryRow({
-          message_type: 'meeting_transcript',
-          anchor_message_id: 42,
-          conversation_id: undefined,
-        }),
-      },
-      predicate: {},
+      selection: { kind: 'entry', row: entryRow({ anchor_message_id: undefined, counterpart_participant_id: 22 }) },
+      client: createAPIClient(vi.fn<typeof fetch>()),
+      predicate: {}, onOpenPerson,
     });
-
-    expect(await screen.findByText('No recorded action items')).toBeDefined();
-    await fireEvent.click(screen.getByRole('button', { name: 'Export meeting context' }));
-    await waitFor(() => expect(createObjectURL).toHaveBeenCalledOnce());
-    const bodies = await Promise.all(requests.map((request) => request.clone().json()));
-    expect(bodies).toContainEqual({ scope: { message_ids: [42] }, limit: 200 });
-    expect(bodies).toContainEqual({ message_ids: [42], format: 'json', include_transcript: false });
-  });
-
-  it.each(['meeting_notes', 'email'])('does not treat %s as a meeting transcript', (messageType) => {
-    const fetchFn = vi.fn<typeof fetch>();
-    render(ReadingPane, {
-      client: createAPIClient(fetchFn),
-      selection: {
-        kind: 'entry',
-        row: entryRow({ message_type: messageType, anchor_message_id: 42, conversation_id: undefined }),
-      },
-      predicate: {},
-    });
-
-    expect(screen.queryByRole('region', { name: 'Meeting context export' })).toBeNull();
-    expect(screen.queryByText('Archived action items')).toBeNull();
-    expect(fetchFn).not.toHaveBeenCalled();
+    await fireEvent.click(screen.getByRole('button', { name: 'Open person' }));
+    expect(onOpenPerson).toHaveBeenCalledWith(22);
   });
 });
 
@@ -230,6 +110,32 @@ describe('ReadingPane identity matches', () => {
 });
 
 describe('ReadingPane group file drill-down', () => {
+  it.each(['participant', 'domain'] as const)('keeps %s files when meeting authority arrives', async dimension => {
+    let fileRequests = 0;
+    const client = createAPIClient(async input => {
+      const path = new URL((input as Request).url).pathname;
+      if (path.endsWith('/explore/files')) {
+        fileRequests += 1;
+        return Response.json({ files: [{ key: 'file-1', filename: 'report.pdf', size: 128, occurred_at: '2026-07-18T12:00:00Z', title: 'Report', source_identifier: 'example.test' }], total_count: 1, cache_revision: 'cache-1', search_provenance: {} });
+      }
+      return Response.json(path.endsWith('/meetings/actions') ? meetingActions() : meetingMetrics());
+    });
+    const selection = { kind: 'group' as const, dimension, key: '42', label: 'Example' };
+    const view = render(ReadingPane, { client, predicate: {}, selection });
+    await screen.findByText('report.pdf');
+    await view.rerender({ client, predicate: {}, selection: { ...selection, meetingScope: { predicate: {}, cache_revision: 'cache-1', search_provenance: {} } } });
+    expect(fileRequests).toBe(1);
+    expect(screen.getByText('report.pdf')).toBeDefined();
+  });
+
+  it('retries unavailable meeting authority', async () => {
+    const onReloadMeetings = vi.fn();
+    render(ReadingPane, { client: createAPIClient(async () => Response.json({ files: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {} })), predicate: {}, onReloadMeetings,
+      selection: { kind: 'group', dimension: 'participant', key: '42', label: 'Example' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Reload meeting activity' }));
+    expect(onReloadMeetings).toHaveBeenCalledOnce();
+  });
+
   it('intersects a drilled-into participant group with an existing participant filter', async () => {
     const requests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
@@ -255,4 +161,13 @@ describe('ReadingPane group file drill-down', () => {
       { dimension: 'participant', values: ['99'] }
     ]);
   });
+});
+
+it('leads group details with the overview and a friendly grouping label', () => {
+ render(ReadingPane, { client: createAPIClient(async () => Response.json({ files: [], total_count: 0, cache_revision: 'cache-1', search_provenance: {} })), predicate: {}, selection: {
+  kind: 'group', dimension: 'participant', key: '7', label: 'Person Example', count: 3, latestAt: '2024-05-31T12:00:00Z',
+  overview: { first_at: '2024-05-03T12:00:00Z', activity: [{ bucket: '2024-05', count: 3 }], co_participants: [] }
+ } });
+ expect(screen.getByText('Grouped by Person')).toBeDefined();
+ expect(screen.getByLabelText('Group details').firstElementChild).toBe(screen.getByRole('region', { name: 'Group overview' }));
 });

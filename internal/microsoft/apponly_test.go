@@ -1,7 +1,6 @@
 package microsoft
 
 import (
-	"context"
 	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
@@ -177,20 +176,20 @@ func TestTokenFetchAndCache(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0)
 	ts.now = func() time.Time { return base }
 
-	tok, err := ts.Token(context.Background())
+	tok, err := ts.Token(t.Context())
 	require.NoError(err)
 	assert.Equal("tok-abc", tok)
 	assert.Equal(1, calls)
 
 	// second call within lifetime is served from cache
-	tok2, err := ts.Token(context.Background())
+	tok2, err := ts.Token(t.Context())
 	require.NoError(err)
 	assert.Equal("tok-abc", tok2)
 	assert.Equal(1, calls, "cached token should not trigger a second fetch")
 
 	// advance past expiry (minus skew) → refetch
 	ts.now = func() time.Time { return base.Add(59 * time.Minute) }
-	_, err = ts.Token(context.Background())
+	_, err = ts.Token(t.Context())
 	require.NoError(err)
 	assert.Equal(2, calls)
 }
@@ -209,7 +208,7 @@ func TestTokenFetchAADError(t *testing.T) {
 	defer srv.Close()
 	ts.endpointOverride = srv.URL
 
-	_, err = ts.Token(context.Background())
+	_, err = ts.Token(t.Context())
 	require.Error(err)
 	assert.Contains(err.Error(), "invalid_client")
 	assert.Contains(err.Error(), "AADSTS700027")

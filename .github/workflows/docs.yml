@@ -9,26 +9,34 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.ref) || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   docs:
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7.0.1
+
+      - uses: kenn-io/kit/.github/actions/kit-retry@v0.48.4
 
       - name: Install ripgrep
         run: |
-          curl -fsSL --retry 3 --max-time 120 \
-            https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/ripgrep-14.1.1-x86_64-unknown-linux-musl.tar.gz \
-            -o "$RUNNER_TEMP/ripgrep.tar.gz"
-          echo "4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e  $RUNNER_TEMP/ripgrep.tar.gz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/ripgrep.tar.gz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/ripgrep-14.1.1-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+          # CI only needs Ubuntu packages; runner-added repositories can fail independently.
+          kit-retry 3 5 sudo apt-get -o Dir::Etc::sourcelist=sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=- -o APT::Update::Error-Mode=any update
+          kit-retry 3 5 sudo apt-get install -y ripgrep
 
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          save-cache: ${{ github.event_name != 'pull_request' }}
 
       - name: Install documentation dependencies
         working-directory: docs
-        run: uv sync --frozen --no-dev
+        run: kit-retry 3 5 uv sync --frozen --no-dev
 
       - name: Check documentation
+        env:
+          DOWNLOAD_RETRY: kit-retry 3 5
         run: make docs-check

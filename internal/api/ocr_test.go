@@ -54,7 +54,7 @@ func TestRequestOCRValidatesHashAndStartsJobAsynchronously(t *testing.T) {
 		ocrStore: ocrStore, scheduler: scheduler,
 	}
 
-	invalid := httptest.NewRequest(http.MethodPost, "/api/v1/attachments/bad/text/request", nil)
+	invalid := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/attachments/bad/text/request", nil)
 	invalid.SetPathValue("hash", "bad")
 	invalidResponse := httptest.NewRecorder()
 	server.handleRequestOCR(invalidResponse, invalid)
@@ -62,7 +62,7 @@ func TestRequestOCRValidatesHashAndStartsJobAsynchronously(t *testing.T) {
 	assertions.Zero(ocrStore.requested)
 
 	hash := strings.Repeat("ab", 32)
-	valid := httptest.NewRequest(http.MethodPost, "/api/v1/attachments/"+hash+"/text/request", nil)
+	valid := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/attachments/"+hash+"/text/request", nil)
 	valid.SetPathValue("hash", hash)
 	validResponse := httptest.NewRecorder()
 	server.handleRequestOCR(validResponse, valid)
@@ -77,7 +77,7 @@ func TestSearchOCRMapsUnavailableIndexToServiceUnavailable(t *testing.T) {
 		cfg:      &config.Config{},
 		ocrStore: &apiOCRStore{searchErr: store.ErrOCRSearchUnavailable},
 	}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/files/text-search", strings.NewReader(`{"query":"invoice"}`))
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/api/v1/files/text-search", strings.NewReader(`{"query":"invoice"}`))
 	response := httptest.NewRecorder()
 	server.handleSearchOCR(response, request)
 	assert.Equal(t, http.StatusServiceUnavailable, response.Code)

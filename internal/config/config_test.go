@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -214,6 +215,29 @@ func TestGmailDraftConfig(t *testing.T) {
 		requirements.NoError(os.WriteFile(path, []byte(invalid), 0o600))
 		_, err := Load(path, "")
 		requirements.Error(err)
+	}
+}
+
+func TestSenderAuthConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	const valid = "[[sender_auth.sources]]\nsource_id = 42\ntrusted_authserv_ids = [\"mx.google.com\"]\n"
+	require.NoError(t, os.WriteFile(path, []byte(valid), 0o600))
+	cfg, err := Load(path, "")
+	require.NoError(t, err)
+	pins := cfg.SenderAuth.Pins()
+	cfg.SenderAuth.Sources[0].TrustedAuthservIDs[0] = "changed.example.test"
+	assert.Equal(t, []string{"mx.google.com"}, pins[42])
+	for _, tc := range []struct{ name, body, want string }{
+		{"missing source", "trusted_authserv_ids = [\"mx.google.com\"]", "source_id is required"},
+		{"missing pins", "source_id = 42", "trusted_authserv_ids must contain at least one ID"},
+		{"blank pin", "source_id = 42\ntrusted_authserv_ids = [\"\"]", "trusted_authserv_ids must be nonblank"},
+		{"whitespace pin", "source_id = 42\ntrusted_authserv_ids = [\"mx.google.com other\"]", "contain no whitespace"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, os.WriteFile(path, []byte("[[sender_auth.sources]]\n"+tc.body+"\n"), 0o600))
+			_, err := Load(path, "")
+			require.ErrorContains(t, err, tc.want)
+		})
 	}
 }
 
@@ -915,10 +939,7 @@ func TestGetAccountScheduleReturnsCopy(t *testing.T) {
 	assert := assert.New(t)
 	cfg := &Config{
 		Accounts: []AccountSchedule{
-			{
-				Email: "test@gmail.com", Schedule: "0 2 * * *", Enabled: true,
-				SkipFolders: []string{"Calendar"},
-			},
+			{Email: "test@gmail.com", Schedule: "0 2 * * *", Enabled: true},
 		},
 	}
 
@@ -930,11 +951,9 @@ func TestGetAccountScheduleReturnsCopy(t *testing.T) {
 	acc.Schedule = "modified"
 	acc.Enabled = false
 	acc.Email = "hacked@gmail.com"
-	acc.SkipFolders[0] = "mutated"
 
 	// Original config must be unchanged
 	assert.Equal("0 2 * * *", cfg.Accounts[0].Schedule, "original Schedule (mutation leaked)")
-	assert.Equal([]string{"Calendar"}, cfg.Accounts[0].SkipFolders, "original SkipFolders (mutation leaked)")
 	assert.True(cfg.Accounts[0].Enabled, "original Enabled (mutation leaked)")
 	assert.Equal("test@gmail.com", cfg.Accounts[0].Email, "original Email (mutation leaked)")
 }
@@ -964,40 +983,6 @@ oauth_app = "personal"
 	src := cfg.GetSynctechSMSSource("pixel")
 	require.NotNil(src, "GetSynctechSMSSource returned nil")
 	require.Truef(src.Backend == "drive" && src.OwnerPhone == "+15550000001" && src.FolderID == "drive-folder-id" && src.GoogleAccount == "user@example.com" && src.StableAfter == "10m", "source mismatch: %#v", src)
-}
-
-func TestGoogleDocsSourcesConfig(t *testing.T) {
-	require := require.New(t)
-	dir := t.TempDir()
-	configPath := filepath.Join(dir, "config.toml")
-	data := []byte(`
-[[google_docs.sources]]
-name = "docs"
-enabled = true
-folder_id = "drive-folder-id"
-google_account = "user@example.com"
-oauth_app = "personal"
-
-[[google_docs.sources]]
-name = "disabled"
-enabled = false
-folder_id = "disabled-folder-id"
-google_account = "user@example.com"
-`)
-	require.NoError(os.WriteFile(configPath, data, 0o600), "write config")
-	cfg, err := Load(configPath, "")
-	require.NoError(err, "Load")
-
-	src := cfg.GetGoogleDocsSource("DOCS")
-	require.NotNil(src, "GetGoogleDocsSource returned nil")
-	require.True(src.Enabled, "source should be enabled")
-	require.Equal("drive-folder-id", src.FolderID, "FolderID")
-	require.Equal("user@example.com", src.GoogleAccount, "GoogleAccount")
-	require.Equal("personal", src.OAuthApp, "OAuthApp")
-
-	enabled := cfg.EnabledGoogleDocsSources()
-	require.Len(enabled, 1, "EnabledGoogleDocsSources")
-	require.Equal("docs", enabled[0].Name, "enabled source name")
 }
 
 func TestSynctechSMSScheduledSources(t *testing.T) {
@@ -2106,6 +2091,28 @@ strip_signatures = false
 	assert.True(cfg.Vector.Preprocess.StripQuotesEnabled(), "StripQuotesEnabled() should be true (unset → default)")
 }
 
+func TestLoadEmbeddingTransportDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name, settings string
+		batch          int
+		timeout        time.Duration
+	}{
+		{"local", "local_only = true", 8, 5 * time.Minute},
+		{"remote", `endpoint = "https://example.com/v1"`, 32, 30 * time.Second},
+		{"local overrides", "local_only = true\nbatch_size = 17\ntimeout = \"45s\"", 17, 45 * time.Second},
+		{"local batch override", "local_only = true\nbatch_size = 32", 32, 5 * time.Minute},
+		{"local timeout override", "local_only = true\ntimeout = \"30s\"", 8, 30 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			require.NoError(t, os.WriteFile(path, []byte("[vector.embeddings]\n"+tc.settings+"\n"), 0o600))
+			cfg, err := Load(path, "")
+			require.NoError(t, err)
+			assert.Equal(t, []any{tc.batch, tc.timeout}, []any{cfg.Vector.Embeddings.BatchSize, cfg.Vector.Embeddings.Timeout})
+		})
+	}
+}
+
 func TestLoadAllowsIndependentMultimodalVectorLane(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -2552,6 +2559,20 @@ api_key = "owner-secret"
 	})
 }
 
+func TestLoadIMAPSkipFoldersRejectsBlank(t *testing.T) {
+	require := require.New(t)
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := `[sync]
+imap_skip_folders = { "imap://user@example.com" = ["Trash", " \t "] }
+`
+	require.NoError(os.WriteFile(path, []byte(content), 0o600))
+	_, err := Load(path, "")
+	require.ErrorContains(err, `sync.imap_skip_folders["imap://user@example.com"] contains a blank folder name`)
+	cfg, err := LoadClientWithOverrides(path, "", RuntimeOverrides{})
+	require.NoError(err)
+	require.ErrorContains(cfg.DaemonConfigError(), "contains a blank folder name")
+}
+
 func TestLoadTrustedIMAPSentMailboxesPerSource(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -2579,18 +2600,116 @@ trusted_imap_sent_mailboxes = { "imaps://alice@example.com@imap.example.com:993"
 		"unconfigured archives carry no explicit Sent-folder trust")
 }
 
+func TestLoadAppleImportPaths(t *testing.T) {
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+	for _, tc := range []struct{ name, path string }{
+		{name: "relative", path: "apple/chat.db"},
+		{name: "tilde", path: "~/apple/chat.db"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.toml")
+			content := fmt.Sprintf("[[whatsapp_apple]]\nname = 'personal'\nenabled = true\nphone = '+15550000000'\nschedule = '*/10 * * * *'\npath = '%s'\n[imessage]\ndb_path = '%s'\n", tc.path, tc.path)
+			require.NoError(os.WriteFile(path, []byte(content), 0o600))
+			cfg, err := Load(path, "")
+			require.NoError(err)
+			wantPath := filepath.Join(dir, "apple/chat.db")
+			if strings.HasPrefix(tc.path, "~/") {
+				wantPath = filepath.Join(home, "apple/chat.db")
+			}
+			assert.Equal(wantPath, cfg.IMessage.DBPath)
+			assert.Equal(wantPath, cfg.WhatsAppApple[0].Path)
+		})
+	}
+}
+
+func TestLoadApplePhonePrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		content   string
+		wantError string
+	}{
+		{name: "requires plus", content: "[[whatsapp_apple]]\nenabled = true\nphone = '15550000000'\n", wantError: "whatsapp_apple[0].phone must start with +"},
+		{name: "disabled without phone", content: "[[whatsapp_apple]]\nenabled = false\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			path := filepath.Join(t.TempDir(), "config.toml")
+			require.NoError(os.WriteFile(path, []byte(tc.content), 0600))
+			cfg, err := Load(path, "")
+			if tc.wantError != "" {
+				require.ErrorContains(err, tc.wantError)
+			} else {
+				require.NoError(err)
+				require.NoError(cfg.DaemonConfigError())
+				return
+			}
+			cfg, err = LoadClientWithOverrides(path, "", RuntimeOverrides{})
+			require.NoError(err)
+			require.ErrorContains(cfg.DaemonConfigError(), tc.wantError)
+		})
+	}
+}
+
+func TestRemovedDocumentConfigGuidesMigration(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	warnedRemovedDocuments.Store(false)
+	t.Cleanup(func() { warnedRemovedDocuments.Store(false) })
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(os.WriteFile(path, []byte("[attachments.documents]\nenabled = true\nmodel = 'retired'\n"), 0o600))
+	cfg, err := Load(path, "")
+	require.NoError(err)
+	require.NotNil(cfg)
+	snapshot, err := ReadConfigFile(path)
+	require.NoError(err)
+	reloaded, err := cfg.ReloadConfigFile(snapshot)
+	require.NoError(err)
+	require.NotNil(reloaded)
+	assert.Contains(logs.String(), "level=WARN")
+	assert.Contains(logs.String(), "[attachments.documents] was removed; delete it and set [integrations.docbank] document_profile")
+	assert.Contains(logs.String(), "for Mistral run docbank processing probe --profile <name> --seeds <dir>")
+	assert.Equal(1, strings.Count(logs.String(), "[attachments.documents]"))
+}
+
+func TestMicrosoftNamedApps(t *testing.T) {
+	cfg := MicrosoftConfig{ClientID: "default", TenantID: "tenant-a", RedirectURI: "http://localhost:9000/callback", Apps: map[string]MicrosoftApp{
+		"orgb":  {ClientID: "client-b"},
+		"empty": {},
+	}}
+	app, err := cfg.App("")
+	require.NoError(t, err)
+	assert.Equal(t, "default", app.ClientID)
+	app, err = cfg.App("orgb")
+	require.NoError(t, err)
+	assert.Equal(t, "client-b", app.ClientID)
+	assert.Equal(t, "common", app.EffectiveTenantID())
+	assert.Equal(t, "http://localhost:8089/callback/microsoft", app.EffectiveRedirectURI())
+	_, err = cfg.App("missing")
+	require.ErrorContains(t, err, "[microsoft.apps.missing]")
+	_, err = cfg.App("empty")
+	require.ErrorContains(t, err, "[microsoft.apps.empty]")
+}
+
 func TestOCRDefaultsFollowArchiveHome(t *testing.T) {
-	assertions := assert.New(t)
-	requirements := require.New(t)
+	require := require.New(t)
+	assert := assert.New(t)
 	home := t.TempDir()
 	cfg, err := Load("", home)
-	requirements.NoError(err)
-	assertions.Equal(filepath.Join(home, "ocr", "executor.sock"), cfg.OCR.Socket)
-	assertions.Equal(5, cfg.OCR.MaxAttempts)
-	assertions.Equal("poppler+tesseract-v1:fra+eng", cfg.OCR.Fingerprint)
-	assertions.Equal(ocr.DefaultMinImageSide, cfg.OCR.MinImageSide)
-	assertions.Equal(ocr.DefaultMaxImageScale, cfg.OCR.MaxImageScale)
-	assertions.Equal(ocr.DefaultMaxPreprocessBytes, cfg.OCR.MaxPreprocessBytes)
+	require.NoError(err)
+	assert.Equal(filepath.Join(home, "ocr", "executor.sock"), cfg.OCR.Socket)
+	assert.Equal(5, cfg.OCR.MaxAttempts)
+	assert.Equal("poppler+tesseract-v1:fra+eng", cfg.OCR.Fingerprint)
+	assert.Equal(ocr.DefaultMinImageSide, cfg.OCR.MinImageSide)
+	assert.Equal(ocr.DefaultMaxImageScale, cfg.OCR.MaxImageScale)
+	assert.Equal(ocr.DefaultMaxPreprocessBytes, cfg.OCR.MaxPreprocessBytes)
 }
 
 func TestOCRMaxAttemptsValidation(t *testing.T) {
@@ -2624,12 +2743,12 @@ func TestOCRResourceValidation(t *testing.T) {
 }
 
 func TestMailAccountSenderPolicyLoads(t *testing.T) {
-	assert := assert.New(t)
 	require := require.New(t)
+	assert := assert.New(t)
 	path := filepath.Join(t.TempDir(), "config.toml")
 	require.NoError(os.WriteFile(path, []byte(`[mail.accounts."owner@example.com"]
 allowed_from = ["reports@example.com"]
-`), 0600))
+`), 0o600))
 	cfg, err := Load(path, "")
 	require.NoError(err)
 	assert.Equal([]string{"reports@example.com"}, cfg.Mail.Accounts["owner@example.com"].AllowedFrom)

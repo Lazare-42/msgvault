@@ -44,6 +44,9 @@ func Available() bool { return false }
 // Close is a no-op for the stub.
 func (b *Backend) Close() error { return nil }
 
+// WithBuildScope returns the unavailable backend placeholder.
+func (b *Backend) WithBuildScope(vector.BuildScope) vector.Backend { return b }
+
 // DB returns nil for the stub.
 func (b *Backend) DB() *sql.DB { return nil }
 
@@ -116,3 +119,7 @@ func (b *Backend) ScoreMessageChunks(_ context.Context, _ vector.GenerationID, _
 // interface. Keeping the assertion here means changes to the interface
 // break stub and real builds in lockstep.
 var _ vector.Backend = (*Backend)(nil)
+
+func (b *Backend) EmbeddingCheckpoints() vector.EmbeddingCheckpoints {
+	return vector.EmbeddingCheckpoints{}
+}

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Button, Calendar, Checkbox, TextInput, todayStr } from '@kenn-io/kit-ui';
+  import { Button, Calendar, Checkbox, NumberInput, TextInput, todayStr } from '@kenn-io/kit-ui';
   import { onMount, tick, untrack } from 'svelte';
 
   import type {
@@ -7,6 +7,7 @@
     AttributeValue as GeneratedAttributeValue,
     PersonAttributeValue as GeneratedPersonAttributeValue,
   } from '../../api/generated/models';
+  import { editorKind } from './attribute-value';
   import { attributeTextLength, trimAttributeText } from '../../directory/attribute-text';
   import type { SetPersonAttributeRequest } from '../../directory/models';
   import type { DirectoryProfileController } from '../../directory/profile-controller.svelte';
@@ -14,7 +15,6 @@
   type AttributeDefinition = GeneratedAttributeDefinition;
   type AttributeValue = GeneratedAttributeValue;
   type PersonAttributeValue = GeneratedPersonAttributeValue;
-  type EditorKind = 'boolean' | 'number' | 'date' | 'timestamp' | 'json' | 'choice' | 'person' | 'text' | 'unsupported';
 
   interface Props {
     controller: DirectoryProfileController;
@@ -94,16 +94,10 @@
   const normalizedTextDraft = $derived(trimAttributeText(draft));
   const trimmedCharacterCount = $derived(attributeTextLength(normalizedTextDraft));
 
-  function editorKind(value: AttributeDefinition): EditorKind {
-    if (value.options?.choices?.length) return 'choice';
-    if (value.value_type === 'boolean') return 'boolean';
-    if (value.value_type === 'integer' || value.value_type === 'real') return 'number';
-    if (value.value_type === 'date') return 'date';
-    if (value.value_type === 'timestamp') return 'timestamp';
-    if (value.value_type === 'json') return 'json';
-    if (value.value_type === 'record_reference' && value.record_target === 'person') return 'person';
-    if (value.value_type === 'text') return 'text';
-    return 'unsupported';
+  function numericDraft(text: string): number | null {
+    if (text.trim() === '') return null;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : null;
   }
 
   function defaultDraft(value: AttributeDefinition): string {
@@ -149,7 +143,7 @@
         return { type: 'real', real: parsed };
       }
       case 'date':
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return invalid('Enter an exact YYYY-MM-DD date.');
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return invalid('Enter a date like 2024-03-15.');
         return { type: 'date', date: value };
       case 'timestamp':
         return timestampValue(value);
@@ -185,29 +179,29 @@
         const parsed = Number(selected);
         return Number.isSafeInteger(parsed)
           ? { type: 'integer', integer: parsed }
-          : invalid('The selected value is not a valid integer.');
+          : invalid("This choice isn't a whole number.");
       }
       case 'real': {
         const parsed = Number(selected);
         return Number.isFinite(parsed)
           ? { type: 'real', real: parsed }
-          : invalid('The selected value is not a valid number.');
+          : invalid("This choice isn't a number.");
       }
       case 'boolean':
         if (selected === 'true' || selected === 'false') return { type: 'boolean', boolean: selected === 'true' };
-        return invalid('The selected value is not a valid boolean.');
+        return invalid("This choice isn't yes or no.");
       case 'date':
         return { type: 'date', date: selected };
       case 'timestamp':
         return timestampValue(selected);
       default:
-        return invalid('This choice type is not editable here.');
+        return invalid("This field can't be edited here.");
     }
   }
 
   function timestampValue(value: string): AttributeValue | undefined {
     if (!isRFC3339(value)) {
-      return invalid('Enter an RFC3339 timestamp.');
+      return invalid('Enter a time like 2026-08-28T14:30:45Z.');
     }
     return { type: 'timestamp', timestamp: value };
   }
@@ -238,7 +232,7 @@
     } catch {
       return invalid('Enter valid JSON.');
     }
-    if (parsed === null) return invalid('JSON cannot be null.');
+    if (parsed === null) return invalid('Enter a value other than null.');
     return { type: 'json', json: parsed };
   }
 
@@ -295,7 +289,7 @@
 
   function conflictMessage(): string | null {
     if (!relevantConflict) return null;
-    if (relevantConflict.code === 'attribute_conflict') return 'This person changed elsewhere. Reload and retry.';
+    if (relevantConflict.code === 'attribute_conflict') return 'This person changed since you opened it.';
     return relevantConflict.message;
   }
 </script>
@@ -303,11 +297,12 @@
 {#if initialDefinition.is_sensitive && !sensitiveRevealed}
   <p class="editor-error" role="alert">Reveal this sensitive value before editing it.</p>
 {:else if kind === 'unsupported'}
-  <p class="editor-error" role="status">This {initialDefinition.value_type} value is read-only in the web editor.</p>
+  <p class="editor-error" role="status">This field can't be edited here.</p>
 {:else}
   <form
     bind:this={formElement}
     class="attribute-editor"
+    data-form
     onsubmit={save}
     aria-label={`${replacing ? 'Edit' : 'Add'} ${initialDefinition.label} value`}
   >
@@ -361,30 +356,32 @@
     {:else if kind === 'number'}
       <label for={inputID}>{initialDefinition.label}</label>
       <div class="number-control">
-        <input
+        <NumberInput
           id={inputID}
-          type="number"
-          step={initialDefinition.value_type === 'integer' ? '1' : 'any'}
-          value={draft}
-          oninput={(event) => {
-            draft = event.currentTarget.value;
+          value={numericDraft(draft)}
+          step={initialDefinition.value_type === 'integer' ? 1 : 0.01}
+          oninput={(value) => {
+            draft = value === null ? '' : String(value);
           }}
           disabled={!definitionAllowsSet}
+          block
+          size="lg"
         />
         {#if initialDefinition.options?.unit}<span>{initialDefinition.options.unit}</span>{/if}
       </div>
     {:else if kind === 'person'}
       <label for={inputID}>{initialDefinition.label}</label>
-      <input
+      <NumberInput
         id={inputID}
-        type="number"
-        min="1"
-        step="1"
-        value={draft}
-        oninput={(event) => {
-          draft = event.currentTarget.value;
+        min={1}
+        step={1}
+        value={numericDraft(draft)}
+        oninput={(value) => {
+          draft = value === null ? '' : String(value);
         }}
         disabled={!definitionAllowsSet}
+        block
+        size="lg"
       />
     {:else if initialDefinition.field_type === 'textarea'}
       <label for={inputID}>{initialDefinition.label}</label>
@@ -421,10 +418,10 @@
       <p class="editor-error" role="alert">{validationError}</p>
     {:else if lineageMissing}
       <p class="editor-error" role="status">
-        The selected value is no longer current. Cancel or add this draft as a new value.
+        This value was removed since you opened it.
       </p>
     {:else if convertToNew}
-      <p role="status">This draft will be added as a new value.</p>
+      <p role="status">Saving adds this as a new value.</p>
     {:else if conflictMessage()}
       <p class="editor-error" role="alert">{conflictMessage()}</p>
     {/if}
@@ -433,7 +430,7 @@
       <Button label="Cancel" type="button" disabled={submitting} onclick={onCancel} />
       {#if needsReload}
         <Button
-          label="Reload attributes"
+          label="Reload"
           type="button"
           disabled={!controller.canReload}
           onclick={() => void reload()}
@@ -441,79 +438,95 @@
       {/if}
       {#if lineageMissing}
         <Button
-          label="Add draft as new value"
+          label="Add as new value"
           type="button"
           disabled={!initialDefinition.ui_creatable}
           onclick={convertDraftToNew}
         />
       {/if}
-      <Button label="Save attribute" type="submit" tone="info" surface="solid" disabled={!canSave} />
+      <Button label="Save" type="submit" tone="info" surface="solid" disabled={!canSave} />
     </div>
   </form>
 {/if}
 
 <style>
+  /* L4 in a box padded 12: the label (Meta, 600) 4 above its 36 field, the hint or error (Small) 4 below it,
+   * and the buttons 16 below the field, 8 apart. */
   .attribute-editor {
     display: grid;
-    gap: var(--space-2);
-    padding: var(--space-3);
+    gap: var(--space-tight);
+    padding: var(--space-box);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-sm);
     background: var(--bg-inset);
   }
-  label {
+  label,
+  legend {
     color: var(--text-secondary);
-    font-size: var(--font-size-sm);
+    font-size: var(--type-meta-size);
+    font-weight: 600;
+    line-height: var(--type-meta-line);
   }
   select,
-  input,
   textarea {
     box-sizing: border-box;
     width: 100%;
-    min-height: 36px;
-    padding: var(--space-2) var(--space-3);
+    min-height: var(--field-h);
+    padding: 0 var(--space-box);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
     background: var(--bg-surface);
     color: var(--text-primary);
     font: inherit;
+    font-size: var(--field-font-size);
+    line-height: var(--type-body-line);
   }
   textarea {
-    min-height: 96px;
+    min-height: 80px;
+    padding: var(--space-group) var(--space-box);
     resize: vertical;
   }
   select:focus-visible,
-  input:focus-visible,
   textarea:focus-visible {
     outline: var(--focus-ring);
     outline-offset: 2px;
   }
   fieldset {
     margin: 0;
-    padding: var(--space-2);
+    padding: var(--space-box);
     border: 1px solid var(--border-default);
     border-radius: var(--radius-md);
   }
-  legend {
-    color: var(--text-secondary);
-    font-size: var(--font-size-sm);
+  small {
+    color: var(--text-muted);
+    font-size: var(--type-small-size);
+    line-height: var(--type-small-line);
+  }
+  p {
+    margin: 0;
+    font-size: var(--type-small-size);
+    line-height: var(--type-small-line);
   }
   .number-control {
     display: flex;
     align-items: center;
-    gap: var(--space-2);
+    gap: var(--space-group);
     color: var(--text-muted);
-    font-size: var(--font-size-sm);
+    font-size: var(--type-meta-size);
+  }
+  .number-control :global(.kit-number-input) {
+    flex: 1;
+    min-width: 0;
   }
   .editor-actions {
     display: flex;
     justify-content: flex-end;
-    gap: var(--space-2);
+    gap: var(--space-group);
     flex-wrap: wrap;
+    margin-top: var(--space-box);
   }
   .editor-error {
     margin: 0;
     color: var(--text-danger);
-    font-size: var(--font-size-sm);
   }
 </style>

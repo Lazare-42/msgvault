@@ -15,36 +15,48 @@ import (
 )
 
 type domainPopulationProfile struct {
-	OperatorName string                    `json:"operator_name"`
-	ExtraInfo    map[string]any            `json:"extra_info"`
-	Children     []domainPopulationProfile `json:"children"`
+	Type             string                    `json:"type"`
+	ExtraInfo        map[string]any            `json:"extra_info"`
+	Children         []domainPopulationProfile `json:"children"`
+	IntermediateRows int64                     `json:"intermediate_rows"`
 }
 
 // Profile the public entry point so the regression also exercises dispatch
 // and parameter binding, rather than manually selecting a query-builder mode.
 func profileDomainPopulation(t *testing.T, engine *DuckDBEngine, request ExploreRequest) (domainPopulationProfile, error) {
 	t.Helper()
+	return profileQuery(t, engine, func() error {
+		_, err := engine.Explore(t.Context(), request)
+		return err
+	})
+}
+
+func profileQuery(t *testing.T, engine *DuckDBEngine, query func() error) (domainPopulationProfile, error) {
+	t.Helper()
 	path := filepath.Join(t.TempDir(), "listing.json")
-	_, err := engine.db.Exec("SET enable_profiling = 'json'")
+	_, err := engine.db.ExecContext(t.Context(), "SET enable_profiling = 'json'")
 	require.NoError(t, err)
-	_, err = engine.db.Exec("SET profiling_output = '" + escapePath(path) + "'")
+	_, err = engine.db.ExecContext(t.Context(), "SET profiling_output = '"+escapePath(path)+"'")
 	require.NoError(t, err)
-	_, exploreErr := engine.Explore(t.Context(), request)
-	_, err = engine.db.Exec("PRAGMA disable_profiling")
+	queryErr := query()
+	_, err = engine.db.ExecContext(t.Context(), "PRAGMA disable_profiling")
 	require.NoError(t, err)
-	if exploreErr != nil {
-		return domainPopulationProfile{}, exploreErr
+	if queryErr != nil {
+		return domainPopulationProfile{}, queryErr
 	}
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	var profile domainPopulationProfile
+	var profile struct {
+		Operators []domainPopulationProfile `json:"operator"`
+	}
 	require.NoError(t, json.Unmarshal(data, &profile))
-	return profile, nil
+	require.NotEmpty(t, profile.Operators)
+	return domainPopulationProfile{Children: profile.Operators}, nil
 }
 
 func (p domainPopulationProfile) domainEvaluations() int {
 	count := 0
-	if strings.TrimSpace(p.OperatorName) == "FILTER" {
+	if strings.TrimSpace(p.Type) == "FILTER" {
 		expression, _ := p.ExtraInfo["Expression"].(string)
 		if strings.Contains(expression, "sender_domain") {
 			count++
@@ -66,6 +78,7 @@ func FuzzExploreDomainPopulationShared(f *testing.F) {
 	f.Add("missing.example", true)
 	f.Add("quote'\x00.example", false)
 	f.Fuzz(func(t *testing.T, domain string, additionalOnly bool) {
+		t.Parallel()
 		engine, _ := buildFastPathEquivalenceEngine(t)
 		filter := Context{Domains: []string{domain}}
 		if additionalOnly {
@@ -88,6 +101,7 @@ func FuzzExploreDomainPopulationShared(f *testing.F) {
 }
 
 func TestExploreDomainPopulationKeepsMembershipAndPages(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	source := b.AddSource("owner@example.com")
 	alpha := b.AddParticipant("sender@alpha.example", "alpha.example", "Alpha")
@@ -175,6 +189,7 @@ func (p domainPopulationProfile) hasFilteredPopulation() bool {
 }
 
 func TestExploreEmptyDomainGroupsKeepScalarRescans(t *testing.T) {
+	t.Parallel()
 	engine, _ := buildFastPathEquivalenceEngine(t)
 	for _, tc := range []struct {
 		name   string
@@ -196,6 +211,7 @@ func TestExploreEmptyDomainGroupsKeepScalarRescans(t *testing.T) {
 // Domain groups intersect per message before chat fragments are collapsed.
 // Matching different groups in separate fragments must not qualify the chat.
 func TestExploreDomainIntersectionIsPerMessage(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	source := b.AddSource("owner@example.com")
 	alpha := b.AddParticipant("person@alpha.example", "alpha.example", "Alpha")
@@ -220,6 +236,7 @@ func FuzzExploreDomainGroupFormsAgree(f *testing.F) {
 	f.Add("missing.example", 1000, 0)
 	f.Add("\xc5XAMPLE.COM", 1, 0)
 	f.Fuzz(func(t *testing.T, domain string, limit, offset int) {
+		t.Parallel()
 		if limit < 0 || limit > maxExploreLimit || offset < 0 {
 			t.Skip("pagination is outside Explore's supported range")
 		}
@@ -246,4 +263,12 @@ func FuzzExploreDomainGroupFormsAgree(f *testing.F) {
 		require.NoError(t, additionalErr)
 		assert.Equal(t, primary, additional)
 	})
+}
+
+func (p domainPopulationProfile) maxCardinality() int {
+	count := int(p.IntermediateRows)
+	for _, child := range p.Children {
+		count = max(count, child.maxCardinality())
+	}
+	return count
 }

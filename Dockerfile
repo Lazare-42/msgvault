@@ -11,7 +11,7 @@ RUN cd web && bun run generate && bun run build
 
 # Go build stage.
 # Pin by digest for reproducibility; update periodically.
-FROM golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS builder
+FROM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS builder
 
 # Install build dependencies for CGO (SQLite, DuckDB).
 # libsqlite3-dev provides sqlite3.h, required to compile the sqlite-vec
@@ -45,6 +45,8 @@ ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 
 # Note: Module path must match go.mod (go.kenn.io/msgvault)
+# posthog.projectKey is the public PostHog ingest key for anonymous telemetry;
+# builds without it send no telemetry.
 RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
         -o /msgvault-codex-bridge ./cmd/msgvault-codex-bridge \
     && bridge_digest=$(sha256sum /msgvault-codex-bridge | cut -d' ' -f1) \
@@ -55,12 +57,13 @@ RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.Version=${VERSION} \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.Commit=${COMMIT} \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.BuildDate=${BUILD_DATE} \
+        -X go.kenn.io/kit/telemetry/posthog.projectKey=phc_AzHd9YvuHR7M5poKzC6eW654d3SgKyBdoQPuwkWhimUf \
         -X go.kenn.io/msgvault/internal/peoplesweep.codexBridgeSHA256=${bridge_digest}" \
     -o /msgvault \
     ./cmd/msgvault
 
 # Runtime stage - Debian provides current glibc for CGO/DuckDB bindings
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 # Install runtime dependencies (libstdc++ required for CGO/DuckDB)
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \

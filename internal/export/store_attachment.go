@@ -147,21 +147,25 @@ func attachmentLooseStore(baseDir string, staging packstore.StagingMode) (*packs
 	return store, nil
 }
 
-// DurableAttachmentReceipt identifies one durable loose publication. Created
+// DurableAttachmentReceipt describes a loose publication attempt. Created
 // distinguishes a blob introduced by this call from a verified deduplication.
+// A receipt returned with an error does not certify completed durability.
 type DurableAttachmentReceipt struct {
 	StoragePath string
 	ContentHash string
 	Created     bool
 }
 
-// StoreAttachmentFileDurable stores attachment content, including an empty
-// blob, through the content-addressed atomic write path. Unlike ordinary
-// ingest, this entry point is reserved for maintenance that will discard an
-// existing authoritative copy after the loose file is durable. Its receipt is
-// populated even when publication succeeded but a later durability step
-// failed, so callers can roll back a newly created blob.
-func StoreAttachmentFileDurable(attachmentsDir string, att *mime.Attachment) (DurableAttachmentReceipt, error) {
+// StoreAttachmentFileDurable publishes attachment content, including an empty
+// blob, with packstore.DurablePublication when attachmentsDir is configured.
+// It verifies deduplicated bytes and syncs file content and directory entries
+// before success. Gmail sync, remote-image archival, and maintenance use this
+// path when a stored reference or follow-up action requires durable bytes.
+//
+// A receipt can accompany an error after publication but before durability
+// completes. Callers must check the error before recording success; Created
+// identifies a new blob eligible for cleanup after checking its references.
+func StoreAttachmentFileDurable(ctx context.Context, attachmentsDir string, att *mime.Attachment) (DurableAttachmentReceipt, error) {
 	if attachmentsDir == "" {
 		return DurableAttachmentReceipt{}, nil
 	}
@@ -185,7 +189,7 @@ func StoreAttachmentFileDurable(attachmentsDir string, att *mime.Attachment) (Du
 	if err != nil {
 		return DurableAttachmentReceipt{}, err
 	}
-	result, writeErr := loose.WriteBytes(context.Background(), att.Content, packstore.WriteOptions{
+	result, writeErr := loose.WriteBytes(ctx, att.Content, packstore.WriteOptions{
 		Durability:   packstore.DurablePublication,
 		Dedup:        packstore.VerifyFullHash,
 		ExpectedHash: expectedHash,
@@ -313,7 +317,7 @@ func StoreAttachmentFromPathVerified(ctx context.Context, attachmentsDir, srcPat
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return "", contentHash, size, fmt.Errorf("rewind attachment source: %w", err)
 	}
-	result, writeErr := loose.Write(ctx, &attachmentContextReader{ctx: ctx, r: f}, packstore.WriteOptions{
+	result, writeErr := loose.Write(ctx, &ContextReader{Context: ctx, Reader: f}, packstore.WriteOptions{
 		Durability:   packstore.AtomicPublication,
 		Dedup:        packstore.VerifyFullHash,
 		ExpectedHash: hash,
@@ -329,7 +333,7 @@ func StoreAttachmentFromPathVerified(ctx context.Context, attachmentsDir, srcPat
 }
 
 func hashSourceFileContext(ctx context.Context, f *os.File, srcPath string, maxSize int64) (string, int64, error) {
-	src := io.Reader(&attachmentContextReader{ctx: ctx, r: f})
+	src := io.Reader(&ContextReader{Context: ctx, Reader: f})
 	if maxSize > 0 {
 		src = io.LimitReader(src, maxSize+1)
 	}
@@ -344,16 +348,33 @@ func hashSourceFileContext(ctx context.Context, f *os.File, srcPath string, maxS
 	return hex.EncodeToString(h.Sum(nil)), size, nil
 }
 
-type attachmentContextReader struct {
-	ctx context.Context
-	r   io.Reader
+// ContextReader stops reading when its context is canceled.
+type ContextReader struct {
+	Context context.Context
+	Reader  io.Reader
 }
 
-func (r *attachmentContextReader) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
+func (r *ContextReader) Read(p []byte) (int, error) {
+	if err := r.Context.Err(); err != nil {
 		return 0, err
 	}
-	return r.r.Read(p)
+	return r.Reader.Read(p)
+}
+
+// OpenAttachmentSource opens a regular file and checks its size when maxSize > 0.
+func OpenAttachmentSource(srcPath string, maxSize int64) (*os.File, error) {
+	linfo, err := os.Lstat(srcPath)
+	if err != nil {
+		return nil, fmt.Errorf("lstat attachment source: %w", err)
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, &os.PathError{Op: "open attachment source", Path: srcPath, Err: errors.New("not a regular file")}
+	}
+	if maxSize > 0 && linfo.Size() > maxSize {
+		return nil, fmt.Errorf("attachment source %q is %d bytes (max %d)", srcPath, linfo.Size(), maxSize)
+	}
+
+	return os.Open(srcPath)
 }
 
 // StoreAttachmentFromPath streams the regular file at srcPath into
@@ -371,24 +392,13 @@ func (r *attachmentContextReader) Read(p []byte) (int, error) {
 // the stored size. On failures after the source was hashed, contentHash and
 // size are still returned (with an empty storage path) so callers can record
 // metadata for content they could not store.
-func StoreAttachmentFromPath(attachmentsDir, srcPath string, maxSize int64) (string, string, int64, error) {
+func StoreAttachmentFromPath(ctx context.Context, attachmentsDir, srcPath string, maxSize int64) (string, string, int64, error) {
 	if attachmentsDir == "" || srcPath == "" {
 		return "", "", 0, errors.New("attachments dir and source path are required")
 	}
-	linfo, err := os.Lstat(srcPath)
+	f, err := OpenAttachmentSource(srcPath, maxSize)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("lstat attachment source: %w", err)
-	}
-	if !linfo.Mode().IsRegular() {
-		return "", "", 0, fmt.Errorf("attachment source %q is not a regular file", srcPath)
-	}
-	if maxSize > 0 && linfo.Size() > maxSize {
-		return "", "", 0, fmt.Errorf("attachment source %q is %d bytes (max %d)", srcPath, linfo.Size(), maxSize)
-	}
-
-	f, err := os.Open(srcPath)
-	if err != nil {
-		return "", "", 0, fmt.Errorf("open attachment source: %w", err)
+		return "", "", 0, err
 	}
 	defer func() { _ = f.Close() }()
 
@@ -418,7 +428,7 @@ func StoreAttachmentFromPath(attachmentsDir, srcPath string, maxSize int64) (str
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return "", contentHash, size, fmt.Errorf("rewind attachment source: %w", err)
 	}
-	result, writeErr := loose.Write(context.Background(), f, packstore.WriteOptions{
+	result, writeErr := loose.Write(ctx, f, packstore.WriteOptions{
 		Durability: packstore.AtomicPublication,
 		Dedup:      packstore.VerifyFullHash,
 		MaxBytes:   maxSize,

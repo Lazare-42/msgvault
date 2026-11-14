@@ -4,11 +4,11 @@
 
 export type SearchMediaParams = {
   /**
-   * Spoken words to find in transcripts
+   * Words to find in recordings and attachments
    */
   q: string;
   /**
-   * Lexical mode; semantic and hybrid are unavailable
+   * Attachment mode: lexical (default), semantic, or hybrid; recordings support lexical only
    */
   mode?: string;
   /**

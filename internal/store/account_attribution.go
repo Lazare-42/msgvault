@@ -288,20 +288,65 @@ func draftEvidenceSQL(m, src string) string {
 	return draftEvidenceInSchemaSQL("", m, src)
 }
 
+// UnsentMessageSQL returns the activity projector's SQLite predicate for aliases
+// m (messages) and src (sources).
+func UnsentMessageSQL() string {
+	return activityUnsentInSchemaSQL(&SQLiteDialect{}, "")
+}
+
+// UnsentCandidateMessageIDsSQL starts from draft evidence before evaluating
+// the shared predicate. Explicit send-state overrides need no draft evidence.
+func UnsentCandidateMessageIDsSQL() string {
+	var queries []string
+	for _, evidence := range draftEvidenceSources("", "draft_src") {
+		from := evidence.from
+		if evidence.sourceID != "" {
+			from += " JOIN sources draft_src ON draft_src.id = " + evidence.sourceID
+		}
+		query := "SELECT " + evidence.messageID + " FROM " + from
+		if evidence.condition != "" {
+			query += " WHERE " + evidence.condition
+		}
+		queries = append(queries, query)
+	}
+	return strings.Join(queries, " UNION ") + " UNION SELECT id FROM messages WHERE is_sent = FALSE"
+}
+
+type draftEvidenceSource struct {
+	from, messageID, sourceID, condition string
+}
+
+// draftEvidenceSources defines each evidence arm once for both correlated
+// message checks and the cache's evidence-first candidate scan.
+func draftEvidenceSources(schema, src string) []draftEvidenceSource {
+	return []draftEvidenceSource{
+		{from: schema + "message_labels ml JOIN " + schema + "labels l ON l.id = ml.label_id",
+			messageID: "ml.message_id", sourceID: "l.source_id",
+			condition: "(l.system_role = '" + LabelSystemRoleDrafts + "' OR (" + src + ".source_type = 'gmail' AND l.source_label_id = 'DRAFT'))"},
+		{from: schema + "imap_message_memberships imm", messageID: "imm.message_id", sourceID: "imm.source_id",
+			condition: `LOWER(CAST(imm.flags AS TEXT)) LIKE '%"\\draft"%' ESCAPE '!'`},
+		{from: schema + "imap_drafts d", messageID: "d.current_message_id"},
+		{from: schema + "imap_drafts d", messageID: "d.pending_original_message_id"},
+		{from: schema + "gmail_drafts d", messageID: "d.current_message_id"},
+		{from: schema + "gmail_drafts d", messageID: "d.pending_original_message_id"},
+	}
+}
+
 // draftEvidenceInSchemaSQL is draftEvidenceSQL reading its evidence tables
 // from schema, such as "src." for an attached source archive.
 func draftEvidenceInSchemaSQL(schema, m, src string) string {
-	return `(EXISTS (SELECT 1 FROM ` + schema + `message_labels ml JOIN ` + schema + `labels l ON l.id = ml.label_id
-		WHERE ml.message_id = ` + m + `.id AND l.source_id = ` + m + `.source_id
-		  AND (l.system_role = '` + LabelSystemRoleDrafts + `'
-		       OR (` + src + `.source_type = 'gmail' AND l.source_label_id = 'DRAFT')))
-		OR EXISTS (SELECT 1 FROM ` + schema + `imap_message_memberships imm
-		WHERE imm.message_id = ` + m + `.id AND imm.source_id = ` + m + `.source_id
-		  AND LOWER(CAST(imm.flags AS TEXT)) LIKE '%"\\draft"%' ESCAPE '!')
-		OR EXISTS (SELECT 1 FROM ` + schema + `imap_drafts d WHERE d.current_message_id = ` + m + `.id)
-		OR EXISTS (SELECT 1 FROM ` + schema + `imap_drafts d WHERE d.pending_original_message_id = ` + m + `.id)
-		OR EXISTS (SELECT 1 FROM ` + schema + `gmail_drafts d WHERE d.current_message_id = ` + m + `.id)
-		OR EXISTS (SELECT 1 FROM ` + schema + `gmail_drafts d WHERE d.pending_original_message_id = ` + m + `.id))`
+	var predicates []string
+	for _, evidence := range draftEvidenceSources(schema, src) {
+		where := evidence.messageID + " = " + m + ".id"
+		if evidence.sourceID != "" {
+			where += " AND " + evidence.sourceID + " = " + m + ".source_id"
+		}
+		if evidence.condition != "" {
+			where += " AND " + evidence.condition
+		}
+		predicates = append(predicates, "EXISTS (SELECT 1 FROM "+evidence.from+" WHERE "+where+")")
+	}
+	return "(" + strings.Join(predicates, " OR ") + ")"
 }
 
 // sourceHasSentFolderSQL is true when source src has a Sent folder, so
@@ -410,11 +455,15 @@ func headerBlock(raw []byte) []byte {
 }
 
 func parseDeliveryBlock(block []byte) (emailattribution.Headers, bool, error) {
+	return emailattribution.ParseHeaders(terminateHeaderBlock(block))
+}
+
+func terminateHeaderBlock(block []byte) []byte {
 	if mimeHeaderEnd(block) == 0 {
 		// A header-only payload has no blank line; terminate it for the reader.
 		block = append(slices.Clip(block), "\r\n\r\n"...)
 	}
-	return emailattribution.ParseHeaders(block)
+	return block
 }
 
 // refreshAccountAttributionTx is the one owner of messages.account_address
@@ -634,19 +683,29 @@ func (s *Store) calendarAccountAddressTx(
 	return address, nil
 }
 
+// MessageHeaderBlockContext returns a bounded outer MIME header block.
+func (s *Store) MessageHeaderBlockContext(ctx context.Context, id int64) ([]byte, error) {
+	prefix, compression, err := s.messageRawHeaderPrefix(ctx, ReadDBContext(ctx, s.db.DB), id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read raw MIME headers for message %d: %w", id, err)
+	}
+	block, err := decodeMessageRawHeaderBounded(prefix, compression, emailattribution.MaxHeaderBytes)
+	if err != nil {
+		return nil, err
+	}
+	return terminateHeaderBlock(block), nil
+}
+
 // readDeliveryHeadersTx reads a bounded prefix of the stored MIME and parses
 // its delivery headers. Undecodable payloads report malformed with no
 // evidence; SQL errors return.
 func (s *Store) readDeliveryHeadersTx(
 	ctx context.Context, tx *loggedTx, id int64,
 ) (emailattribution.Headers, bool, error) {
-	var prefix []byte
-	var compression sql.NullString
-	err := tx.QueryRowContext(ctx, `
-		SELECT `+s.dialect.BlobPrefixSQL("raw_data")+`, compression
-		FROM message_raw WHERE message_id = ? AND raw_format = 'mime'`,
-		accountHeaderRawPrefix, id,
-	).Scan(&prefix, &compression)
+	prefix, compression, err := s.messageRawHeaderPrefix(ctx, tx.Tx, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return emailattribution.Headers{}, false, nil
 	}
@@ -655,6 +714,15 @@ func (s *Store) readDeliveryHeadersTx(
 	}
 	headers, malformed := decodeDeliveryHeaders(prefix, compression)
 	return headers, malformed, nil
+}
+
+func (s *Store) messageRawHeaderPrefix(ctx context.Context, reader SQLReader, id int64) ([]byte, sql.NullString, error) {
+	var prefix []byte
+	var compression sql.NullString
+	err := reader.QueryRowContext(ctx, s.Rebind(`
+		SELECT `+s.dialect.BlobPrefixSQL("raw_data")+`, compression
+		FROM message_raw WHERE message_id = ? AND raw_format = 'mime'`), accountHeaderRawPrefix, id).Scan(&prefix, &compression)
+	return prefix, compression, err
 }
 
 // decodeDeliveryHeaders reads delivery evidence from a stored blob prefix.
@@ -1288,20 +1356,40 @@ func (s *Store) deriveAccountAttributionPagesContext(
 	ctx context.Context, sourceID int64, progress func(AccountAttributionRepairSummary),
 	page func(tx *loggedTx, after int64, limit int) ([]int64, error),
 ) (AccountAttributionRepairSummary, error) {
+	scanned, flagged, err := s.derivePagesContext(ctx, sourceID, "derive account attribution", page,
+		func(tx *loggedTx, id int64) (bool, error) {
+			return s.refreshAccountAttributionTx(ctx, tx, id, deliveryInput{})
+		},
+		func(scanned, flagged int64) {
+			if progress != nil {
+				progress(AccountAttributionRepairSummary{Scanned: scanned, Undecodable: flagged})
+			}
+		})
+	return AccountAttributionRepairSummary{Scanned: scanned, Undecodable: flagged}, err
+}
+
+// derivePagesContext runs derive on each ID page returns, a page per shared
+// attribution transaction on sourceID. derive reports whether the row needs
+// a flag in the summary (undecodable, incomplete). progress sees the running
+// totals after each committed page.
+func (s *Store) derivePagesContext(
+	ctx context.Context, sourceID int64, what string,
+	page func(tx *loggedTx, after int64, limit int) ([]int64, error),
+	derive func(tx *loggedTx, id int64) (bool, error),
+	progress func(scanned, flagged int64),
+) (scanned, flagged int64, err error) {
 	limit := accountRepairPageSize
 	if s.accountRepairPageSizeOverride > 0 {
 		limit = s.accountRepairPageSizeOverride
 	}
-	var summary AccountAttributionRepairSummary
 	var after int64
 	for {
 		if err := ctx.Err(); err != nil {
-			return summary, err
+			return scanned, flagged, err
 		}
-		var pageSummary AccountAttributionRepairSummary
-		var last int64
+		var pageScanned, pageFlagged, last int64
 		err := s.withAttributionTxContext(ctx, attributionLock{Sources: []int64{sourceID}}, func(tx *loggedTx) error {
-			pageSummary, last = AccountAttributionRepairSummary{}, 0
+			pageScanned, pageFlagged, last = 0, 0, 0
 			ids, err := page(tx, after, limit)
 			if err != nil {
 				return err
@@ -1310,29 +1398,29 @@ func (s *Store) deriveAccountAttributionPagesContext(
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				malformed, err := s.refreshAccountAttributionTx(ctx, tx, id, deliveryInput{})
+				flag, err := derive(tx, id)
 				if err != nil {
 					return err
 				}
-				pageSummary.Scanned++
-				if malformed {
-					pageSummary.Undecodable++
+				pageScanned++
+				if flag {
+					pageFlagged++
 				}
 				last = id
 			}
 			return nil
 		})
 		if err != nil {
-			return summary, fmt.Errorf("derive account attribution for source %d: %w", sourceID, err)
+			return scanned, flagged, fmt.Errorf("%s for source %d: %w", what, sourceID, err)
 		}
-		if pageSummary.Scanned == 0 {
-			return summary, nil
+		if pageScanned == 0 {
+			return scanned, flagged, nil
 		}
-		summary.Scanned += pageSummary.Scanned
-		summary.Undecodable += pageSummary.Undecodable
+		scanned += pageScanned
+		flagged += pageFlagged
 		after = last
 		if progress != nil {
-			progress(summary)
+			progress(scanned, flagged)
 		}
 	}
 }

@@ -16,6 +16,7 @@ import (
 )
 
 func TestArchiveDuckDBEngineCanceledStartupCleansOwnedSpill(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	spillDir := t.TempDir()
 	ctx, cancel := context.WithCancel(t.Context())
@@ -30,6 +31,7 @@ func TestArchiveDuckDBEngineCanceledStartupCleansOwnedSpill(t *testing.T) {
 }
 
 func TestArchiveDuckDBEngineStartupHonorsDeadlineDuringPublication(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	builder := NewTestDataBuilder(t)
 	builder.AddSource("owner@example.com")
@@ -39,7 +41,7 @@ func TestArchiveDuckDBEngineStartupHonorsDeadlineDuringPublication(t *testing.T)
 	publicationLock := flock.New(CacheBuildLockPath(dir))
 	requirements.NoError(publicationLock.Lock())
 	spillDir := filepath.Join(t.TempDir(), "spill")
-	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the held publication lock keeps startup waiting
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond) //nolint:kennlint // deadlinetest: the deadline is the expected result; the held publication lock keeps startup waiting
 	defer cancel()
 	done := make(chan error, 1)
 	finished := make(chan struct{})
@@ -73,6 +75,7 @@ func TestArchiveDuckDBEngineStartupHonorsDeadlineDuringPublication(t *testing.T)
 }
 
 func TestArchiveDuckDBEngineRestrictsSQLToAnalytics(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	t.Run("missing analytics directory", func(t *testing.T) {
 		_, err := NewArchiveDuckDBEngine(t.Context(), "")
@@ -120,12 +123,12 @@ func TestArchiveDuckDBEngineRestrictsSQLToAnalytics(t *testing.T) {
 	})
 	t.Run("configuration remains locked", func(t *testing.T) {
 		for _, setting := range []string{"SET enable_external_access = true", "SET memory_limit = '1GB'"} {
-			_, err := engine.db.Exec(setting)
+			_, err := engine.db.ExecContext(t.Context(), setting)
 			require.Error(t, err)
 		}
 	})
 	t.Run("owner SQL remains privileged", func(t *testing.T) {
-		owner, err := NewDuckDBEngine(dir, "", nil)
+		owner, err := NewDuckDBEngine(t.Context(), dir, "", nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { require.NoError(t, owner.Close()) })
 		result, err := owner.QuerySQL(t.Context(), fmt.Sprintf("SELECT content FROM read_text('%s')", escapePath(outside)))
@@ -135,6 +138,7 @@ func TestArchiveDuckDBEngineRestrictsSQLToAnalytics(t *testing.T) {
 }
 
 func TestArchiveDuckDBEngineFollowsPublication(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	builder := NewTestDataBuilder(t)
@@ -150,14 +154,14 @@ func TestArchiveDuckDBEngineFollowsPublication(t *testing.T) {
 	requirements.NotNil(before.Cache)
 	assertions.Equal([][]any{{"Original publication"}}, before.Rows)
 
-	writer, err := NewDuckDBEngine(dir, "", nil)
+	writer, err := NewDuckDBEngine(t.Context(), dir, "", nil)
 	requirements.NoError(err)
 	t.Cleanup(func() { requirements.NoError(writer.Close()) })
 	files, err := filepath.Glob(filepath.Join(dir, "messages", "*", "*.parquet"))
 	requirements.NoError(err)
 	requirements.Len(files, 1)
 	replacement := filepath.Join(t.TempDir(), "replacement.parquet")
-	_, err = writer.db.Exec(fmt.Sprintf(
+	_, err = writer.db.ExecContext(t.Context(), fmt.Sprintf(
 		"COPY (SELECT * EXCLUDE (message_type) REPLACE ('New publication' AS subject) FROM read_parquet('%s')) TO '%s' (FORMAT PARQUET)",
 		escapePath(files[0]), escapePath(replacement)))
 	requirements.NoError(err)

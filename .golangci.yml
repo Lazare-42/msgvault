@@ -38,6 +38,7 @@ linters:
     - errorlint
     - exhaustive
     - exptostd
+    - fatcontext
     - forbidigo
     - forcetypeassert
     - ginkgolinter
@@ -61,6 +62,7 @@ linters:
     - intrange
     - iotamixing
     - kennlint
+    - kennnolint
     - loggercheck
     - makezero
     - mirror
@@ -71,6 +73,7 @@ linters:
     - nilerr
     - nilnesserr
     - nilnil
+    - noctx
     - nolintlint
     - nosprintfhostport
     - perfsprint
@@ -100,14 +103,30 @@ linters:
   # Deliberately not enabled (kept here so an upgrade cannot quietly re-add them):
   #   style/opinionated: nlreturn, wsl, wsl_v5, varnamelen, ireturn, lll,
   #     tagliatelle, exhaustruct, nonamedreturns, tagalign, noinlineerr, dupl,
-  #     dupword, fatcontext, funcorder, containedctx, godox, interfacebloat, unqueryvet
+  #     dupword, funcorder, godox, interfacebloat, unqueryvet
   #   complexity (trust reviewer judgment): funlen, cyclop, gocognit, maintidx, gocyclo, nestif
   #   project misfit: depguard, mnd, gochecknoglobals, gochecknoinits, testpackage,
   #     paralleltest, tparallel, gosmopolitan, prealloc, err113
   #   deprecated: none of the enabled linter names are deprecated
-  #   pending dedicated passes: contextcheck, noctx (see follow-up PRs)
+  #   context misfit:
+  #     containedctx: the stored contexts belong to adapters for interfaces
+  #       without a context parameter (io.Reader, oauth2.TokenSource, Bubble
+  #       Tea models) or to lifecycle owners such as the scheduler and the
+  #       daemon client; moving them would not change cancellation.
+  #     contextcheck: it reports every call from a function with a context
+  #       to one without, including Close methods, constructors, and work
+  #       that ignores cancellation on purpose. A function-level nolint
+  #       silences it but nolintlint then reports the directive as unused.
 
   settings:
+    nolintlint:
+      require-specific: true
+
+    usetesting:
+      # Tests use t.Context() so a test's work stops when the test ends.
+      context-background: true
+      context-todo: true
+
     misspell:
       ignore-rules:
         - thrid # Google exports use the literal X-GM-THRID header.
@@ -213,8 +232,13 @@ linters:
         - .Err(
 
     custom:
+      kennnolint:
+        type: module
+        description: Kit suppression rule labels and reasons.
+        original-url: go.kenn.io/kit/lint
       # Kit's analyzers, built into custom-gcl by `make lint`. Only sleeptest
-      # and deadlinetest run. The stock sqlclosecheck and rowserrcheck above
+      # and deadlinetest run here; the separate kennnolint rule is listed above.
+      # The stock sqlclosecheck and rowserrcheck above
       # stay; Kit's copies and its other analyzers are off until they get
       # their own pass.
       kennlint:

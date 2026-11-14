@@ -70,19 +70,20 @@ func InteractivePolicyWithOverrides(tempDirectory string, overrides InteractiveO
 
 // BuilderPolicy returns the bounded policy for cache derivation processes.
 func BuilderPolicy(tempDirectory string) Policy {
-	return Policy{
-		MemoryLimit:          "2GB",
-		Threads:              min(runtime.GOMAXPROCS(0), 2),
-		TempDirectory:        tempDirectory,
-		MaxTempDirectorySize: "32GB",
-	}
+	return BuilderPolicyWithOverrides(tempDirectory, BuilderOverrides{})
 }
 
 // BuilderPolicyWithOverrides applies non-zero overrides to BuilderPolicy.
 func BuilderPolicyWithOverrides(tempDirectory string, overrides BuilderOverrides) Policy {
-	policy := BuilderPolicy(tempDirectory)
-	if overrides.MemoryLimit != "" {
-		policy.MemoryLimit = overrides.MemoryLimit
+	memoryLimit := overrides.MemoryLimit
+	if memoryLimit == "" {
+		memoryLimit = defaultBuilderMemoryLimit()
+	}
+	policy := Policy{
+		MemoryLimit:          memoryLimit,
+		Threads:              min(runtime.GOMAXPROCS(0), 2),
+		TempDirectory:        tempDirectory,
+		MaxTempDirectorySize: "32GB",
 	}
 	if overrides.Threads != 0 {
 		policy.Threads = overrides.Threads
@@ -93,13 +94,40 @@ func BuilderPolicyWithOverrides(tempDirectory string, overrides BuilderOverrides
 	return policy
 }
 
+// BuilderError adds actionable resource guidance to a cache builder exhaustion
+// error while preserving its cause. Pass the policy used to open the connection.
+func BuilderError(err error, policy Policy) error {
+	if _, annotated := errors.AsType[*builderResourceError](err); annotated {
+		return err
+	}
+	if !IsOutOfMemory(err) {
+		return err
+	}
+	return &builderResourceError{fmt.Errorf("%w; cache builder limits: analytics.builder_memory_limit=%s, "+
+		"analytics.builder_threads=%d, analytics.builder_temp_limit=%s; "+
+		"check available memory and free disk space before raising the relevant "+
+		"builder limit in config.toml, or reduce analytics.builder_threads; "+
+		"retry with msgvault build-cache", err,
+		policy.MemoryLimit, policy.Threads, policy.MaxTempDirectorySize)}
+}
+
+// A nested build must retain the policy of the connection that actually failed.
+type builderResourceError struct{ error }
+
+func (e *builderResourceError) Unwrap() error { return e.error }
+
 // Open creates one in-memory DuckDB connection and applies policy before any
 // analytical work can run.
 func Open(ctx context.Context, policy Policy) (*sql.DB, error) {
 	if !Available {
 		return nil, errors.New("DuckDB requires a build with CGO enabled")
 	}
-	db, err := sql.Open("duckdb", "")
+	if err := policy.validate(); err != nil {
+		return nil, err
+	}
+	// Bound both pools before DuckDB starts them; applying limits after opening
+	// still pays for the host-sized default pools during initialization.
+	db, err := sql.Open("duckdb", fmt.Sprintf("?threads=%d&async_threads=%d", policy.Threads, policy.Threads))
 	if err != nil {
 		return nil, fmt.Errorf("open duckdb: %w", err)
 	}
@@ -117,17 +145,8 @@ func Apply(ctx context.Context, db *sql.DB, policy Policy) error {
 	if db == nil {
 		return errors.New("apply duckdb policy: nil database")
 	}
-	if policy.Threads <= 0 {
-		return errors.New("apply duckdb policy: threads must be positive")
-	}
-	if !ValidSize(policy.MemoryLimit) {
-		return fmt.Errorf("apply duckdb policy: invalid memory limit %q", policy.MemoryLimit)
-	}
-	if !ValidSize(policy.MaxTempDirectorySize) {
-		return fmt.Errorf("apply duckdb policy: invalid temp-directory limit %q", policy.MaxTempDirectorySize)
-	}
-	if policy.TempDirectory == "" || !filepath.IsAbs(policy.TempDirectory) {
-		return errors.New("apply duckdb policy: temp directory must be absolute")
+	if err := policy.validate(); err != nil {
+		return err
 	}
 	if err := os.MkdirAll(policy.TempDirectory, 0o700); err != nil {
 		return fmt.Errorf("create duckdb temp directory: %w", err)
@@ -140,6 +159,7 @@ func Apply(ctx context.Context, db *sql.DB, policy Policy) error {
 	}{
 		{name: "memory_limit", sql: "SET memory_limit = '" + policy.MemoryLimit + "'"},
 		{name: "threads", sql: fmt.Sprintf("SET threads = %d", policy.Threads)},
+		{name: "async_threads", sql: fmt.Sprintf("SET async_threads = %d", policy.Threads)},
 		{name: "preserve_insertion_order", sql: "SET preserve_insertion_order = false"},
 		{name: "temp_directory", sql: "SET temp_directory = '" + quotedTemp + "'"},
 		{name: "max_temp_directory_size", sql: "SET max_temp_directory_size = '" + policy.MaxTempDirectorySize + "'"},
@@ -148,6 +168,22 @@ func Apply(ctx context.Context, db *sql.DB, policy Policy) error {
 		if _, err := db.ExecContext(ctx, setting.sql); err != nil {
 			return fmt.Errorf("set duckdb %s: %w", setting.name, err)
 		}
+	}
+	return nil
+}
+
+func (policy Policy) validate() error {
+	if policy.Threads <= 0 {
+		return errors.New("apply duckdb policy: threads must be positive")
+	}
+	if !ValidSize(policy.MemoryLimit) {
+		return fmt.Errorf("apply duckdb policy: invalid memory limit %q", policy.MemoryLimit)
+	}
+	if !ValidSize(policy.MaxTempDirectorySize) {
+		return fmt.Errorf("apply duckdb policy: invalid temp-directory limit %q", policy.MaxTempDirectorySize)
+	}
+	if policy.TempDirectory == "" || !filepath.IsAbs(policy.TempDirectory) {
+		return errors.New("apply duckdb policy: temp directory must be absolute")
 	}
 	return nil
 }

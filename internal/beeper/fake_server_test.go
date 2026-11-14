@@ -90,6 +90,9 @@ type fakeBeeper struct {
 	// failChatSearch makes GET /v1/chats/search answer 400.
 	failChatSearch bool
 	// failChatGets makes GET /v1/chats/{id} answer 400 for the listed chats.
+	// goneChatGets makes the same request answer 404 while the chat's messages
+	// stay readable, as when Beeper drops a chat from its index.
+	goneChatGets map[string]bool
 	failChatGets map[string]bool
 	chats        []*fakeChat
 	assets       map[string][]byte // asset URL (mxc://...) -> bytes served by /v1/assets/serve
@@ -114,15 +117,12 @@ type fakeBeeper struct {
 	cancelOnMessageListChatID string
 	blockMessageListChatID    string
 	messageListStarted        chan struct{}
+	blockChatGetID            string
+	chatGetStarted            chan struct{}
 	reqs                      []string // "PATH?QUERY" per request, in order
 }
 
 func newFakeBeeper(t *testing.T) *fakeBeeper {
-	t.Helper()
-	// Retries are exercised without real waits.
-	oldBackoff := fetchRetryBackoff
-	fetchRetryBackoff = []time.Duration{0, 0}
-	t.Cleanup(func() { fetchRetryBackoff = oldBackoff })
 	t.Helper()
 	return &fakeBeeper{t: t, pageSize: 20, assets: map[string][]byte{}, failMessageGets: map[string]bool{},
 		failMessageLists: map[string]bool{}, failMessageListsTimes: map[string]int{}, failChatGets: map[string]bool{}}
@@ -270,6 +270,14 @@ func (f *fakeBeeper) cancelMessageListFor(chatID string, cancelFn func()) {
 	f.cancelFn = cancelFn
 }
 
+func (f *fakeBeeper) blockChatGetFor(chatID string) <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.blockChatGetID = chatID
+	f.chatGetStarted = make(chan struct{})
+	return f.chatGetStarted
+}
+
 func (f *fakeBeeper) server() *httptest.Server {
 	return httptest.NewServer(f.handler())
 }
@@ -297,6 +305,18 @@ func (f *fakeBeeper) handler() http.HandlerFunc {
 			rest := strings.TrimPrefix(path, "/v1/chats/")
 			switch parts := strings.SplitN(rest, "/", 3); {
 			case len(parts) == 1:
+				f.mu.Lock()
+				blocked := f.blockChatGetID == parts[0]
+				started := f.chatGetStarted
+				if blocked {
+					f.blockChatGetID = ""
+				}
+				f.mu.Unlock()
+				if blocked {
+					close(started)
+					<-r.Context().Done()
+					return
+				}
 				f.writeChat(w, parts[0])
 			case len(parts) == 2 && parts[1] == "messages":
 				f.mu.Lock()
@@ -417,6 +437,10 @@ func (f *fakeBeeper) writeChat(w http.ResponseWriter, chatID string) {
 	defer f.mu.Unlock()
 	if f.failChatGets[chatID] {
 		http.Error(w, `{"error":"transient"}`, http.StatusBadRequest)
+		return
+	}
+	if f.goneChatGets[chatID] {
+		http.Error(w, `{"error":"chat not found"}`, http.StatusNotFound)
 		return
 	}
 	for _, ch := range f.chats {

@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/sqldialect"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
@@ -40,10 +41,10 @@ func postgresFTSRankExpression(vectorExpr, queryArg string) string {
 // to_tsquery + ts_rank_cd on the inline messages.search_fts
 // column and pgvector's `<=>` cosine-distance operator. The FTS
 // argument is rendered from req.FTSTerms via
-// query.PostgreSQLQueryDialect.BuildFTSTerm (lexeme:* AND-joined) so
+// query.PostgreSQLQueryDialect.BuildFTSTerm (ordered phrases with a final prefix) so
 // the BM25 leg prefix-matches the same term set SQLite does. The
 // 'simple' text-search configuration matches what
-// FTSUpsert/FTSBackfillBatchSQL in internal/store/dialect_pg.go writes
+// FTSUpsert in internal/store/dialect_pg.go writes
 // into search_fts, so query-time tokens line up with stored tokens (no
 // English stemming on either side). The returned PoolSaturated flag is true
 // when either per-signal pool produced more than KPerSignal candidates —
@@ -109,7 +110,7 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	// sizes. Args, binds and CTEs are rebuilt per call because the inner
 	// LIMIT participates in positional binding; the widening loop re-issues
 	// it with a growing innerChunks until the ANN pool is large enough.
-	runFused := func(innerChunks int) ([]vector.FusedHit, int, int, error) {
+	runFused := func(innerChunks int) ([]vector.FusedHit, int, int, bool, error) {
 		var args []any
 		bind := func(v any) string {
 			args = append(args, v)
@@ -130,6 +131,7 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 		// subquery uses a correlated EXISTS instead of a JOIN. For a
 		// non-empty filter the materialized CTE is reasonable: it computes
 		// the filtered set once and reuses it across both signals. [V1]
+		omittedFTS, omittedANN := "FALSE", "FALSE"
 		var ctes []string
 		if !emptyFilter {
 			filterSQL := applyFilterClauses(req.Filter, bind)
@@ -138,14 +140,11 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 		}
 
 		if useFTS {
-			// Render the dialect-neutral terms into a PG tsquery arg
-			// (lexeme:* AND-joined) BEFORE binding. to_tsquery requires a
-			// pre-formatted argument (operators &, prefix :*) and ERRORS on
-			// raw text — this is safe ONLY because we always feed it
-			// PostgreSQLQueryDialect.BuildFTSTerm's output, never raw text.
+			// Use the shared phrase predicate before applying the pool limit.
 			_, tsArg := query.PostgreSQLQueryDialect{}.BuildFTSTerm(req.FTSTerms)
 			ftsArg := bind(tsArg)
 			ftsRank := postgresFTSRankExpression("m.search_fts", ftsArg)
+			ftsPredicate := sqldialect.PostgreSQLSearchPredicate(ftsArg, req.FTSTerms)
 			kp1Arg := bind(kPlus1)
 			kArg := bind(req.KPerSignal)
 			// Empty filter: scan messages directly with an inline liveness
@@ -157,15 +156,18 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 				ftsFrom = ""
 				ftsLive = "       AND " + liveSQL + "\n"
 			}
+			omittedFTS = fmt.Sprintf(`((SELECT COUNT(*) FROM fts_pool) > %s AND EXISTS (
+ SELECT 1 FROM messages m %s WHERE %s
+ %s AND m.id NOT IN (SELECT message_id FROM fused)))`, kArg, ftsFrom, ftsPredicate, ftsLive)
 			ctes = append(ctes,
 				fmt.Sprintf(`fts_pool AS (
     SELECT m.id AS message_id,
            %s AS bm25
       FROM messages m
-%s     WHERE m.search_fts @@ to_tsquery('simple', %s)
+%s     WHERE %s
 %s     ORDER BY bm25 DESC
      LIMIT %s
-)`, ftsRank, ftsFrom, ftsArg, ftsLive, kp1Arg),
+)`, ftsRank, ftsFrom, ftsPredicate, ftsLive, kp1Arg),
 				fmt.Sprintf(`fts_ranked AS (
     SELECT message_id, bm25,
            ROW_NUMBER() OVER (ORDER BY bm25 DESC, message_id ASC) AS rnk
@@ -205,6 +207,9 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 					"               AND EXISTS (SELECT 1 FROM messages m WHERE m.id = e.message_id AND %s)\n",
 					liveSQL)
 			}
+			omittedANN = fmt.Sprintf(`((SELECT COUNT(*) FROM ann_pool) > %s AND EXISTS (
+ SELECT 1 FROM embeddings e %s WHERE e.generation_id = %s AND e.dimension = %d
+ %s AND e.message_id NOT IN (SELECT message_id FROM fused)))`, kArg, annConstraint, genArg, dim, annLive)
 			ctes = append(ctes,
 				fmt.Sprintf(`ann_pool AS (
     SELECT ann.message_id,
@@ -282,26 +287,27 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 		query := "WITH " + strings.Join(ctes, ",\n") + fmt.Sprintf(`
 SELECT message_id, rrf_score, bm25_score, vector_score,
        %s AS fts_pool_size,
-       %s AS ann_pool_size
+       %s AS ann_pool_size,
+       CASE WHEN %s >= (SELECT COUNT(*) FROM fused) THEN %s OR %s ELSE FALSE END AS candidate_omitted
   FROM fused
  ORDER BY rrf_score DESC, message_id ASC
- LIMIT %s`, ftsPoolExpr, annPoolExpr, limitArg)
+ LIMIT %s`, ftsPoolExpr, annPoolExpr, bind(req.Limit), omittedFTS, omittedANN, limitArg)
 
 		rows, err := b.db.QueryContext(ctx, query, args...)
 		if err != nil {
-			return nil, 0, 0, fmt.Errorf("fused query: %w", err)
+			return nil, 0, 0, false, fmt.Errorf("fused query: %w", err)
 		}
 		defer func() { _ = rows.Close() }()
 
 		var hits []vector.FusedHit
 		var ftsPoolSize, annPoolSize int
-		var poolSizeRead bool
+		var poolSizeRead, omitted bool
 		for rows.Next() {
 			var h vector.FusedHit
 			var bm, vec sql.NullFloat64
 			var ftsPool, annPool int
-			if err := rows.Scan(&h.MessageID, &h.RRFScore, &bm, &vec, &ftsPool, &annPool); err != nil {
-				return nil, 0, 0, fmt.Errorf("scan fused hit: %w", err)
+			if err := rows.Scan(&h.MessageID, &h.RRFScore, &bm, &vec, &ftsPool, &annPool, &omitted); err != nil {
+				return nil, 0, 0, false, fmt.Errorf("scan fused hit: %w", err)
 			}
 			if !poolSizeRead {
 				ftsPoolSize = ftsPool
@@ -319,7 +325,7 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 			hits = append(hits, h)
 		}
 		if err := rows.Err(); err != nil {
-			return nil, 0, 0, fmt.Errorf("iterate fused hits: %w", err)
+			return nil, 0, 0, false, fmt.Errorf("iterate fused hits: %w", err)
 		}
 
 		// Saturation: when the fused result set is empty, the correlated
@@ -333,17 +339,17 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 			if useFTS {
 				if err := b.db.QueryRowContext(ctx,
 					prefix+"SELECT COUNT(*) FROM fts_pool", prefixArgs...).Scan(&ftsPoolSize); err != nil {
-					return nil, 0, 0, fmt.Errorf("count fts_pool: %w", err)
+					return nil, 0, 0, false, fmt.Errorf("count fts_pool: %w", err)
 				}
 			}
 			if useANN {
 				if err := b.db.QueryRowContext(ctx,
 					prefix+"SELECT COUNT(*) FROM ann_pool", prefixArgs...).Scan(&annPoolSize); err != nil {
-					return nil, 0, 0, fmt.Errorf("count ann_pool: %w", err)
+					return nil, 0, 0, false, fmt.Errorf("count ann_pool: %w", err)
 				}
 			}
 		}
-		return hits, ftsPoolSize, annPoolSize, nil
+		return hits, ftsPoolSize, annPoolSize, omitted, nil
 	}
 
 	// Widening loop. Start at (KPerSignal+1)*fusedANNChunksPerMessage so the
@@ -356,13 +362,14 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 		hits        []vector.FusedHit
 		ftsPoolSize int
 		annPoolSize int
+		omitted     bool
 	)
 	innerChunks := kPlus1 * fusedANNChunksPerMessage
 	for {
 		if useANN && chunkCeiling > 0 && innerChunks > chunkCeiling {
 			innerChunks = chunkCeiling
 		}
-		hits, ftsPoolSize, annPoolSize, err = runFused(innerChunks)
+		hits, ftsPoolSize, annPoolSize, omitted, err = runFused(innerChunks)
 		if err != nil {
 			return nil, vector.SearchMetadata{}, err
 		}
@@ -390,7 +397,7 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 	}
 
 	saturated := ftsPoolSize > req.KPerSignal || annPoolSize > req.KPerSignal
-	return hits, vector.SearchMetadata{PoolSaturated: saturated}, nil
+	return hits, vector.SearchMetadata{PoolSaturated: saturated, CandidatePoolOmitted: omitted}, nil
 }
 
 // filteredChunkMessageCount returns the number of distinct messages that

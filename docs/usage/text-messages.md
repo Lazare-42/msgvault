@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-10-06"
+last_edited: "2026-11-04"
 title: Text Messages
 description: Import chats and texts from common exports, and browse synchronized Teams and Discord conversations in msgvault.
 ---
@@ -9,7 +9,7 @@ or connect [Beeper](/docs/usage/beeper/), [Slack](/docs/usage/slack/),
 [Microsoft Teams](/docs/usage/teams/), or [Discord](/docs/usage/discord/) for
 ongoing sync.
 
-The [Web UI](/docs/web-ui/) groups chats into conversations in Everything;
+The [Web UI](/docs/web-ui/) groups chats into conversations in Messages;
 open a conversation to read its messages. In the [TUI](/docs/usage/tui/), press
 `m` to switch to Texts mode.
 
@@ -19,6 +19,8 @@ open a conversation to read its messages. In the [TUI](/docs/usage/tui/), press
 | [iMessage](#import-imessage) | macOS `chat.db` |
 | [iMazing Messages](#import-imazing-csv) | CSV export root or `csv/` directory |
 | [Google Voice](#import-gvoice) | Google Takeout Voice directory |
+| [Telegram](#import-telegram) | Telegram Desktop Machine-readable JSON export |
+| [X DMs](#import-x) | Extracted X account archive |
 | [Facebook Messenger](#import-messenger) | Download Your Information export |
 | [SMS Backup & Restore](#import-synctech-sms) | XML backup |
 | [Slackdump](/docs/usage/slack/#import-a-slackdump-export) | Export directory or ZIP |
@@ -71,6 +73,11 @@ msgvault import-whatsapp --phone +447700900000 \
 
 Reading the native store may require Full Disk Access for your terminal in
 **System Settings → Privacy & Security**.
+
+To keep it current with the daemon, add a scheduled
+[`[[whatsapp_apple]]` entry](/docs/configuration/#apple-whatsapp-sources) and run
+`msgvault serve`. Grant Full Disk Access to the process running the daemon too.
+The first run reads the whole store; later runs pick up changed messages.
 
 Run the same command again to pick up new messages. Each run writes only
 messages that are new or changed: edited text, a sender or chat that
@@ -126,6 +133,13 @@ that reports recoverable message errors.
 
 Import messages from the local iMessage database on macOS.
 
+To keep Messages current with the daemon, enable a schedule under
+[`[imessage]`](/docs/configuration/#imessage) and run `msgvault serve`.
+Grant Full Disk Access to the process running the daemon. Every run re-reads
+all of `chat.db` and writes only what changed, including late arrivals
+and edits.
+Choose an interval that allows for the time it takes to read your database. Sources shows run history and offers **Sync now**.
+
 ```bash
 msgvault import-imessage
 ```
@@ -136,6 +150,28 @@ By default, the command reads from `~/Library/Messages/chat.db`. No positional a
     **Full Disk Access required.** macOS protects `~/Library/Messages/chat.db`. Before running this command, grant Full Disk Access to your terminal app in System Settings > Privacy & Security > Full Disk Access.
 
 This is a read-only operation. msgvault does not modify your iMessage database.
+
+Eligible attachments referenced by `chat.db` are copied into the archive from
+the `Attachments` and `StickerCache` folders under `~/Library/Messages`. Every
+run reads the files again, so changed files are archived again, and bytes
+already archived are kept when a file can no longer be read. For a copied
+`chat.db`, `--messages-root` names the copied Messages folder, and paths into a
+Mac home folder are rebased onto it. Attachment metadata is retained when a
+file is unavailable or exceeds the default 250 MiB file limit or 20-participant
+conversation limit. The import summary counts unavailable and skipped
+attachments (including paths outside those folders), so an import without Full
+Disk Access on the Attachments folder does not look clean. iMessage voice notes
+are `.caf` files. They stay in the archive but are not transcribed, because
+Docbank only takes the audio formats listed in
+[Send audio to Docbank](/docs/usage/beeper/#send-audio-to-docbank).
+Pass `--no-attachments` to record attachment metadata without copying files.
+Set the participant and size limits under `[imessage]` in `config.toml`, or
+override the size for one run with `--max-media-mb`; see
+[Configuration](/docs/configuration/#imessage). Skipped attachments keep their
+metadata and the reason they were skipped. Rerunning with a stricter limit keeps
+the bytes already archived for files that have not changed. With
+`--no-attachments` the limits aren't applied, and attachments are recorded as
+metadata only.
 
 Apple timestamp sentinels and dates outside years 1 through 9999 are stored as
 missing dates. msgvault retains those messages and their raw timestamp
@@ -148,6 +184,16 @@ existing messages without creating duplicates. When it clears a previously
 stored date, msgvault rebuilds analytics so the old date is removed there too.
 Keep the original `--db-path` and `--me` options if you supplied them.
 
+Each run reads all of `chat.db` again and updates archived messages to match
+it. Edited text replaces the archived text. When a message no longer has text in
+`chat.db`, the next import clears its archived text and its snippet, and keyword
+search no longer matches that text. Unsending a message on iOS 16, macOS 13, or
+later removes its text this way. The message stays in the archive with its date
+and participants. Messages deleted from `chat.db` also stay in the archive.
+
+If msgvault can't decode a message's text in `chat.db`, it keeps the archived
+text and counts the message under `Unreadable text` in the import summary.
+
 ### Flags
 
 | Flag | Default | Description |
@@ -158,6 +204,9 @@ Keep the original `--db-path` and `--me` options if you supplied them.
 | `--limit` | `0` | Limit number of messages (for testing) |
 | `--me` | — | Your phone/email for recipient tracking |
 | `--contacts` | — | Path to a `.vcf` file used to backfill participant display names |
+| `--messages-root` | `~/Library/Messages` | Messages folder to read attachments from; rebase copied Mac paths here |
+| `--no-attachments` | `false` | Do not copy attachment files (attachment metadata is still recorded) |
+| `--max-media-mb` | `0` | Skip files larger than this many MiB; `0` uses `max_media_mb` from `[imessage]` (default 250) |
 
 ### Examples
 
@@ -394,7 +443,7 @@ msgvault sync-synctech-sms phone-backups
 
 Start `msgvault serve` and open the [Web UI](/docs/web-ui/) to search email, chats,
 calendar events, and meeting notes together. Chat results stay grouped as
-conversations so short message fragments do not overwhelm Everything. Open a
+conversations so short message fragments do not overwhelm Messages. Open a
 conversation to inspect its matching messages in context.
 
 For terminal browsing, launch the TUI and press `m` to cycle from Email to
@@ -435,3 +484,80 @@ msgvault tui
 # View updated archive stats
 msgvault stats
 ```
+
+## import-telegram
+
+In Telegram Desktop, export your data as **Machine-readable JSON**. Choose the media you want to keep, then import the directory containing `result.json`:
+
+```bash
+msgvault import-telegram /path/to/TelegramExport
+```
+
+Full exports identify your account. For a single-chat export, supply your numeric Telegram user ID:
+
+```bash
+msgvault import-telegram --me 482111 /path/to/chat-export
+```
+
+Messages include senders, replies, edit markers, and available media. Service messages, unsupported entries, and polls, locations, or contacts without text or media are skipped. Missing media is counted in the import summary.
+
+A later or overlapping export adds new messages and fills media slots that still lack bytes. Archived messages keep their original text, sender, timestamp, and edit flag. Media already stored stays unchanged. Replies link when their parent arrives in a later export. Telegram export users link to Beeper users with the same numeric Telegram user ID; for Beeper users already archived, the link appears when a sync revisits their chat (`sync-beeper --full` covers quiet chats).
+
+Every exported chat becomes a conversation, even one with no messages. Each import replaces the conversation title with the export's chat name when that name is non-empty.
+
+An interrupted import resumes after the last completed chat when `result.json` in the same directory has the same size and modification time. Use `--no-resume` to scan every chat again, or `--limit N` to cap the messages added in one run.
+
+## import-x
+
+Import supplied direct and group DMs from an
+extracted [X account archive](https://help.x.com/en/managing-your-account/how-to-download-your-x-archive):
+
+```bash
+msgvault import-x /path/to/x-archive
+msgvault import-x --me 100001 /path/to/x-archive/data
+```
+
+Pass the archive root or its `data` directory. `account.js` supplies the numeric
+owner ID. Without it, `--me <numeric-id>` is required; an override conflicting
+with `account.js` is rejected. Numeric X IDs remain distinct from public
+usernames. Missing names, timestamps and recipients stay unknown. Malformed
+timestamps also stay unknown while their original strings remain in message
+evidence.
+
+The importer reads `direct-messages.js`, `direct-messages-group.js` and their
+`-partN.js` files, with matching `window.YTD.direct_messages.partN` or
+`window.YTD.direct_messages_group.partN` assignments. It reads each
+`dmConversation`'s `conversationId` followed by its `messages` array and imports
+`messageCreate` records. Redacted real records cover direct and group messages,
+a group `joinConversation.participantsSnapshot`, and a direct-media URL.
+Numbered parts, account metadata and media bytes have synthetic test coverage.
+HTML-only exports, ZIP files and newer encrypted-chat formats are unsupported.
+The archive's contents determine coverage; deleted or lifetime history is not promised.
+
+Imported messages appear in Texts and search. Each message keeps its original
+JSON, timestamp string and source filename as evidence. This preserves imported
+message evidence, not a complete backup of the original export. Messages without
+usable dates remain in the archive and live full-text search; date-based cache
+views may omit them. Group membership
+snapshots add observed participants without removing earlier observations or
+inferring per-message recipients. One encountered snapshot and its provenance
+are retained as conversation metadata; it does not establish the final roster.
+Service and membership events are skipped as messages and counted in the summary.
+Invalid records and unknown events are counted separately.
+
+Local media comes from `direct_messages_media` or
+`direct_messages_group_media`. The archive viewer names each file
+`<messageCreate.id>-<URL filename>` in the corresponding directory, including
+video URLs. Video naming has synthetic test coverage against the viewer code;
+no real video record is included in the fixtures. URLs are never fetched.
+Nonregular, missing, unsafe or oversized files remain missing attachments. The existing
+250 MiB chat attachment limit applies. Each JSON event is limited to 1 MiB;
+whole conversations are streamed without a conversation-size limit.
+
+Re-running skips archived messages and retries attachment slots that still lack
+bytes. It preserves first-imported text, raw evidence and stored media. An
+interrupted import can be replayed safely; absence never deletes archived data.
+The summary reports direct/group conversation entries, added and duplicate
+messages, skipped events, invalid records and media outcomes. Conversation
+entries can repeat across numbered parts. Use `--no-default-identity` to skip
+recording the source account as a default identity.

@@ -3,10 +3,12 @@ package query
 import (
 	"context"
 	"database/sql"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/search"
@@ -29,28 +31,7 @@ func (e *DuckDBEngine) Explore(ctx context.Context, request ExploreRequest) (*Ex
 	}
 	defer release()
 
-	if err := search.ValidateAccountScopes(request.Context.AccountScopes); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidExploreRequest, err)
-	}
-	if request.Page.Offset < 0 || request.Page.Limit < 0 || request.Page.Limit > maxExploreLimit {
-		return nil, fmt.Errorf("%w: page is outside the supported range", ErrInvalidExploreRequest)
-	}
-	if request.Context.Deletion != DeletionAny &&
-		request.Context.Deletion != DeletionActive &&
-		request.Context.Deletion != DeletionDeleted {
-		return nil, fmt.Errorf("%w: unknown deletion filter %q", ErrInvalidExploreRequest, request.Context.Deletion)
-	}
-	if len(request.Grouping) > 0 {
-		return nil, fmt.Errorf("%w: grouped exploration is not available in the entry-row query", ErrInvalidExploreRequest)
-	}
-	if request.Presentation != PresentationDefault && request.Presentation != PresentationTable {
-		return nil, fmt.Errorf("%w: unsupported presentation %q", ErrInvalidExploreRequest, request.Presentation)
-	}
-	if len(request.Sort) > 1 || (len(request.Sort) == 1 &&
-		(request.Sort[0].Field != "sent_at" || request.Sort[0].Direction != sortDirectionDesc)) {
-		return nil, fmt.Errorf("%w: only sent_at descending sort is supported", ErrInvalidExploreRequest)
-	}
-	searchProvenance, err := validateResolvedSearch(request.Search)
+	searchProvenance, err := validateExploreRequest(request)
 	if err != nil {
 		return nil, err
 	}
@@ -75,9 +56,9 @@ func (e *DuckDBEngine) Explore(ctx context.Context, request ExploreRequest) (*Ex
 	countArgs := append(append([]any{}, conditionArgs...), candidateRankArgs...)
 	args := append(append([]any{}, countArgs...), limit, request.Page.Offset)
 	var queryText string
-	fastPath := !e.exploreFastPathDisabled && !exploreConditionsTouchParticipantLists(request)
+	fastPath := !e.exploreFastPathDisabled
 	if fastPath {
-		shareFilteredPopulation := len(request.Context.Domains) > 0
+		shareFilteredPopulation := len(request.Context.Domains) > 0 || len(request.Context.ParticipantIDs) > 0 || len(request.Context.AdditionalParticipantGroups) > 0
 		for _, group := range request.Context.AdditionalDomainGroups {
 			if len(group) > 0 {
 				shareFilteredPopulation = true
@@ -106,49 +87,10 @@ func (e *DuckDBEngine) Explore(ctx context.Context, request ExploreRequest) (*Ex
 		CacheRevision:    state.Revision(),
 		SearchProvenance: searchProvenance,
 	}
-	for rows.Next() {
-		var row EntryRow
-		var anchorID, conversationID, strongestMatchedMessageID, counterpartParticipantID sql.NullInt64
-		var participantIDsJSON, participantLabelsJSON string
-		if err := rows.Scan(
-			&row.Key, &row.Kind, &anchorID, &conversationID, &row.OccurredAt,
-			&row.SourceID, &row.SourceType, &row.SourceIdentifier,
-			&row.MessageType, &row.ConversationType, &row.Title, &row.Preview,
-			&participantIDsJSON, &participantLabelsJSON, &strongestMatchedMessageID, &row.MessageCount,
-			&row.HasAttachments, &row.AttachmentCount, &row.AttachmentSize,
-			&row.DeletedFromSource, &response.TotalCount, &counterpartParticipantID,
-		); err != nil {
-			return nil, fmt.Errorf("scan analytical entry: %w", err)
-		}
-		if row.Title == row.Preview {
-			row.Title = FlattenSnippet(row.Title)
-		}
-		row.Preview = FlattenSnippet(row.Preview)
-		if anchorID.Valid {
-			row.AnchorMessageID = &anchorID.Int64
-		}
-		if conversationID.Valid {
-			row.ConversationID = &conversationID.Int64
-		}
-		if strongestMatchedMessageID.Valid {
-			row.StrongestMatchedMessageID = &strongestMatchedMessageID.Int64
-		}
-		if counterpartParticipantID.Valid {
-			row.CounterpartParticipantID = &counterpartParticipantID.Int64
-		}
-		if err := json.Unmarshal([]byte(participantIDsJSON), &row.ParticipantIDs); err != nil {
-			return nil, fmt.Errorf("decode analytical participant IDs: %w", err)
-		}
-		if err := json.Unmarshal([]byte(participantLabelsJSON), &row.ParticipantLabels); err != nil {
-			return nil, fmt.Errorf("decode analytical participant labels: %w", err)
-		}
-		row.MatchedSenderIdentities = make([]string, 0)
-		row.MatchedRecipientIdentities = make([]string, 0)
-		response.Rows = append(response.Rows, row)
+	if err := scanExploreRows(rows, response); err != nil {
+		return nil, err
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate analytical entries: %w", err)
-	}
+
 	if len(response.Rows) == 0 && request.Page.Offset > 0 {
 		countSQL := buildExploreCountSQL(conditions, candidateRankExpression)
 		if fastPath {
@@ -255,16 +197,10 @@ func buildExploreCandidateRank(search SearchSpec) (string, []any) {
 	if search.Mode != SearchSemantic && search.Mode != SearchHybrid {
 		return "NULL::BIGINT", nil
 	}
-	parts := make([]string, len(search.CandidateMessageIDs))
-	args := make([]any, len(search.CandidateMessageIDs))
-	for i, messageID := range search.CandidateMessageIDs {
-		parts[i] = fmt.Sprintf("WHEN ? THEN %d", i)
-		args[i] = messageID
-	}
-	if len(parts) == 0 {
+	if len(search.CandidateMessageIDs) == 0 {
 		return "NULL::BIGINT", nil
 	}
-	return "CASE message_id " + strings.Join(parts, " ") + " ELSE NULL END", args
+	return "(list_position(?::BIGINT[], message_id) - 1)", []any{search.CandidateMessageIDs}
 }
 
 func validateResolvedSearch(search SearchSpec) (SearchProvenance, error) {
@@ -311,9 +247,37 @@ func validateResolvedSearch(search SearchSpec) (SearchProvenance, error) {
 	}
 }
 
+type exploreConditionDialect struct {
+	unicodeLower   func(string) string
+	envelopeColumn string
+	dateComparison func(string, string) string
+	dateParam      func(time.Time) any
+	messageTypes   func(string, []string) (string, []any)
+	candidates     func([]int64) (string, any)
+}
+
 func buildExploreConditions(request ExploreRequest) (string, []any) {
+	return buildExploreConditionsWithDialect(request, exploreConditionDialect{
+		unicodeLower:   func(column string) string { return "LOWER(" + column + ")" },
+		envelopeColumn: "envelope_address",
+		dateComparison: func(column, operator string) string { return column + " " + operator + " CAST(? AS TIMESTAMP)" },
+		dateParam:      func(value time.Time) any { return value.UTC() },
+		messageTypes:   duckDBMessageTypeCondition,
+		candidates:     func(ids []int64) (string, any) { return "message_id IN (SELECT UNNEST(?::BIGINT[]))", ids },
+	})
+}
+
+func buildExploreConditionsWithDialect(request ExploreRequest, dialect exploreConditionDialect) (string, []any) {
 	var conditions []string
 	var args []any
+	if request.SentOnly {
+		conditions = append(conditions, sentIdentityConditions("true"))
+	}
+	if request.PersonInteractionsOnly {
+		conditions = append(conditions, `(`+identityindex.EntryKindSQL("analytical_entries.message_type")+` NOT IN ('event', 'meeting') OR analytical_entries.message_id IN (
+			SELECT message_id FROM relationship_owner_event_messages
+		))`)
+	}
 	appendIntAnyOf := func(values []int64, expression string) {
 		if len(values) == 0 {
 			return
@@ -330,20 +294,30 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 		conditions = append(conditions, "message_id IN (SELECT account_m.id FROM messages account_m WHERE "+strings.Join(scopeConditions, " AND ")+")")
 		args = append(args, scopeArgs...)
 	}
-	if identityCondition, identityArgs := buildIdentityPredicateCondition(request.Context.Identity, ""); identityCondition != "" {
+	if identityCondition, identityArgs := buildIdentityPredicateCondition(request.Context.Identity, "", dialect.unicodeLower, dialect.envelopeColumn); identityCondition != "" {
 		conditions = append(conditions, identityCondition)
 		args = append(args, identityArgs...)
 	}
-	if len(request.Context.ParticipantIDs) > 0 {
-		parts := make([]string, len(request.Context.ParticipantIDs))
-		for i := range parts {
-			parts[i] = "(sender_id = ? OR list_contains(participant_ids, ?) OR list_contains(conversation_participant_ids, ?))"
+	appendParticipantGroup := func(values []int64) {
+		if len(values) == 0 {
+			return
 		}
-		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
-		for _, value := range request.Context.ParticipantIDs {
+		parts := make([]string, len(values))
+		for i, value := range values {
+			// Test the same sender, recipient, and roster membership as the
+			// list columns without aggregating lists for the whole archive.
+			parts[i] = `(sender_id = ? OR message_id IN (
+				SELECT participant_recipient.message_id FROM message_recipients participant_recipient
+				WHERE participant_recipient.participant_id = ?
+			) OR conversation_id IN (
+				SELECT participant_member.conversation_id FROM conversation_participants participant_member
+				WHERE participant_member.participant_id = ?
+			))`
 			args = append(args, value, value, value)
 		}
+		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
 	}
+	appendParticipantGroup(request.Context.ParticipantIDs)
 	appendDomainGroup := func(values []string) {
 		if len(values) == 0 {
 			return
@@ -352,14 +326,14 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 		for i, value := range values {
 			// Test the same sender, recipient, and roster membership as the
 			// list columns without aggregating lists for the whole archive.
-			parts[i] = `(lower(sender_domain) = lower(?) OR message_id IN (
+			parts[i] = `(` + dialect.unicodeLower("sender_domain") + ` = ` + dialect.unicodeLower("?") + ` OR message_id IN (
 				SELECT domain_recipient.message_id FROM message_recipients domain_recipient
 				JOIN participants domain_person ON domain_person.id = domain_recipient.participant_id
-				WHERE COALESCE(domain_person.domain, '') = lower(?)
+				WHERE COALESCE(` + identityindex.SenderDomainExpr("domain_recipient", "domain_person") + `, '') = ` + dialect.unicodeLower("?") + `
 			) OR conversation_id IN (
 				SELECT domain_member.conversation_id FROM conversation_participants domain_member
 				JOIN participants domain_person ON domain_person.id = domain_member.participant_id
-				WHERE COALESCE(domain_person.domain, '') = lower(?)
+				WHERE COALESCE(domain_person.domain, '') = ` + dialect.unicodeLower("?") + `
 			))`
 			args = append(args, value, value, value)
 		}
@@ -372,7 +346,7 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 		}
 		parts := make([]string, len(values))
 		for i, value := range values {
-			parts[i] = "LOWER(list_id) = LOWER(?)"
+			parts[i] = "(list_id IS NOT NULL AND " + dialect.unicodeLower("COALESCE(list_id, '')") + " = " + dialect.unicodeLower("?") + ")"
 			args = append(args, value)
 		}
 		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
@@ -383,17 +357,7 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 	// using the same predicate shape as the primary group above, and every
 	// group is AND'd into the overall condition list alongside it.
 	for _, group := range request.Context.AdditionalParticipantGroups {
-		if len(group) == 0 {
-			continue
-		}
-		parts := make([]string, len(group))
-		for i := range parts {
-			parts[i] = "(sender_id = ? OR list_contains(participant_ids, ?) OR list_contains(conversation_participant_ids, ?))"
-		}
-		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
-		for _, value := range group {
-			args = append(args, value, value, value)
-		}
+		appendParticipantGroup(group)
 	}
 	for _, group := range request.Context.AdditionalDomainGroups {
 		appendDomainGroup(group)
@@ -403,9 +367,19 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 	}
 	// duckDBMessageTypeCondition treats "email" as also matching NULL/empty
 	// message_type: legacy rows imported before message_type existed are email.
-	if messageTypeCondition, messageTypeArgs := duckDBMessageTypeCondition("", request.Context.MessageTypes); messageTypeCondition != "" {
+	if messageTypeCondition, messageTypeArgs := dialect.messageTypes("", request.Context.MessageTypes); messageTypeCondition != "" {
 		conditions = append(conditions, messageTypeCondition)
 		args = append(args, messageTypeArgs...)
+	}
+	if len(request.Context.Kinds) > 0 {
+		placeholders := make([]string, len(request.Context.Kinds))
+		for i, kind := range request.Context.Kinds {
+			placeholders[i] = "?"
+			args = append(args, string(kind))
+		}
+		kind := "CASE WHEN " + sqlIsChatPredicate("message_type", "conversation_type") +
+			" THEN 'conversation' ELSE " + identityindex.EntryKindSQL("message_type") + " END"
+		conditions = append(conditions, "("+kind+") IN ("+strings.Join(placeholders, ",")+")")
 	}
 	// CAST(? AS TIMESTAMP) pins the bound time to its UTC wall clock. The Go
 	// DuckDB driver binds time.Time as TIMESTAMP WITH TIME ZONE; left uncast,
@@ -413,12 +387,12 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 	// TIMESTAMPTZ on every row — a per-row ICU session-timezone conversion
 	// (the relationship index avoids the same measured conversion hazard).
 	if request.Context.After != nil {
-		conditions = append(conditions, "occurred_at >= CAST(? AS TIMESTAMP)")
-		args = append(args, request.Context.After.UTC())
+		conditions = append(conditions, dialect.dateComparison("occurred_at", ">="))
+		args = append(args, dialect.dateParam(*request.Context.After))
 	}
 	if request.Context.Before != nil {
-		conditions = append(conditions, "occurred_at < CAST(? AS TIMESTAMP)")
-		args = append(args, request.Context.Before.UTC())
+		conditions = append(conditions, dialect.dateComparison("occurred_at", "<"))
+		args = append(args, dialect.dateParam(*request.Context.Before))
 	}
 	switch request.Context.Deletion {
 	case DeletionAny:
@@ -431,12 +405,9 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 		if len(request.Search.CandidateMessageIDs) == 0 {
 			conditions = append(conditions, "false")
 		} else {
-			parts := make([]string, len(request.Search.CandidateMessageIDs))
-			for i, id := range request.Search.CandidateMessageIDs {
-				parts[i] = "?"
-				args = append(args, id)
-			}
-			conditions = append(conditions, "message_id IN ("+strings.Join(parts, ",")+")")
+			condition, arg := dialect.candidates(request.Search.CandidateMessageIDs)
+			conditions = append(conditions, condition)
+			args = append(args, arg)
 		}
 	}
 	if len(conditions) == 0 {
@@ -445,7 +416,7 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 	return strings.Join(conditions, " AND "), args
 }
 
-func buildIdentityPredicateCondition(identity *IdentityPredicate, prefix string) (string, []any) {
+func buildIdentityPredicateCondition(identity *IdentityPredicate, prefix string, lower func(string) string, envelopeColumn string) (string, []any) {
 	if identity == nil {
 		return "", nil
 	}
@@ -505,11 +476,12 @@ func buildIdentityPredicateCondition(identity *IdentityPredicate, prefix string)
 			return participantMatch(alias + ".participant_id")
 		}
 		args = append(args, identity.EmailIdentifier)
-		envelope := "(COALESCE(" + alias + ".envelope_address, '') <> '' AND LOWER(" + alias + ".envelope_address) = LOWER(?))"
+		column := alias + "." + envelopeColumn
+		envelope := "(COALESCE(" + column + ", '') <> '' AND " + lower("COALESCE("+column+", '')") + " = " + lower("?") + ")"
 		if len(identity.ParticipantIDs) == 0 {
 			return envelope
 		}
-		return "(" + envelope + " OR (COALESCE(" + alias + ".envelope_address, '') = '' AND " +
+		return "(" + envelope + " OR (COALESCE(" + alias + "." + envelopeColumn + ", '') = '' AND " +
 			participantMatch(alias+".participant_id") + fallbackGuard + "))"
 	}
 	senderCondition := func() string {
@@ -517,7 +489,7 @@ func buildIdentityPredicateCondition(identity *IdentityPredicate, prefix string)
 			SELECT 1 FROM message_recipients identity_mr_sender_envelope
 			WHERE identity_mr_sender_envelope.message_id = ` + outerPrefix + `message_id
 			  AND identity_mr_sender_envelope.recipient_type = 'from'
-			  AND COALESCE(identity_mr_sender_envelope.envelope_address, '') <> ''
+			  AND COALESCE(identity_mr_sender_envelope.` + envelopeColumn + `, '') <> ''
 		)`
 		explicitFrom := `EXISTS (
 			SELECT 1 FROM message_recipients identity_mr_sender
@@ -571,13 +543,18 @@ func buildExploreSQL(conditions, candidateRankExpression, clustersGlob, ownersGl
 ), counted AS (
     SELECT *, COUNT(*) OVER () AS total_count
     FROM logical_entries
+), page AS MATERIALIZED (
+    SELECT * FROM counted
+    ORDER BY occurred_at DESC, source_id ASC, entry_key ASC
+    LIMIT ? OFFSET ?
+), page_senders AS (
+    %s
 ), clusters AS (
     SELECT participant_id, canonical_id FROM read_parquet('%s')
 ), owners AS (
     SELECT DISTINCT participant_id FROM read_parquet('%s')
 ), canon AS (
-    SELECT p.id AS participant_id, COALESCE(c.canonical_id, p.id) AS canonical_id
-    FROM participants p LEFT JOIN clusters c ON c.participant_id = p.id
+    %s
 ), owner_canon AS (
     SELECT DISTINCT cn.canonical_id FROM owners o JOIN canon cn ON cn.participant_id = o.participant_id
 ), owner_participant_ids AS (
@@ -614,18 +591,21 @@ SELECT
     CASE WHEN NOT EXISTS (SELECT 1 FROM owners)
                   AND NOT (is_from_me AND message_owner.canonical_id IS NOT NULL) THEN NULL
         ELSE (SELECT MIN(pid) FROM UNNEST(participant_ids) AS u(pid)
-              WHERE pid NOT IN (SELECT participant_id FROM owner_participant_ids)
+              WHERE pid IN (SELECT participant_id FROM canon)
+                AND pid NOT IN (SELECT participant_id FROM owner_participant_ids)
                 AND NOT (is_from_me AND EXISTS (
                     SELECT 1 FROM canon participant_canon
                     WHERE participant_canon.participant_id = pid
                       AND participant_canon.canonical_id = message_owner.canonical_id
                 )))
-    END AS counterpart_participant_id
-FROM counted
+    END AS counterpart_participant_id,
+    COALESCE(senders.sender_label, '') AS sender_label
+FROM page
+LEFT JOIN page_senders senders ON senders.sender_message_id = page.anchor_message_id AND page.entry_kind <> 'conversation'
 LEFT JOIN message_owner_canon message_owner
-  ON message_owner.message_id = counted.anchor_message_id
-ORDER BY occurred_at DESC, source_id ASC, entry_key ASC
-LIMIT ? OFFSET ?`, clustersGlob, ownersGlob)
+  ON message_owner.message_id = page.anchor_message_id
+ORDER BY occurred_at DESC, source_id ASC, entry_key ASC`,
+		sqlPageSenderLabels("SELECT anchor_message_id FROM page WHERE entry_kind <> 'conversation'"), clustersGlob, ownersGlob, identityindex.CanonicalParticipantsSQL("participants", "clusters"))
 }
 
 func buildExploreCountSQL(conditions, candidateRankExpression string) string {
@@ -641,19 +621,8 @@ func buildExploreFastCountSQL(conditions, candidateRankExpression string) string
 SELECT COUNT(*) FROM logical_entries`
 }
 
-// exploreConditionsTouchParticipantLists reports whether buildExploreConditions
-// renders predicates over the per-message participant list columns for this
-// request. Those predicates force analytical_entries to assemble participant
-// lists for the whole archive during filtering, so the two-phase listing fast
-// path (which rescans the filtered population) would pay that cost twice; such
-// requests keep the single-pass legacy query.
-func exploreConditionsTouchParticipantLists(request ExploreRequest) bool {
-	return len(request.Context.ParticipantIDs) > 0 ||
-		len(request.Context.AdditionalParticipantGroups) > 0
-}
-
 // buildExploreFastListingSQL builds the two-phase entry-row page query used
-// when exploreConditionsTouchParticipantLists is false. Phase one selects the
+// unless the fast path is disabled for equivalence tests. Phase one selects the
 // page (ORDER BY + LIMIT/OFFSET) from logical entries WITHOUT participant
 // list columns, so the whole-archive per-message list aggregation inside
 // analytical_entries is pruned; phase two rebuilds participant_ids and
@@ -681,6 +650,16 @@ func exploreConditionsTouchParticipantLists(request ExploreRequest) bool {
 // are bound once. Listings without domain filters keep scalar rescans to avoid
 // materializing the archive's message strings.
 //
+// Materialize the bounded page so its enrichment queries share those rows
+// instead of inlining the full listing pipeline into each consumer. The page
+// is chosen from logical_entry_keys, which carries no display strings; the
+// page rows then read title, preview, and labels from their anchor messages.
+//
+// A conversation entry's links cover every member message, so they are joined
+// to one recipient-and-sender stream and reduced to distinct participants
+// before the list aggregation. Aggregating labels per link held every member
+// message's labels in memory at once.
+//
 // Output columns, ordering, and pagination are identical to buildExploreSQL;
 // TestExploreListingFastPathMatchesLegacy pins the equivalence.
 func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlob, ownersGlob string, shareFilteredPopulation bool) string {
@@ -691,15 +670,33 @@ func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlo
 		populationConditions = "TRUE"
 	}
 	return buildExploreNarrowFilteredClassifiedCTE(conditions, candidateRankExpression) +
-		exploreLogicalEntriesCTE(false) + fmt.Sprintf(`
-), page AS (
-    SELECT * FROM logical_entries
+		exploreLogicalEntryKeysCTE() + fmt.Sprintf(`
+), page_keys AS MATERIALIZED (
+    SELECT * FROM logical_entry_keys
     ORDER BY occurred_at DESC, source_id ASC, entry_key ASC
     LIMIT ? OFFSET ?
+), page AS MATERIALIZED (
+    SELECT k.*,
+        COALESCE(s.source_type, '') AS source_type,
+        COALESCE(s.account_email, '') AS source_identifier,
+        COALESCE(m.message_type, '') AS message_type,
+        COALESCE(c.conversation_type, '') AS conversation_type,
+        CASE WHEN k.entry_kind = 'conversation'
+            THEN COALESCE(NULLIF(c.title, ''), 'Conversation')
+            ELSE COALESCE(NULLIF(m.subject, ''), NULLIF(c.title, ''), m.snippet, '')
+        END AS title,
+        COALESCE(m.snippet, '') AS preview,
+        m.is_from_me
+    FROM page_keys k
+    JOIN messages m ON m.id = k.anchor_message_id
+    JOIN sources s ON s.id = m.source_id
+    LEFT JOIN conversations c ON c.id = m.conversation_id
 ), membership AS (
     SELECT source_id, conversation_id, message_id
     FROM %s
     WHERE (%s) AND (%s)
+), page_senders AS (
+    %s
 ), page_messages AS (
     SELECT p.entry_key, p.anchor_message_id AS message_id
     FROM page p WHERE p.entry_kind <> 'conversation'
@@ -709,21 +706,26 @@ func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlo
       ON m.source_id = p.source_id AND m.conversation_id = p.conversation_id
     WHERE p.entry_kind = 'conversation'
 ), page_participant_links AS (
-    SELECT pm.entry_key, mr.participant_id
-    FROM page_messages pm JOIN message_recipients mr ON mr.message_id = pm.message_id
-    UNION ALL
-    SELECT pm.entry_key, msg.sender_id AS participant_id
-    FROM page_messages pm JOIN messages msg ON msg.id = pm.message_id
-    WHERE msg.sender_id IS NOT NULL
+    SELECT pm.entry_key, links.participant_id
+    FROM page_messages pm JOIN (
+        SELECT message_id, participant_id FROM message_recipients
+        UNION ALL
+        SELECT id AS message_id, sender_id AS participant_id
+        FROM messages WHERE sender_id IS NOT NULL
+    ) links ON links.message_id = pm.message_id
     UNION ALL
     SELECT p.entry_key, cp.participant_id
     FROM page p JOIN conversation_participants cp ON cp.conversation_id = p.conversation_id
     WHERE p.entry_kind = 'conversation'
+), page_participants AS (
+    SELECT entry_key, participant_id
+    FROM page_participant_links
+    GROUP BY entry_key, participant_id
 ), page_participant_facts AS (
     SELECT links.entry_key,
         list_sort(list_distinct(list(links.participant_id))) AS participant_ids,
         list_sort(list_distinct(list(%s))) AS participant_labels
-    FROM page_participant_links links
+    FROM page_participants links
     JOIN participants pt ON pt.id = links.participant_id
     GROUP BY links.entry_key
 ), total AS (
@@ -740,8 +742,7 @@ func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlo
 ), owners AS (
     SELECT DISTINCT participant_id FROM read_parquet('%s')
 ), canon AS (
-    SELECT p.id AS participant_id, COALESCE(c.canonical_id, p.id) AS canonical_id
-    FROM participants p LEFT JOIN clusters c ON c.participant_id = p.id
+    %s
 ), owner_canon AS (
     SELECT DISTINCT cn.canonical_id FROM owners o JOIN canon cn ON cn.participant_id = o.participant_id
 ), owner_participant_ids AS (
@@ -778,21 +779,25 @@ SELECT
     CASE WHEN NOT EXISTS (SELECT 1 FROM owners)
                   AND NOT (p.is_from_me AND message_owner.canonical_id IS NOT NULL) THEN NULL
         ELSE (SELECT MIN(pid) FROM UNNEST(COALESCE(f.participant_ids, []::BIGINT[])) AS u(pid)
-              WHERE pid NOT IN (SELECT participant_id FROM owner_participant_ids)
+              WHERE pid IN (SELECT participant_id FROM canon)
+                AND pid NOT IN (SELECT participant_id FROM owner_participant_ids)
                 AND NOT (p.is_from_me AND EXISTS (
                     SELECT 1 FROM canon participant_canon
                     WHERE participant_canon.participant_id = pid
                       AND participant_canon.canonical_id = message_owner.canonical_id
                 )))
-    END AS counterpart_participant_id
+    END AS counterpart_participant_id,
+    COALESCE(senders.sender_label, '') AS sender_label
 FROM page p
+LEFT JOIN page_senders senders ON senders.sender_message_id = p.anchor_message_id AND p.entry_kind <> 'conversation'
 LEFT JOIN page_participant_facts f ON f.entry_key = p.entry_key
 LEFT JOIN message_owner_canon message_owner ON message_owner.message_id = p.anchor_message_id
 ORDER BY p.occurred_at DESC, p.source_id ASC, p.entry_key ASC`,
 		population, populationConditions, sqlIsChatPredicate("message_type", "conversation_type"),
+		sqlPageSenderLabels("SELECT anchor_message_id FROM page WHERE entry_kind <> 'conversation'"),
 		sqlAnalyticalEntriesParticipantLabel("pt"),
 		sqlIsChatPredicate("message_type", "conversation_type"), population, populationConditions,
-		clustersGlob, ownersGlob)
+		clustersGlob, ownersGlob, identityindex.CanonicalParticipantsSQL("participants", "clusters"))
 }
 
 func buildExploreLogicalSQL(conditions string) string {
@@ -863,6 +868,12 @@ func buildExploreLogicalSQLWithCandidateRank(conditions, candidateRankExpression
 		exploreLogicalEntriesCTE(true)
 }
 
+// These importers include attachment bytes in their message estimates.
+// Known attachment bytes still bound an incomplete estimate from below.
+const exploreEstimatedBytesSQL = `CASE WHEN lower(source_type) IN ('beeper', 'matrix', 'slack', 'teams', 'inline')
+	THEN GREATEST(size_estimate, attachment_size)
+	ELSE size_estimate + attachment_size END`
+
 // exploreLogicalEntriesCTE renders the logical_entries CTE (appended directly
 // after buildExploreFilteredClassifiedCTE, left unclosed for the caller).
 // withParticipantLists controls whether the three participant list columns
@@ -871,11 +882,6 @@ func buildExploreLogicalSQLWithCandidateRank(conditions, candidateRankExpression
 // Explore fast path omits them here and rebuilds them for the ≤limit page
 // rows only (see buildExploreFastListingSQL).
 func exploreLogicalEntriesCTE(withParticipantLists bool) string {
-	// These importers include attachment bytes in their message estimates.
-	// Known attachment bytes still bound an incomplete estimate from below.
-	estimatedBytes := `CASE WHEN lower(source_type) IN ('beeper', 'slack', 'teams')
-		THEN GREATEST(size_estimate, attachment_size)
-		ELSE size_estimate + attachment_size END`
 	messageLists := ""
 	conversationLists := ""
 	if withParticipantLists {
@@ -905,7 +911,7 @@ func exploreLogicalEntriesCTE(withParticipantLists bool) string {
         snippet AS preview,` + messageLists + `
 		CASE WHEN candidate_rank IS NOT NULL THEN message_id ELSE NULL END AS strongest_matched_message_id,
 		1::BIGINT AS message_count,
-		(` + estimatedBytes + `)::BIGINT AS estimated_bytes,
+		(` + exploreEstimatedBytesSQL + `)::BIGINT AS estimated_bytes,
 		(entry_kind = 'email' AND lower(source_type) IN ` + deletableSourceTypesSQL + ` AND NOT internally_deleted AND NOT deleted_from_source AND NOT archive_only
 			AND COALESCE(source_message_id, '') <> '') AS deletable,
 		has_attachments,
@@ -935,7 +941,7 @@ func exploreLogicalEntriesCTE(withParticipantLists bool) string {
 		arg_min(message_id, struct_pack(candidate_rank := candidate_rank, message_id := message_id))
 			FILTER (WHERE candidate_rank IS NOT NULL) AS strongest_matched_message_id,
 		COUNT(*)::BIGINT AS message_count,
-		SUM(` + estimatedBytes + `)::BIGINT AS estimated_bytes,
+		SUM(` + exploreEstimatedBytesSQL + `)::BIGINT AS estimated_bytes,
 		false AS deletable,
 		bool_or(has_attachments) AS has_attachments,
 		arg_max(is_from_me, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS is_from_me,
@@ -945,4 +951,122 @@ func exploreLogicalEntriesCTE(withParticipantLists bool) string {
     FROM classified
     WHERE is_chat
     GROUP BY source_id, conversation_id`
+}
+
+// exploreLogicalEntryKeysCTE renders logical_entry_keys: the logical entries
+// of exploreLogicalEntriesCTE(false) reduced to the columns that select and
+// order a page, plus the numeric summaries. The string columns a page displays
+// (title, preview, source and type labels) are equal to the anchor message's
+// values for both kinds of entry, so buildExploreFastListingSQL reads them for
+// the page rows only. Carrying them through both full-archive arms concurrently
+// multiplied listing memory by the query thread count.
+func exploreLogicalEntryKeysCTE() string {
+	return `, logical_entry_keys AS (
+    SELECT
+        ` + sqlMessageEntryKeyExpr("") + ` AS entry_key,
+        entry_kind,
+        message_id AS anchor_message_id,
+        conversation_id,
+        occurred_at,
+        source_id,
+        CASE WHEN candidate_rank IS NOT NULL THEN message_id ELSE NULL END AS strongest_matched_message_id,
+        1::BIGINT AS message_count,
+        has_attachments,
+        attachment_count::BIGINT AS attachment_count,
+        attachment_size::BIGINT AS attachment_size,
+        deleted_from_source
+    FROM classified
+    WHERE NOT is_chat
+
+    UNION ALL
+
+    SELECT
+        ` + sqlConversationEntryKeyExpr("") + ` AS entry_key,
+        'conversation' AS entry_kind,
+        arg_max(message_id, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS anchor_message_id,
+        conversation_id,
+        MAX(occurred_at) AS occurred_at,
+        source_id,
+        arg_min(message_id, struct_pack(candidate_rank := candidate_rank, message_id := message_id))
+            FILTER (WHERE candidate_rank IS NOT NULL) AS strongest_matched_message_id,
+        COUNT(*)::BIGINT AS message_count,
+        bool_or(has_attachments) AS has_attachments,
+        SUM(attachment_count)::BIGINT AS attachment_count,
+        SUM(attachment_size)::BIGINT AS attachment_size,
+        bool_or(deleted_from_source) AS deleted_from_source
+    FROM classified
+    WHERE is_chat
+    GROUP BY source_id, conversation_id`
+}
+
+func validateExploreRequest(request ExploreRequest) (SearchProvenance, error) {
+	if err := search.ValidateAccountScopes(request.Context.AccountScopes); err != nil {
+		return SearchProvenance{}, fmt.Errorf("%w: %w", ErrInvalidExploreRequest, err)
+	}
+	if request.Page.Offset < 0 || request.Page.Limit < 0 || request.Page.Limit > maxExploreLimit {
+		return SearchProvenance{}, fmt.Errorf("%w: page is outside the supported range", ErrInvalidExploreRequest)
+	}
+	if request.Context.Deletion != DeletionAny &&
+		request.Context.Deletion != DeletionActive &&
+		request.Context.Deletion != DeletionDeleted {
+		return SearchProvenance{}, fmt.Errorf("%w: unknown deletion filter %q", ErrInvalidExploreRequest, request.Context.Deletion)
+	}
+	if len(request.Grouping) > 0 {
+		return SearchProvenance{}, fmt.Errorf("%w: grouped exploration is not available in the entry-row query", ErrInvalidExploreRequest)
+	}
+	if request.Presentation != PresentationDefault && request.Presentation != PresentationTable {
+		return SearchProvenance{}, fmt.Errorf("%w: unsupported presentation %q", ErrInvalidExploreRequest, request.Presentation)
+	}
+	if len(request.Sort) > 1 || (len(request.Sort) == 1 &&
+		(request.Sort[0].Field != "sent_at" || request.Sort[0].Direction != sortDirectionDesc)) {
+		return SearchProvenance{}, fmt.Errorf("%w: only sent_at descending sort is supported", ErrInvalidExploreRequest)
+	}
+	return validateResolvedSearch(request.Search)
+}
+
+func scanExploreRows(rows *sql.Rows, response *ExploreResponse) error {
+	for rows.Next() {
+		var row EntryRow
+		var anchorID, conversationID, strongestMatchedMessageID, counterpartParticipantID sql.NullInt64
+		var participantIDsJSON, participantLabelsJSON string
+		if err := rows.Scan(
+			&row.Key, &row.Kind, &anchorID, &conversationID, &row.OccurredAt,
+			&row.SourceID, &row.SourceType, &row.SourceIdentifier,
+			&row.MessageType, &row.ConversationType, &row.Title, &row.Preview,
+			&participantIDsJSON, &participantLabelsJSON, &strongestMatchedMessageID, &row.MessageCount,
+			&row.HasAttachments, &row.AttachmentCount, &row.AttachmentSize,
+			&row.DeletedFromSource, &response.TotalCount, &counterpartParticipantID, &row.SenderLabel,
+		); err != nil {
+			return fmt.Errorf("scan analytical entry: %w", err)
+		}
+		if row.Title == row.Preview {
+			row.Title = FlattenSnippet(row.Title)
+		}
+		row.Preview = FlattenSnippet(row.Preview)
+		if anchorID.Valid {
+			row.AnchorMessageID = &anchorID.Int64
+		}
+		if conversationID.Valid {
+			row.ConversationID = &conversationID.Int64
+		}
+		if strongestMatchedMessageID.Valid {
+			row.StrongestMatchedMessageID = &strongestMatchedMessageID.Int64
+		}
+		if counterpartParticipantID.Valid {
+			row.CounterpartParticipantID = &counterpartParticipantID.Int64
+		}
+		if err := json.Unmarshal([]byte(participantIDsJSON), &row.ParticipantIDs); err != nil {
+			return fmt.Errorf("decode analytical participant IDs: %w", err)
+		}
+		if err := json.Unmarshal([]byte(participantLabelsJSON), &row.ParticipantLabels, jsontext.AllowInvalidUTF8(true)); err != nil {
+			return fmt.Errorf("decode analytical participant labels: %w", err)
+		}
+		row.MatchedSenderIdentities = make([]string, 0)
+		row.MatchedRecipientIdentities = make([]string, 0)
+		response.Rows = append(response.Rows, row)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate analytical entries: %w", err)
+	}
+	return nil
 }

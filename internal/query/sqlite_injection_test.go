@@ -10,6 +10,7 @@ import (
 // TestSQLInjection_InvalidSortField tests that invalid SortField values are handled safely.
 // The sortClause function should validate the SortField is within expected range.
 func TestSQLInjection_InvalidSortField(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	// Create options with an invalid SortField value
@@ -26,6 +27,7 @@ func TestSQLInjection_InvalidSortField(t *testing.T) {
 // TestSQLInjection_InvalidMessageSortField tests that invalid MessageSortField values
 // are handled safely in ListMessages.
 func TestSQLInjection_InvalidMessageSortField(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	// Create filter with an invalid MessageSortField value
@@ -45,6 +47,7 @@ func TestSQLInjection_InvalidMessageSortField(t *testing.T) {
 // TestSQLInjection_InvalidTimeGranularity tests that invalid TimeGranularity values
 // are handled safely when used in queries.
 func TestSQLInjection_InvalidTimeGranularity(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	opts := DefaultAggregateOptions()
@@ -59,6 +62,7 @@ func TestSQLInjection_InvalidTimeGranularity(t *testing.T) {
 // string fields like Sender, Label, etc. are properly parameterized and
 // cannot be used for SQL injection.
 func TestSQLInjection_FilterStringsAreSafelyParameterized(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	// These SQL injection payloads should be treated as literal strings,
@@ -91,15 +95,16 @@ func TestSQLInjection_FilterStringsAreSafelyParameterized(t *testing.T) {
 
 	// Verify the database is still intact after all injection attempts
 	var count int
-	err := env.DB.QueryRow("SELECT COUNT(*) FROM messages").Scan(&count)
+	err := env.DB.QueryRowContext(t.Context(), "SELECT COUNT(*) FROM messages").Scan(&count)
 	require.NoError(t, err, "failed to count messages after injection tests")
 	assert.Equal(t, 5, count, "expected 5 messages in database after injection tests (standard seed data)")
 }
 
 func TestListMessagesFiltersByMessageType(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	env := newTestEnv(t)
-	_, err := env.DB.Exec(`
+	_, err := env.DB.ExecContext(t.Context(), `
 		INSERT INTO participants (id, phone_number, display_name) VALUES (99, '+15551234567', 'SMS Sender');
 		INSERT INTO participants (id, phone_number, display_name) VALUES (100, '+15557654321', 'Me');
 		INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at, subject, snippet, size_estimate, has_attachments, attachment_count)

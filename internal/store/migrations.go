@@ -9,7 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
+	"strconv"
 	"time"
+
+	"go.kenn.io/msgvault/internal/mime"
 )
 
 // One-time data migrations run by InitSchema and gated on the
@@ -18,11 +22,13 @@ import (
 // last_modified backfill alone is a full messages-table scan — seconds of
 // startup on a large archive).
 const (
+	migrationCalendarEventProjectionV1      = "calendar_event_projection_v1"
 	migrationMeetingProjectionV1            = "meeting_projection_v1"
 	migrationAttachmentsContentHashUnique   = "attachments_content_hash_unique_index"
 	migrationAttachmentOccurrenceUnique     = "attachment_occurrence_unique_indexes_v1"
 	migrationMessagesLastModifiedBackfill   = "messages_last_modified_backfill"
 	migrationMessagesLastModifiedNullRepair = "messages_last_modified_null_repair"
+	migrationMessagesHiddenTextBackfill     = "messages_hidden_text_backfill_v1"
 	// v3: messageIdentityAttributionMatch became envelope-authoritative and
 	// gated email identifier matches on the sender lacking a primary email.
 	// Archives that ran v2 reconciled under the old predicate, so the rename
@@ -61,13 +67,8 @@ const (
 	// reassignments.
 	// v3: recipient role edits that cross the authoritative-role boundary are
 	// scope relinks/unlinks; edits within the boundary remain source edits.
-	// v4: source deletion/reimport, scope unlink/relink, and identity
-	// reassignment publish lane-exact document_text changes with the serving
-	// occurrence's attachment and occurrence coordinates. Archives that ran v3
-	// must reinstall both backend trigger sets so document evidence lifecycle
-	// changes can match the canonical document lane instead of only the owning
-	// conversation_text or meeting_text row.
-	migrationPersonSweepChangeTriggers     = "person_sweep_change_triggers_v5"
+	// v6 removes the document text lane.
+	migrationPersonSweepChangeTriggers     = "person_sweep_change_triggers_v6"
 	migrationIdentityMatchSourceSupport    = "identity_match_source_support_v1"
 	migrationCardDAVDisplayNameOwnership   = "carddav_display_name_ownership_v1"
 	migrationCardDAVLocalPublicationOrigin = "carddav_local_publication_origin_v1"
@@ -83,7 +84,8 @@ const (
 	// FTS bookkeeping sweeps no longer requeue the archive.
 	// v5: is_sent joined MessagesActivityColumns, and messages projected while
 	// unsent are requeued so the projector retracts them.
-	migrationActivityProjectionTriggers = "activity_projection_triggers_v5"
+	// v6: membership changes mark one conversation for expansion by the drain.
+	migrationActivityProjectionTriggers = "activity_projection_triggers_v6"
 	migrationPersonInferenceProviderV2  = "person_inference_provider_v2"
 	migrationPersonSweepCallsV2         = "person_sweep_calls_v2"
 	migrationProviderConsentsV1         = "provider_consents_v1"
@@ -103,6 +105,121 @@ const (
 	migrationCardDAVInferenceExportState    = "carddav_inference_export_state_v1"
 	migrationChatMembers                    = "chat_members_v1"
 )
+
+// hiddenTextBackfillCursorKey is the archive_metadata key holding the last
+// message ID the hidden text backfill committed, so an interrupted run resumes.
+const hiddenTextBackfillCursorKey = "hidden_text_backfill_cursor"
+
+// backfillMessagesHiddenText walks message IDs in bounded transactions. Bodies
+// are fetched by primary key, and only non-empty HTML reaches the detector.
+// Each batch commits its last ID with its flags, and the next run continues
+// after it. content_changed_at stays unchanged; PostgreSQL's blanket
+// last_modified and embedding triggers still run on flag updates.
+func (s *Store) backfillMessagesHiddenText(ctx context.Context) error {
+	const batchSize = 1000
+	var afterID int64
+	var cursorValue string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM archive_metadata WHERE key = ?`,
+		hiddenTextBackfillCursorKey).Scan(&cursorValue)
+	haveCursor := err == nil
+	if haveCursor {
+		if afterID, err = strconv.ParseInt(cursorValue, 10, 64); err != nil {
+			return fmt.Errorf("parse hidden text backfill cursor %q: %w", cursorValue, err)
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read hidden text backfill cursor: %w", err)
+	}
+	started, lastLog := time.Now(), time.Now()
+	var checked, flagged int64
+	for {
+		// The first batch has no lower bound, since zero and negative IDs are legal.
+		query := `SELECT id FROM messages ORDER BY id LIMIT ?`
+		args := []any{batchSize}
+		if haveCursor {
+			query = `SELECT id FROM messages WHERE id > ? ORDER BY id LIMIT ?`
+			args = []any{afterID, batchSize}
+		}
+		var ids []int64
+		if err := s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
+			rows, err := tx.QueryContext(ctx, query, args...)
+			if err != nil {
+				return fmt.Errorf("read hidden text backfill IDs: %w", err)
+			}
+			for rows.Next() {
+				var id int64
+				if err := rows.Scan(&id); err != nil {
+					_ = rows.Close()
+					return fmt.Errorf("scan hidden text backfill ID: %w", err)
+				}
+				ids = append(ids, id)
+			}
+			err = rows.Err()
+			closeErr := rows.Close()
+			if err != nil {
+				return fmt.Errorf("iterate hidden text backfill IDs: %w", err)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("close hidden text backfill IDs: %w", closeErr)
+			}
+			for _, id := range ids {
+				var bodyHTML string
+				err := tx.QueryRowContext(ctx, `SELECT body_html FROM message_bodies
+					WHERE message_id = ? AND body_html <> ''`, id).Scan(&bodyHTML)
+				if errors.Is(err, sql.ErrNoRows) {
+					continue
+				}
+				if err != nil {
+					return fmt.Errorf("read hidden text backfill body %d: %w", id, err)
+				}
+				checked++
+				if !mime.HTMLHasHiddenText(bodyHTML) {
+					continue
+				}
+				flagged++
+				if _, err := tx.ExecContext(ctx, `UPDATE messages SET hidden_text_present = TRUE
+					WHERE id = ? AND hidden_text_present = FALSE`, id); err != nil {
+					return fmt.Errorf("backfill hidden text flag %d: %w", id, err)
+				}
+			}
+			if len(ids) < batchSize {
+				// Record completion with the cursor's removal, so a crash between them
+				// can't lose both and restart the walk from the first message.
+				if _, err := tx.ExecContext(ctx, `DELETE FROM archive_metadata WHERE key = ?`,
+					hiddenTextBackfillCursorKey); err != nil {
+					return fmt.Errorf("clear hidden text backfill cursor: %w", err)
+				}
+				return s.markMigrationAppliedContext(ctx, tx, migrationMessagesHiddenTextBackfill, 1)
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO archive_metadata (key, value) VALUES (?, ?)
+				ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
+				hiddenTextBackfillCursorKey, strconv.FormatInt(ids[len(ids)-1], 10)); err != nil {
+				return fmt.Errorf("save hidden text backfill cursor: %w", err)
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		if len(ids) < batchSize {
+			if time.Since(started) >= 30*time.Second {
+				slog.Info("backfilled hidden text flags",
+					slog.Int64("checked", checked),
+					slog.Int64("flagged", flagged),
+					slog.Duration("elapsed", time.Since(started)))
+			}
+			return nil
+		}
+		afterID, haveCursor = ids[len(ids)-1], true
+		// Time-throttled so a small archive logs nothing during startup.
+		if time.Since(lastLog) >= 30*time.Second {
+			slog.Info("backfilling hidden text flags",
+				slog.Int64("checked", checked),
+				slog.Int64("flagged", flagged),
+				slog.Int64("checked_to_id", afterID),
+				slog.Duration("elapsed", time.Since(started)))
+			lastLog = time.Now()
+		}
+	}
+}
 
 func (s *Store) backfillSyncRunResumeMetadata(
 	ctx context.Context, tx *loggedTx,

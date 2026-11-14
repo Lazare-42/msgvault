@@ -35,21 +35,26 @@ type Message struct {
 	// RawDateHeader holds the unparsed Date header even when Date could not
 	// be resolved, so callers can distinguish a missing header from one that
 	// failed to parse.
-	RawDateHeader string
-	ReceivedDates []time.Time
-	From          []Address
-	To            []Address
-	Cc            []Address
-	Bcc           []Address
-	ReplyTo       []Address
-	MessageID     string
-	InReplyTo     string
-	ListID        string
-	References    []string
-	BodyText      string
-	BodyHTML      string
-	Attachments   []Attachment
-	Errors        []string // Non-fatal parsing errors
+	RawDateHeader   string
+	ReceivedDates   []time.Time
+	From            []Address
+	To              []Address
+	Cc              []Address
+	Bcc             []Address
+	ReplyTo         []Address
+	MessageID       string
+	InReplyTo       string
+	ListID          string
+	AutoSubmitted   string
+	Precedence      string
+	ListUnsubscribe bool
+	HasCalendarPart bool
+	References      []string
+	BodyText        string
+	BodyHTML        string
+	Attachments     []Attachment
+	Errors          []string // Non-fatal parsing errors
+	Incomplete      bool     // The parser reports that some message content was lost.
 }
 
 // Address represents an email address with optional display name.
@@ -90,7 +95,9 @@ func DistinctAttachments(parts []Attachment) []Attachment {
 	return out
 }
 
-// Parse parses raw MIME data into a Message.
+// Parse parses raw MIME data into textual projections and binary attachments.
+// NUL becomes U+FFFD in display/search text. Identity evidence, original bytes
+// and attachment contents are unchanged; new writes use OmitNULIdentities.
 func Parse(raw []byte) (*Message, error) {
 	return parse(raw, nil)
 }
@@ -112,12 +119,16 @@ func parse(raw []byte, inspect func(*enmime.Part)) (*Message, error) {
 	}
 
 	msg := &Message{
-		Subject:   env.GetHeader("Subject"),
-		MessageID: env.GetHeader("Message-ID"),
-		InReplyTo: env.GetHeader("In-Reply-To"),
-		ListID:    NormalizeListID(env.GetHeader("List-Id")),
-		BodyText:  env.Text,
-		BodyHTML:  env.HTML,
+		Subject:         env.GetHeader("Subject"),
+		MessageID:       env.GetHeader("Message-ID"),
+		InReplyTo:       env.GetHeader("In-Reply-To"),
+		ListID:          NormalizeListID(env.GetHeader("List-Id")),
+		BodyText:        env.Text,
+		BodyHTML:        env.HTML,
+		AutoSubmitted:   env.GetHeader("Auto-Submitted"),
+		Precedence:      env.GetHeader("Precedence"),
+		ListUnsubscribe: len(env.GetHeaderValues("List-Unsubscribe")) > 0,
+		HasCalendarPart: hasCalendarPart(root),
 	}
 
 	// Parse date
@@ -155,17 +166,19 @@ func parse(raw []byte, inspect func(*enmime.Part)) (*Message, error) {
 	// Collect any parsing errors
 	for _, e := range env.Errors {
 		msg.Errors = append(msg.Errors, e.Error())
+		msg.Incomplete = msg.Incomplete || e.Severe
 	}
 
 	if inspect != nil {
 		inspect(root)
 	}
+	msg.normalizeText()
 	return msg, nil
 }
 
 // ParseWithRecovery parses a message and salvages its top-level headers when
-// malformed MIME structure prevents full envelope parsing. Body content and
-// attachments remain unavailable after a fatal parse error.
+// malformed MIME structure prevents full envelope parsing. A narrowly recognized
+// legacy CSV framing defect is retried on a copy before falling back to headers.
 func ParseWithRecovery(raw []byte, fallbackSubject string) (*Message, error) {
 	return parseWithRecovery(raw, fallbackSubject, nil)
 }
@@ -176,7 +189,13 @@ func parseWithRecovery(raw []byte, fallbackSubject string, inspect func(*enmime.
 		return msg, nil
 	}
 
+	if recovered := recoverLegacyCSV(raw); recovered != nil {
+		// Repaired framing must not be exposed as original raw-part evidence.
+		return recovered, nil
+	}
+
 	msg = salvageHeaders(raw)
+	msg.Incomplete = true
 	if msg.Subject == "" {
 		msg.Subject = fallbackSubject
 	}
@@ -185,17 +204,21 @@ func parseWithRecovery(raw []byte, fallbackSubject string, inspect func(*enmime.
 		"[MIME parsing failed: %s]\n\nRaw MIME data is preserved in message_raw table.",
 		errMsg,
 	)
+	msg.normalizeText()
 	return msg, err
 }
 
 func salvageHeaders(raw []byte) *Message {
 	headers := tokenizeHeaders(raw)
 	msg := &Message{
-		Subject:       decodeHeader(firstHeader(headers, "subject")),
-		ReceivedDates: ParseReceivedChain(headers["received"]),
-		MessageID:     strings.ToValidUTF8(firstHeader(headers, "message-id"), "\uFFFD"),
-		InReplyTo:     strings.ToValidUTF8(firstHeader(headers, "in-reply-to"), "\uFFFD"),
-		ListID:        NormalizeListID(firstHeader(headers, "list-id")),
+		Subject:         decodeHeader(firstHeader(headers, "subject")),
+		ReceivedDates:   ParseReceivedChain(headers["received"]),
+		MessageID:       strings.ToValidUTF8(firstHeader(headers, "message-id"), "\uFFFD"),
+		InReplyTo:       strings.ToValidUTF8(firstHeader(headers, "in-reply-to"), "\uFFFD"),
+		ListID:          NormalizeListID(firstHeader(headers, "list-id")),
+		AutoSubmitted:   firstHeader(headers, "auto-submitted"),
+		Precedence:      firstHeader(headers, "precedence"),
+		ListUnsubscribe: len(headers["list-unsubscribe"]) > 0,
 	}
 
 	if dateHeader := firstHeader(headers, "date"); dateHeader != "" {
@@ -309,14 +332,14 @@ func parseSalvagedAddressList(value string) []Address {
 
 	addresses := make([]Address, 0, len(list))
 	for _, addr := range list {
-		if addr.Address == "" {
+		if addr.Address == "" || strings.ContainsRune(addr.Address, 0) {
 			continue
 		}
 		email := strings.ToLower(addr.Address)
 		addresses = append(addresses, Address{
 			Name:   addr.Name,
 			Email:  email,
-			Domain: extractDomain(email),
+			Domain: ExtractDomain(email),
 		})
 	}
 	return addresses
@@ -431,13 +454,13 @@ func parseAddressList(env *enmime.Envelope, header string) []Address {
 
 	addresses := make([]Address, 0, len(list))
 	for _, addr := range list {
-		if addr.Address == "" {
+		if addr.Address == "" || strings.ContainsRune(addr.Address, 0) {
 			continue
 		}
 		addresses = append(addresses, Address{
 			Name:   addr.Name,
 			Email:  strings.ToLower(addr.Address),
-			Domain: extractDomain(addr.Address),
+			Domain: ExtractDomain(addr.Address),
 		})
 	}
 	return addresses
@@ -449,11 +472,15 @@ func parseAddressList(env *enmime.Envelope, header string) []Address {
 func fallbackAddressList(value string) []Address {
 	var addresses []Address
 	for _, token := range splitAddressTokens(value) {
-		for _, email := range emailAddressTokenRe.FindAllString(stripAddressDecorations(token), -1) {
+		token = stripAddressDecorations(token)
+		if strings.ContainsRune(token, 0) {
+			continue
+		}
+		for _, email := range emailAddressTokenRe.FindAllString(token, -1) {
 			email = strings.ToLower(email)
 			addresses = append(addresses, Address{
 				Email:  email,
-				Domain: extractDomain(email),
+				Domain: ExtractDomain(email),
 			})
 		}
 	}
@@ -569,8 +596,8 @@ func stripAddressDecorations(value string) string {
 	return stripped.String()
 }
 
-// extractDomain extracts the domain from an email address.
-func extractDomain(email string) string {
+// ExtractDomain extracts the domain from an email address.
+func ExtractDomain(email string) string {
 	if _, domain, ok := strings.CutLast(email, "@"); ok {
 		return strings.ToLower(domain)
 	}

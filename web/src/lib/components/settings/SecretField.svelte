@@ -2,6 +2,7 @@
   import { Button, IconButton, Modal, TextInput } from '@kenn-io/kit-ui';
   import Pencil from '@lucide/svelte/icons/pencil';
   import Trash2 from '@lucide/svelte/icons/trash-2';
+  import { trackUnsavedForm } from '../../settings/unsaved-forms.svelte';
 
   // One line for a stored secret such as an API key: a read-only box that
   // shows a masked hint of the key ("sk-…x9Q") or "None", a pencil button
@@ -47,7 +48,7 @@
     onclear?: () => void;
   } = $props();
 
-  const sentence = $derived(label.charAt(0).toLowerCase() + label.slice(1));
+  const sentence = $derived(/^[A-Z][a-z]/.test(label) ? label.charAt(0).toLowerCase() + label.slice(1) : label);
   const blocked = $derived(disabled || saving || disabledReason !== '');
   const verb = $derived(configured ? 'Replace' : 'Add');
   // A set key with no hint still shows as set, just without characters.
@@ -55,6 +56,7 @@
 
   let open = $state(false);
   let draft = $state('');
+  trackUnsavedForm({ dirty: () => open && draft !== '', discard: () => { open = false; draft = ''; } });
 
   function openDialog() {
     if (blocked) return;

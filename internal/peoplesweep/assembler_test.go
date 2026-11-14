@@ -2,6 +2,7 @@ package peoplesweep
 
 import (
 	"context"
+	"sort"
 	"testing"
 	"time"
 
@@ -39,9 +40,10 @@ func (s *assemblySourceStub) BuildPersonSweepEvidenceStatusChanges(_ context.Con
 }
 
 type assemblyContextArchive struct {
-	candidates []int64
-	items      []EvidenceItem
-	searches   []ContextRequest
+	candidates    []int64
+	items         []EvidenceItem
+	itemsByTarget map[string][]EvidenceItem
+	searches      []ContextRequest
 }
 
 func (a *assemblyContextArchive) ListPersonSweepHistoricalCandidates(context.Context, HistoricalCandidateRequest) ([]int64, error) {
@@ -50,14 +52,13 @@ func (a *assemblyContextArchive) ListPersonSweepHistoricalCandidates(context.Con
 
 func (a *assemblyContextArchive) SearchPersonSweepMessages(_ context.Context, request ContextRequest) ([]EvidenceItem, error) {
 	a.searches = append(a.searches, request)
+	if items, ok := a.itemsByTarget[request.Target.Key]; ok {
+		return append([]EvidenceItem(nil), items...), nil
+	}
 	return append([]EvidenceItem(nil), a.items...), nil
 }
 
 func (a *assemblyContextArchive) HydratePersonSweepMessages(context.Context, int64, []int64, int64) ([]EvidenceItem, error) {
-	return []EvidenceItem{}, nil
-}
-
-func (a *assemblyContextArchive) SearchPersonSweepDocuments(context.Context, DocumentContextRequest) ([]EvidenceItem, error) {
 	return []EvidenceItem{}, nil
 }
 
@@ -101,87 +102,138 @@ func TestAssemblerUsesTargetDescriptionsForBoundedContext(t *testing.T) {
 	checks.Len(result.Packet.Context, 1)
 }
 
-func TestAssemblerEmitsPartialDocumentCursorProgress(t *testing.T) {
+func TestAssemblerOverflowDropsLowestPriorityContext(t *testing.T) {
 	checks := assert.New(t)
-	must := require.New(t)
 	packet := packetTestPacket()
 	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
-	seed := packetTestEvidence(10, SourceDocumentText, "document chunk")
+	meeting := packetTestEvidence(300, SourceMeetingText, "meeting context")
+	conversation := packetTestEvidence(200, SourceConversationText, "conversation context")
+	otherTarget := packetTestEvidence(250, SourceConversationText, "other target context")
 	source := &assemblySourceStub{windows: map[GenerationCursorMode]PersonWindow{
-		GenerationCursorOptimistic: {
-			Seeds: []EvidenceItem{seed}, NextSequence: 10, NextDocumentKey: "live:00000000000000000002",
-			Changes: []ArchiveChange{{Sequence: 11, PersonID: 7, SourceLane: SourceDocumentText}},
+		GenerationCursorOptimistic: {Seeds: []EvidenceItem{packet.Seeds[1]}, NextSequence: 12},
+	}}
+	archive := &assemblyContextArchive{
+		candidates: []int64{300, 250, 200, 150, 100},
+		itemsByTarget: map[string][]EvidenceItem{
+			packet.Catalog.Targets[0].Key: {meeting, conversation,
+				packetTestEvidence(100, SourceConversationText, "lowest first target context")},
+			packet.Catalog.Targets[1].Key: {otherTarget,
+				packetTestEvidence(150, SourceConversationText, "lowest second target context")},
 		},
-	}, state: PersonFactState{}}
-	key := CursorKey{PersonID: 7, SourceLane: SourceDocumentText,
-		ProgramFingerprint: ProgramFingerprint(), CatalogFingerprint: packet.Catalog.Fingerprint}
-	result, err := (Assembler{Source: source, MaxBytes: 16_384, MaxItems: 10,
-		ContextPerTarget: 0}).Build(t.Context(), AssemblyRequest{
-		PersonID: 7, Cursors: []Cursor{{Key: key, OptimisticSequence: 10,
-			ReconciliationComplete: true, LastBackstopAt: &now}}, Catalog: packet.Catalog,
-		Profile: ProviderProfile{AllowedSources: []SourceClass{SourceDocumentText},
+	}
+	assembler := Assembler{Source: source, Context: NewContextRetriever(archive),
+		MaxBytes: 16_384, MaxItems: 4, MaxBatches: 1, ContextPerTarget: 3}
+
+	result, err := assembler.Build(t.Context(), AssemblyRequest{
+		PersonID: 7, Catalog: packet.Catalog,
+		Cursors: []Cursor{{Key: CursorKey{PersonID: 7, SourceLane: SourceConversationText,
+			ProgramFingerprint: ProgramFingerprint(), CatalogFingerprint: packet.Catalog.Fingerprint},
+			OptimisticSequence: 10, ReconciliationComplete: true, LastBackstopAt: &now}},
+		Profile: ProviderProfile{AllowedSources: []SourceClass{SourceConversationText, SourceMeetingText},
 			SourceSince: "2020-01-01", AllowSensitive: true},
 		Now: now, BackstopInterval: 24 * time.Hour,
 	})
-	must.NoError(err)
-	must.Len(result.CursorEnvelope, 1)
-	checks.Equal(GenerationCursor{Key: key, Mode: GenerationCursorOptimistic,
-		CursorFrom: 10, CursorThrough: 10, DocumentToKey: "live:00000000000000000002"},
-		result.CursorEnvelope[0])
-	must.Len(source.windowRequests, 1)
-	checks.Empty(source.windowRequests[0].DocumentAfter)
+	require.NoError(t, err)
+	checks.Len(result.Batches, 1)
+	checks.Equal([]string{packetEvidenceID(meeting), packetEvidenceID(otherTarget),
+		packetEvidenceID(conversation)}, result.ContextPriority)
+	checks.ElementsMatch([]int64{300, 250, 200}, contextMessageIDs(result.Packet.Context))
+	checks.True(sort.SliceIsSorted(result.Packet.Context, func(i, j int) bool {
+		return evidenceLess(result.Packet.Context[i], result.Packet.Context[j])
+	}))
 }
 
-func TestAssemblerEmitsPartialDocumentSourceKeyProgress(t *testing.T) {
+func TestAssemblerContextPriorityDedupesAcrossTargets(t *testing.T) {
 	packet := packetTestPacket()
 	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
-	seed := packetTestEvidence(10, SourceDocumentText, "document chunk")
-	key := CursorKey{PersonID: 7, SourceLane: SourceDocumentText,
-		ProgramFingerprint: ProgramFingerprint(), CatalogFingerprint: packet.Catalog.Fingerprint}
-	tests := []struct {
-		name      string
-		mode      GenerationCursorMode
-		cursor    Cursor
-		window    PersonWindow
-		force     bool
-		wantUpper string
+	shared := packetTestEvidence(300, SourceMeetingText, "shared context")
+	firstOnly := packetTestEvidence(200, SourceConversationText, "first target context")
+	secondOnly := packetTestEvidence(100, SourceConversationText, "second target context")
+	for _, test := range []struct {
+		name         string
+		maxItems     int
+		wantIDs      []int64
+		wantPriority []string
 	}{
-		{name: "reconciliation", mode: GenerationCursorReconciliation,
-			cursor: Cursor{Key: key, ReconcileUpperKey: "00000000000000000010", LastBackstopAt: &now},
-			window: PersonWindow{Seeds: []EvidenceItem{seed},
-				NextDocumentKey: "live:00000000000000000002"}},
-		{name: "backstop", mode: GenerationCursorBackstop,
-			cursor: Cursor{Key: key, ReconciliationComplete: true}, force: true,
-			window: PersonWindow{Seeds: []EvidenceItem{seed},
-				NextDocumentKey:  "live:00000000000000000002",
-				CapturedUpperKey: "00000000000000000010"},
-			wantUpper: "00000000000000000010"},
-	}
-	for _, test := range tests {
+		{name: "all context fits", maxItems: 4, wantIDs: []int64{100, 200, 300},
+			wantPriority: []string{packetEvidenceID(shared), packetEvidenceID(firstOnly), packetEvidenceID(secondOnly)}},
+		{name: "trim one unique item", maxItems: 3, wantIDs: []int64{200, 300},
+			wantPriority: []string{packetEvidenceID(shared), packetEvidenceID(firstOnly)}},
+	} {
 		t.Run(test.name, func(t *testing.T) {
 			checks := assert.New(t)
-			must := require.New(t)
 			source := &assemblySourceStub{windows: map[GenerationCursorMode]PersonWindow{
-				GenerationCursorOptimistic: {NextSequence: test.cursor.OptimisticSequence},
-				test.mode:                  test.window,
+				GenerationCursorOptimistic: {Seeds: []EvidenceItem{packet.Seeds[1]}, NextSequence: 12},
 			}}
-			result, err := (Assembler{Source: source, MaxBytes: 16_384, MaxItems: 10,
-				ContextPerTarget: 0}).Build(t.Context(), AssemblyRequest{
-				PersonID: 7, Cursors: []Cursor{test.cursor}, Catalog: packet.Catalog,
-				Profile: ProviderProfile{AllowedSources: []SourceClass{SourceDocumentText},
+			archive := &assemblyContextArchive{
+				candidates: []int64{300, 200, 100},
+				itemsByTarget: map[string][]EvidenceItem{
+					packet.Catalog.Targets[0].Key: {shared, firstOnly},
+					packet.Catalog.Targets[1].Key: {shared, secondOnly},
+				},
+			}
+			result, err := (Assembler{Source: source, Context: NewContextRetriever(archive),
+				MaxBytes: 16_384, MaxItems: test.maxItems, MaxBatches: 1, ContextPerTarget: 3}).Build(t.Context(), AssemblyRequest{
+				PersonID: 7, Catalog: packet.Catalog,
+				Cursors: []Cursor{{Key: CursorKey{PersonID: 7, SourceLane: SourceConversationText,
+					ProgramFingerprint: ProgramFingerprint(), CatalogFingerprint: packet.Catalog.Fingerprint},
+					OptimisticSequence: 10, ReconciliationComplete: true, LastBackstopAt: &now}},
+				Profile: ProviderProfile{AllowedSources: []SourceClass{SourceConversationText, SourceMeetingText},
 					SourceSince: "2020-01-01", AllowSensitive: true},
-				Now: now, BackstopInterval: 24 * time.Hour, ForceBackstop: test.force,
+				Now: now, BackstopInterval: 24 * time.Hour,
 			})
-			must.NoError(err)
-			must.Len(result.CursorEnvelope, 1)
-			checks.Equal(test.mode, result.CursorEnvelope[0].Mode)
-			checks.Empty(result.CursorEnvelope[0].ReconcileFromKey)
-			checks.Empty(result.CursorEnvelope[0].ReconcileToKey)
-			checks.Empty(result.CursorEnvelope[0].DocumentFromKey)
-			checks.Equal("live:00000000000000000002", result.CursorEnvelope[0].DocumentToKey)
-			checks.Equal(test.wantUpper, result.CursorEnvelope[0].BackstopUpperKey)
+			require.NoError(t, err)
+			checks.Equal(test.wantIDs, contextMessageIDs(result.Packet.Context))
+			checks.Equal(test.wantPriority, result.ContextPriority)
+			checks.Len(result.Batches, 1)
 		})
 	}
+}
+
+func TestAssemblerOverflowWithOnlySeedsTerminates(t *testing.T) {
+	packet := packetTestPacket()
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name  string
+		items []EvidenceItem
+	}{
+		{name: "no context"},
+		{name: "context exhausted", items: []EvidenceItem{packetTestEvidence(100, SourceConversationText, "context")}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			checks := assert.New(t)
+			seeds := []EvidenceItem{packet.Seeds[1],
+				packetTestEvidence(20, SourceConversationText, "second seed"),
+				packetTestEvidence(30, SourceConversationText, "third seed")}
+			source := &assemblySourceStub{windows: map[GenerationCursorMode]PersonWindow{
+				GenerationCursorOptimistic: {Seeds: seeds, NextSequence: 12},
+			}}
+			archive := &assemblyContextArchive{candidates: []int64{100}, items: test.items}
+			result, err := (Assembler{Source: source, Context: NewContextRetriever(archive),
+				MaxBytes: 16_384, MaxItems: 2, MaxBatches: 1, ContextPerTarget: 1}).Build(t.Context(), AssemblyRequest{
+				PersonID: 7, Catalog: packet.Catalog,
+				Cursors: []Cursor{{Key: CursorKey{PersonID: 7, SourceLane: SourceConversationText,
+					ProgramFingerprint: ProgramFingerprint(), CatalogFingerprint: packet.Catalog.Fingerprint},
+					OptimisticSequence: 10, ReconciliationComplete: true, LastBackstopAt: &now}},
+				Profile: ProviderProfile{AllowedSources: []SourceClass{SourceConversationText},
+					SourceSince: "2020-01-01", AllowSensitive: true},
+				Now: now, BackstopInterval: 24 * time.Hour,
+			})
+			require.NoError(t, err)
+			checks.Empty(result.Packet.Context)
+			checks.Empty(result.ContextPriority)
+			checks.Len(result.Batches, 2)
+			checks.Equal([]int64{10, 20, 30}, contextMessageIDs(result.Packet.Seeds))
+		})
+	}
+}
+
+func contextMessageIDs(items []EvidenceItem) []int64 {
+	ids := make([]int64, 0, len(items))
+	for _, item := range items {
+		ids = append(ids, item.Ref.MessageID)
+	}
+	return ids
 }
 
 func TestAssemblerBuildsPluralDueCursorEnvelope(t *testing.T) {

@@ -286,7 +286,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (summary *I
 	// membership this run's media policy is about to be evaluated against, so
 	// purge and retry selection later reach the same verdict sync did.
 	floor := guildFloor{}
-	if media != nil {
+	if media != nil || opts.MediaPolicy.MaxParticipants > 0 {
 		floor = imp.guildParticipantFloor(ctx, opts, summary)
 		// The floor is guild-wide, so its outcome lands on every conversation of
 		// the guild before staging rewrites this run's containers: purge and
@@ -1660,32 +1660,7 @@ func (imp *Importer) resolveRecipients(ctx context.Context,
 }
 
 func (imp *Importer) resolveDeferredReplies(ctx context.Context, sourceID int64) error {
-	afterID := int64(0)
-	for {
-		unresolved, err := imp.store.ListUnresolvedMessageRepliesAfterContext(ctx,
-			sourceID, discordMessageType, afterID, imp.pageSize,
-		)
-		if err != nil {
-			return err
-		}
-		for _, reply := range unresolved {
-			var metadata struct {
-				ReferencedMessageID string `json:"referenced_message_id"`
-			}
-			if err := json.Unmarshal([]byte(reply.Metadata), &metadata); err != nil {
-				return fmt.Errorf("decode Discord reply metadata for %s: %w", reply.SourceMessageID, err)
-			}
-			if metadata.ReferencedMessageID != "" {
-				if err := imp.store.SetReplyToContext(ctx, sourceID, reply.SourceMessageID, metadata.ReferencedMessageID); err != nil {
-					return fmt.Errorf("resolve deferred Discord reply %s: %w", reply.SourceMessageID, err)
-				}
-			}
-			afterID = reply.MessageID
-		}
-		if len(unresolved) < imp.pageSize {
-			return nil
-		}
-	}
+	return imp.store.ResolveDeferredMessageRepliesContext(ctx, sourceID, discordMessageType, imp.pageSize)
 }
 
 func (imp *Importer) saveCheckpoint(ctx context.Context,

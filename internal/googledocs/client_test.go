@@ -1,7 +1,6 @@
 package googledocs
 
 import (
-	"context"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
@@ -52,7 +51,7 @@ func TestValidateSourceAndDocumentID(t *testing.T) {
 	}})
 	require.Error(err, "invalid folder ID should fail")
 
-	_, err = client.GetDoc(context.Background(), "work", "bad document id", 100)
+	_, err = client.GetDoc(t.Context(), "work", "bad document id", 100)
 	require.Error(err, "invalid document ID should fail before API call")
 	assert.Contains(t, err.Error(), "document_id is invalid", "error")
 }

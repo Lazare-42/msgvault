@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil/dbtest"
 )
 
 // Wrapping the dialect selects the historical scan path without changing its
@@ -20,11 +21,12 @@ type metadataScanDialect struct{ SQLiteQueryDialect }
 
 func metadataSearchDB(tb testing.TB) *sql.DB {
 	tb.Helper()
-	st, err := store.OpenForTest(filepath.Join(tb.TempDir(), "metadata.db"))
+	dbtest.SkipIfPostgres(tb, "SQLite fixtures require SQLite")
+	st, err := store.OpenForTest(tb.Context(), filepath.Join(tb.TempDir(), "metadata.db"))
 	require.NoError(tb, err)
 	tb.Cleanup(func() { require.NoError(tb, st.Close()) })
 	require.NoError(tb, st.InitSchema())
-	_, err = st.DB().Exec(`INSERT INTO sources(id,source_type,identifier) VALUES(1,'gmail','archive@example.org');
+	_, err = st.DB().ExecContext(tb.Context(), `INSERT INTO sources(id,source_type,identifier) VALUES(1,'gmail','archive@example.org');
  INSERT INTO conversations(id,source_id,source_conversation_id,conversation_type) VALUES(1,1,'synthetic-thread','email_thread');
  INSERT INTO participants(id,email_address,display_name,phone_number) VALUES(1,'contact@example.org','ÉCOLE Contact','+15550001111');
  INSERT INTO messages(id,conversation_id,source_id,message_type,source_message_id,subject,snippet,sent_at,sender_id)
@@ -40,31 +42,20 @@ func metadataSearchDB(tb testing.TB) *sql.DB {
 func metadataPlan(t *testing.T, e *SQLiteEngine, q *search.Query) string {
 	t.Helper()
 	conditions, args, join := e.buildFilteredMetadataSearchQueryParts(t.Context(), q, MessageFilter{})
-	rows, err := e.db.Query("EXPLAIN QUERY PLAN "+searchResultsSQL(join, strings.Join(conditions, " AND ")), append(args, 50, 0)...)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, rows.Close()) }()
-	var plan strings.Builder
-	for rows.Next() {
-		var id, parent, unused int
-		var detail string
-		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
-		plan.WriteString(detail + "\n")
-	}
-	require.NoError(t, rows.Err())
-	return plan.String()
+	return dbtest.ExplainQueryPlan(t, e.db, searchResultsSQL(join, strings.Join(conditions, " AND ")), append(args, 50, 0)...)
 }
 
 func TestMetadataSearchIndexedPlan(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	e := NewSQLiteEngine(metadataSearchDB(t))
 	for _, q := range []*search.Query{{TextTerms: []string{"eedle"}}, {TextTerms: []string{"ÉCOLE"}, AccountIDs: []int64{1}}} {
 		plan := metadataPlan(t, e, q)
+		assert.NotRegexp(`(?m)^SCAN m(?: |$)`, plan)
 		assert.Contains(plan, "messages_metadata_fts VIRTUAL TABLE INDEX")
 		assert.Contains(plan, "participants_metadata_fts VIRTUAL TABLE INDEX")
 		assert.Contains(plan, "recipients_metadata_fts VIRTUAL TABLE INDEX")
-		if len(q.AccountIDs) == 0 {
-			assert.Contains(plan, "SEARCH m USING INTEGER PRIMARY KEY")
-		} else {
+		if len(q.AccountIDs) > 0 {
 			assert.Contains(plan, "source_id=? AND rowid=?")
 		}
 	}
@@ -74,6 +65,7 @@ func TestMetadataSearchIndexedPlan(t *testing.T) {
 }
 
 func TestMetadataSearchLiteralFields(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	e := NewSQLiteEngine(metadataSearchDB(t))
@@ -97,12 +89,13 @@ func TestMetadataSearchLiteralFields(t *testing.T) {
 }
 
 func TestMetadataSearchUnavailableIndex(t *testing.T) {
+	t.Parallel()
 	for _, damage := range []string{`DROP TABLE recipients_metadata_fts`, `DELETE FROM archive_metadata WHERE key='metadata_fts_version'`, `UPDATE archive_metadata SET value='0' WHERE key='metadata_fts_version'`} {
 		t.Run(damage, func(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
 			db := metadataSearchDB(t)
-			_, err := db.Exec(damage)
+			_, err := db.ExecContext(t.Context(), damage)
 			require.NoError(err)
 			e := NewSQLiteEngine(db)
 			assert.NotContains(metadataPlan(t, e, &search.Query{TextTerms: []string{"needle"}}), "messages_metadata_fts VIRTUAL TABLE INDEX")
@@ -123,13 +116,14 @@ func TestMetadataSearchUnavailableIndex(t *testing.T) {
 // A setup without FTS5 removes the readiness marker and stops index
 // maintenance while a long-running engine may already be using the index.
 func TestMetadataSearchStopsUsingDisabledIndex(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	db := metadataSearchDB(t)
 	e := NewSQLiteEngine(db)
 	needle := &search.Query{TextTerms: []string{"needle"}}
 	require.Contains(metadataPlan(t, e, needle), "messages_metadata_fts VIRTUAL TABLE INDEX")
-	_, err := db.Exec(`DELETE FROM archive_metadata WHERE key='metadata_fts_version';
+	_, err := db.ExecContext(t.Context(), `DELETE FROM archive_metadata WHERE key='metadata_fts_version';
  DROP TRIGGER messages_metadata_fts_insert;
  INSERT INTO messages(id,conversation_id,source_id,message_type,source_message_id,subject,snippet,sent_at)
  VALUES(5,1,1,'email','synthetic-5','unindexed needle','other','2024-01-05');`)
@@ -147,6 +141,7 @@ func TestMetadataSearchStopsUsingDisabledIndex(t *testing.T) {
 // The real SQLite authorizer lets cancellation land at a particular query
 // phase without a throughput race or a fake database implementation.
 func TestMetadataSearchCancellationDuringAggregates(t *testing.T) {
+	t.Parallel()
 	for _, phase := range []string{"count", "sum"} {
 		t.Run(phase, func(t *testing.T) {
 			require := require.New(t)

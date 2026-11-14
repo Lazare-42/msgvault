@@ -29,7 +29,7 @@ func TestMergeSourcesExecutionLockOwnership(t *testing.T) {
 			require := require.New(t)
 			var st *Store
 			if dbURL := os.Getenv("MSGVAULT_TEST_DB"); IsPostgresURL(dbURL) {
-				st = newPGStoreInternal(t, dbURL)
+				st = newPGStoreInternal(t)
 			} else {
 				st = openTestStore(t)
 			}
@@ -37,7 +37,7 @@ func TestMergeSourcesExecutionLockOwnership(t *testing.T) {
 			require.NoError(err)
 			second, err := st.GetOrCreateSource("gmail", "second@example.test")
 			require.NoError(err)
-			peer, err := OpenForTest(st.dbPath)
+			peer, err := OpenForTest(t.Context(), st.dbPath)
 			require.NoError(err)
 			t.Cleanup(func() { _ = peer.Close() })
 			ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
@@ -98,7 +98,7 @@ func TestSourceRemovalLockSerializesWithMerge(t *testing.T) {
 	require := require.New(t)
 	var st *Store
 	if dbURL := os.Getenv("MSGVAULT_TEST_DB"); IsPostgresURL(dbURL) {
-		st = newPGStoreInternal(t, dbURL)
+		st = newPGStoreInternal(t)
 	} else {
 		st = openTestStore(t)
 	}
@@ -106,7 +106,7 @@ func TestSourceRemovalLockSerializesWithMerge(t *testing.T) {
 	require.NoError(err)
 	into, err := st.GetOrCreateSource("matrix", "@archive:example.org")
 	require.NoError(err)
-	peer, err := OpenForTest(st.dbPath)
+	peer, err := OpenForTest(t.Context(), st.dbPath)
 	require.NoError(err)
 	t.Cleanup(func() { require.NoError(peer.Close()) })
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
@@ -151,7 +151,7 @@ func TestSourceRemovalLockDoesNotRecoverRunningSync(t *testing.T) {
 	require := require.New(t)
 	var st *Store
 	if dbURL := os.Getenv("MSGVAULT_TEST_DB"); IsPostgresURL(dbURL) {
-		st = newPGStoreInternal(t, dbURL)
+		st = newPGStoreInternal(t)
 	} else {
 		st = openTestStore(t)
 	}
@@ -161,7 +161,7 @@ func TestSourceRemovalLockDoesNotRecoverRunningSync(t *testing.T) {
 	require.NoError(err)
 	syncID, err := execution.StartSyncContext(t.Context(), "matrix", "")
 	require.NoError(err)
-	peer, err := OpenForTest(st.dbPath)
+	peer, err := OpenForTest(t.Context(), st.dbPath)
 	require.NoError(err)
 	t.Cleanup(func() { require.NoError(peer.Close()) })
 	require.NoError(execution.Release(), "release worker ownership while leaving its running row")

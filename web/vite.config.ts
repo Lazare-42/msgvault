@@ -12,7 +12,7 @@ export default defineConfig({
       // exercise the same policy intersection the daemon enforces on
       // sandboxed srcdoc mail frames. Keep the two in sync.
       'Content-Security-Policy':
-        "default-src 'self'; img-src 'self' data: blob: https: http:; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+        "default-src 'self'; img-src 'self' data: blob: https: http:; media-src 'self' blob:; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     }
   },
   resolve: {
@@ -26,6 +26,15 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     setupFiles: ['./src/test/setup.ts'],
-    exclude: ['tests/**', 'node_modules/**', 'dist/**']
+    exclude: ['tests/**', 'node_modules/**', 'dist/**'],
+    // In GitHub Actions, retry a failed test twice and record every result in
+    // a JSON report that CI uploads, so a test that passed on retry stays
+    // visible as flaky. The tree reporter lists each test under its file.
+    // Naming reporters drops Vitest's automatic github-actions annotations, so
+    // keep them explicitly.
+    ...(process.env.GITHUB_ACTIONS === 'true' && {
+      retry: 2,
+      reporters: ['tree', 'github-actions', ['json', { outputFile: 'test-results/vitest/unit.json' }]]
+    })
   }
 });

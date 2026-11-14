@@ -35,7 +35,7 @@ A same-service, same-scope username match can become a review candidate instead
 of an automatic link. Conflicting existing bindings remain conflicts. This is
 why two entries for the same person may stay separate after a sync.
 
-Open the Web [Directory review queues](/docs/web-ui/#directory-and-reviews) to inspect
+Open the Web [People: Possible duplicates](/docs/web-ui/#saved-profiles-and-possible-duplicates) to inspect
 identity candidates and accept or reject the proposed match. Check the source
 and identifier evidence before linking. See [people and source identities](/docs/usage/people/)
 for the difference between an observed participant and a curated profile.
@@ -91,8 +91,10 @@ but it is fully resumable: interrupt it any time and the next run continues
 from the saved checkpoint. Later runs only fetch chats with new activity.
 
 Recent messages (last 24 hours) are re-checked on every incremental run so
-edits, deletions, and reaction changes are captured; older in-place changes
-are only picked up by `--full` runs.
+edits, deletions, and reaction changes are captured. Only messages that changed
+since they were archived are rewritten, and the summary counts them as
+`updated`; `added` counts only messages archived for the first time. Older
+in-place changes are only picked up by `--full` runs.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -238,9 +240,9 @@ WHERE m.message_type = 'beeper'
 GROUP BY is_share;
 ```
 
-## Mirror all attachments to Docbank (unreleased)
+## Mirror all attachments to Docbank
 
-Mirror stored attachments from all sources with [attachment upload consent](../configuration.md#mirror-stored-attachments-to-docbank-unreleased).
+Mirror stored attachments from all sources with [attachment upload consent](../configuration.md#mirror-stored-attachments-to-docbank).
 
 ## Send audio to Docbank
 
@@ -393,6 +395,13 @@ A scheduled run keeps other sources on their cadence:
   completes the run, and the next run continues from the saved cursors.
 - **Account rotation.** After stopping within an account, the next run starts
   with the following account. Each account retains its own progress.
+- **Yielding to waiting work.** When a run stops because other work is
+  waiting, a follow-up runs after that work. It visits only the accounts that
+  have not had a turn yet, including one cut short at a boundary. Once every
+  account has had a turn, the next run waits for the next scheduled time.
+  **Sync now** or a scheduled time that arrives while a follow-up waits starts
+  a new pass over every account instead. The daemon keeps this progress in
+  memory, so a restart starts over.
 - **New messages first.** Chats with only new messages sync before chats
   still backfilling history. Completed chats are skipped until the current
   discovery cycle finishes, so later chats also get a turn.
@@ -438,6 +447,8 @@ separable (different sources and different `message_type` values), and
 participants still unify across archives via phone-number and email matching
 (the Beeper user ID is also persisted as an identifier, so later runs keep
 resolving to the same person).
+
+Telegram users also link to [Telegram Desktop imports](text-messages.md#import-telegram) by numeric user ID when a sync revisits their chat; `sync-beeper --full` covers quiet chats.
 
 ## Caveats
 

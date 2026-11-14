@@ -14,23 +14,23 @@ func TestWhatsAppPairingAuth(t *testing.T) {
 	handler := &whatsappPairingHandler{pairingToken: "secret"}
 
 	t.Run("query_token", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/qr?token=secret", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/qr?token=secret", nil)
 		assert.True(t, handler.authorized(req))
 	})
 
 	t.Run("bearer_token", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/qr", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/qr", nil)
 		req.Header.Set("Authorization", "Bearer secret")
 		assert.True(t, handler.authorized(req))
 	})
 
 	t.Run("wrong_token", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/qr?token=wrong", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/qr?token=wrong", nil)
 		assert.False(t, handler.authorized(req))
 	})
 
 	t.Run("open_when_unconfigured", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodGet, "/qr", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/qr", nil)
 		assert.True(t, (&whatsappPairingHandler{}).authorized(req))
 	})
 }

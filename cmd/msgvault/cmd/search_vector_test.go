@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -85,6 +86,24 @@ func TestWriteHybridResultsTableExplainKeepsScores(t *testing.T) {
 	assert.Contains(buf.String(), "0.5000")
 	assert.Contains(buf.String(), "1.2500")
 	assert.Contains(buf.String(), "0.7500")
+}
+
+func TestOutputHybridResultsJSONHiddenTextPresent(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	done := captureStdout(t)
+	err := outputHybridResultsJSON(&daemonclient.CLIHybridSearch{Results: []daemonclient.CLIHybridSearchResult{
+		{ID: 1, Message: query.MessageSummary{HiddenTextPresent: true}},
+		{ID: 2, Message: query.MessageSummary{HiddenTextPresent: false}},
+	}}, false)
+	out := done()
+	require.NoError(err)
+	var result struct {
+		Results []map[string]any `json:"results"`
+	}
+	require.NoError(json.Unmarshal([]byte(out), &result))
+	require.Len(result.Results, 2)
+	assert.Equal(true, result.Results[0]["hidden_text_present"])
+	assert.Equal(false, result.Results[1]["hidden_text_present"])
 }
 
 func TestSearchHybridFullTextInPipe(t *testing.T) {
@@ -257,6 +276,64 @@ func TestSearchCmd_HybridModeUsesConfiguredRemoteHTTP(t *testing.T) {
 	assert.Contains(out, `"accelerator": "vec1_ivf_opq"`, "accelerator path")
 }
 
+func TestSearchCmd_HintsUseConfiguredRemoteHTTP(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		hasMore       bool
+		offset, limit int
+		message       string
+	}{
+		{name: "fts_complete", limit: 50},
+		{name: "fts_later_page", hasMore: true, offset: 50, limit: 50, message: "Hint: more messages match; use --offset 100 for the next page\n"},
+	} {
+		for _, asJSON := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/json=%t", tc.name, asJSON), func(t *testing.T) {
+				assert, require := assert.New(t), require.New(t)
+				requests := &atomic.Int32{}
+				srv := vectorSearchHTTPDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+					requests.Add(1)
+					assert.Equal(strconv.Itoa(tc.limit), r.URL.Query().Get("limit"))
+					if tc.offset > 0 {
+						assert.Equal("50", r.URL.Query().Get("offset"))
+					}
+					rows := make([]map[string]any, tc.limit)
+					for i := range rows {
+						rows[i] = map[string]any{"id": i + 1, "subject": "Lunch"}
+					}
+					assert.NoError(json.NewEncoder(w).Encode(map[string]any{"results": rows, "has_more": tc.hasMore}))
+				})
+				ctx, restore := configureVectorSearchHTTPTest(t, t.TempDir(), false, srv.URL)
+				defer restore()
+				root := newTestRootCmd()
+				root.SetContext(ctx)
+				root.AddCommand(searchCmd)
+				args := []string{"search", "--mode", "fts", "lunch", "--offset", strconv.Itoa(tc.offset), "--limit", strconv.Itoa(tc.limit)}
+				if asJSON {
+					args = append(args, "--json")
+				}
+				root.SetArgs(args)
+				var stderr bytes.Buffer
+				root.SetErr(&stderr)
+				done := captureStdout(t)
+				err := root.Execute()
+				out := done()
+				require.NoError(err)
+				assert.Equal(int32(1), requests.Load())
+				if tc.message == "" {
+					assert.Empty(stderr.String())
+				} else {
+					assert.Equal(tc.message, stderr.String())
+				}
+				if asJSON {
+					var rows []map[string]any
+					require.NoError(json.Unmarshal([]byte(out), &rows))
+					assert.Len(rows, tc.limit)
+				}
+			})
+		}
+	}
+}
+
 func vectorSearchHTTPDaemon(
 	t *testing.T,
 	searchHandler http.HandlerFunc,
@@ -268,6 +345,7 @@ func vectorSearchHTTPDaemon(
 		Version: Version,
 	}))
 	mux.HandleFunc("/api/v1/search", searchHandler)
+	mux.HandleFunc("/api/v1/cli/search", searchHandler)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv

@@ -52,6 +52,7 @@ func (m *mockIngestFunc) fn(
 
 func openTestStorePst(t *testing.T) *store.Store {
 	t.Helper()
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "msgvault.db")
 	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
@@ -64,7 +65,7 @@ func TestImportPst_MissingFile(t *testing.T) {
 	st := openTestStorePst(t)
 	mock := &mockIngestFunc{}
 
-	_, err := ImportPst(context.Background(), st, "/nonexistent/path.pst", PstImportOptions{
+	_, err := ImportPst(t.Context(), st, "/nonexistent/path.pst", PstImportOptions{
 		Identifier: "user@example.com",
 		NoResume:   true,
 		IngestFunc: mock.fn,
@@ -76,7 +77,7 @@ func TestImportPst_MissingFile(t *testing.T) {
 // TestImportPst_RequiresIdentifier verifies that ImportPst rejects an empty identifier.
 func TestImportPst_RequiresIdentifier(t *testing.T) {
 	st := openTestStorePst(t)
-	_, err := ImportPst(context.Background(), st, "any.pst", PstImportOptions{
+	_, err := ImportPst(t.Context(), st, "any.pst", PstImportOptions{
 		Identifier: "",
 	})
 	require.Error(t, err, "expected error for empty identifier")

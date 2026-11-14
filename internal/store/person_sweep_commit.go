@@ -86,6 +86,195 @@ func (s *Store) ApplyPersonSweep(
 	return s.applyPersonSweepWithAligner(ctx, request, PersonSweepEvidenceAligner{Store: s})
 }
 
+// ApplyPersonSweepStatusOnly commits support changes without completing work or
+// advancing cursors. The worker renews the lease before entering this phase;
+// return that lease only after its fence has protected the committed generation.
+func (s *Store) ApplyPersonSweepStatusOnly(
+	ctx context.Context, request peoplesweep.StatusOnlyApplyRequest,
+) (peoplesweep.Lease, error) {
+	generation := request.Generation
+	if request.Lease.PersonID <= 0 || strings.TrimSpace(request.Lease.WorkerID) == "" ||
+		request.Lease.Fence < 0 || strings.TrimSpace(request.AttemptID) == "" || request.CompletedAt.IsZero() ||
+		generation.PersonID != request.Lease.PersonID || len(generation.Claims) != 0 ||
+		len(generation.EvidenceStatusChanges) == 0 ||
+		generation.Provider != peoplesweep.StatusOnlyProvider ||
+		generation.ProviderVersion != peoplesweep.StatusOnlyProviderVersion ||
+		generation.Model != peoplesweep.StatusOnlyModel ||
+		generation.ModelVersion != peoplesweep.StatusOnlyModelVersion {
+		return peoplesweep.Lease{}, errors.New("apply person sweep status-only requires a lease, host generation, support changes, and completion time")
+	}
+	prepared, err := personfacts.PreparePersonFactGeneration(ctx, generation, PersonSweepEvidenceAligner{Store: s})
+	if err != nil {
+		return peoplesweep.Lease{}, fmt.Errorf("prepare person sweep status-only generation: %w", err)
+	}
+	err = s.withTxContext(ctx, func(tx *loggedTx) error {
+		attempt, err := s.lockPersonSweepBudgetAttempt(ctx, tx, request.AttemptID)
+		if err != nil {
+			return err
+		}
+		if attempt.personID != request.Lease.PersonID || attempt.leaseFence != request.Lease.Fence ||
+			attempt.status != peoplesweep.AttemptRunning {
+			return peoplesweep.ErrLeaseLost
+		}
+		if err := s.requirePersonSweepBudgetRunRunning(ctx, tx, attempt.runID); err != nil {
+			return err
+		}
+		// No provider reservations exist yet. The shared lock planner still
+		// takes the work row before any person/profile locks in the fact apply.
+		current, err := s.lockPersonSweepUsageThenWorkTx(ctx, tx, request.AttemptID, nil, request.Lease)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return peoplesweep.ErrLeaseLost
+		}
+		if err := s.lockProfileIdentityKeyTxContext(ctx, tx, "person-fact-generation", generation.PersonID); err != nil {
+			return err
+		}
+		// A later range can contain both committed and new support changes.
+		// Apply only the pending changes so the status ledger has one event for
+		// each evidence-key/source-version/reason transition.
+		pending, err := personSweepPendingStatusChangesTx(
+			ctx, tx, generation.PersonID, generation.EvidenceStatusChanges)
+		if err != nil {
+			return err
+		}
+		if len(pending) == 0 {
+			return nil
+		}
+		if len(pending) != len(generation.EvidenceStatusChanges) {
+			filtered := generation
+			filtered.EvidenceStatusChanges = pending
+			prepared, err = personfacts.PreparePersonFactGeneration(
+				ctx, filtered, PersonSweepEvidenceAligner{Store: s})
+			if err != nil {
+				return fmt.Errorf("prepare pending person sweep status changes: %w", err)
+			}
+		}
+		_, facts, err := s.applyPreparedPersonFactGenerationDetailedTx(ctx, tx, prepared, nil)
+		if err != nil {
+			return err
+		}
+		// Replay metadata is zero, so retrying this phase cannot double count.
+		if _, err := tx.ExecContext(ctx, `UPDATE person_sweep_attempts SET
+			decision_count = decision_count + ?, projected_write_count = projected_write_count + ?
+			WHERE id = ?`, facts.decisionRowsInserted, facts.projectionRowsWritten, request.AttemptID); err != nil {
+			return fmt.Errorf("record person sweep status-only counts: %w", err)
+		}
+		return s.refreshPersonSweepAttemptAndRunUsage(ctx, tx, request.AttemptID, attempt.runID)
+	})
+	if err != nil {
+		return peoplesweep.Lease{}, fmt.Errorf("apply person sweep status-only: %w", err)
+	}
+	return request.Lease, nil
+}
+
+// PersonSweepEvidenceStatusesApplied reports whether every requested evidence
+// status change is already reflected by a committed generation.
+func (s *Store) PersonSweepEvidenceStatusesApplied(
+	ctx context.Context, personID int64, changes []personfacts.EvidenceStatusChange,
+) (applied bool, err error) {
+	if personID <= 0 {
+		return false, errors.New("check person sweep evidence statuses requires a person")
+	}
+	if len(changes) == 0 {
+		return true, nil
+	}
+	err = s.withTxContext(ctx, func(tx *loggedTx) error {
+		applied, err = personSweepStatusesAppliedTx(ctx, tx, personID, changes)
+		return err
+	})
+	if err != nil {
+		return false, fmt.Errorf("check person sweep evidence statuses applied: %w", err)
+	}
+	return applied, nil
+}
+
+func personSweepStatusesAppliedTx(ctx context.Context, tx *loggedTx, personID int64,
+	changes []personfacts.EvidenceStatusChange,
+) (bool, error) {
+	pending, err := personSweepPendingStatusChangesTx(ctx, tx, personID, changes)
+	if err != nil {
+		return false, err
+	}
+	return len(pending) == 0, nil
+}
+
+func personSweepPendingStatusChangesTx(ctx context.Context, tx *loggedTx, personID int64,
+	changes []personfacts.EvidenceStatusChange,
+) ([]personfacts.EvidenceStatusChange, error) {
+	pending := make([]personfacts.EvidenceStatusChange, 0, len(changes))
+	for _, change := range changes {
+		var supported bool
+		var reason personfacts.EvidenceStatusReason
+		err := tx.QueryRowContext(ctx, `SELECT e.supported, e.reason
+			FROM person_fact_evidence_status_events e
+			JOIN person_fact_generations g ON g.id = e.generation_id
+			WHERE e.person_id = ? AND e.evidence_key = ? AND e.source_version = ?
+			ORDER BY g.resolved_at DESC, e.id DESC LIMIT 1`,
+			personID, change.EvidenceKey, change.SourceVersion).Scan(&supported, &reason)
+		if errors.Is(err, sql.ErrNoRows) {
+			pending = append(pending, change)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("check committed sweep evidence status: %w", err)
+		}
+		if supported != change.Supported || reason != change.Reason {
+			pending = append(pending, change)
+		}
+	}
+	return pending, nil
+}
+
+// DeferPersonSweepAttempt cancels pre-provider work and releases its fenced
+// lease immediately. Committed status counts survive; retry counters do not grow.
+func (s *Store) DeferPersonSweepAttempt(ctx context.Context, lease peoplesweep.Lease,
+	attemptID string, completedAt time.Time,
+) error {
+	if strings.TrimSpace(attemptID) == "" || completedAt.IsZero() {
+		return errors.New("defer person sweep attempt requires an attempt and completion time")
+	}
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		attempt, err := s.lockPersonSweepBudgetAttempt(ctx, tx, attemptID)
+		if err != nil {
+			return err
+		}
+		if attempt.personID != lease.PersonID || attempt.leaseFence != lease.Fence ||
+			attempt.status != peoplesweep.AttemptRunning {
+			return peoplesweep.ErrLeaseLost
+		}
+		if err := s.requirePersonSweepBudgetRunRunning(ctx, tx, attempt.runID); err != nil {
+			return err
+		}
+		batches, err := listPersonSweepBatchCoordinatesTx(ctx, tx, attemptID)
+		if err != nil {
+			return err
+		}
+		if len(batches) != 0 {
+			return errors.New("defer person sweep attempt requires no provider reservations")
+		}
+		current, err := s.lockPersonSweepUsageThenWorkTx(ctx, tx, attemptID, nil, lease)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return peoplesweep.ErrLeaseLost
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE person_sweep_attempts
+			SET status = 'cancelled', completed_at = ? WHERE id = ?`,
+			s.dialect.TimestampParam(completedAt), attemptID); err != nil {
+			return fmt.Errorf("cancel deferred person sweep attempt: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE person_sweep_work
+			SET available_at = %s, lease_owner = '', lease_until = NULL, updated_at = %s
+			WHERE person_id = ?`, s.dialect.Now(), s.dialect.Now()), lease.PersonID); err != nil {
+			return fmt.Errorf("requeue deferred person sweep attempt: %w", err)
+		}
+		return s.refreshPersonSweepAttemptAndRunUsage(ctx, tx, attemptID, attempt.runID)
+	})
+}
+
 func (s *Store) applyPersonSweepWithAligner(
 	ctx context.Context, request peoplesweep.ApplyRequest, aligner personfacts.EvidenceAligner,
 ) (peoplesweep.ApplyResult, error) {
@@ -208,7 +397,8 @@ func (s *Store) applyPersonSweepWithAligner(
 		attemptResult, err := tx.ExecContext(ctx, `UPDATE person_sweep_attempts SET
 			status = 'succeeded', failure_class = '', brief_failure_class = ?,
 			generation_id = ?, generation_key = ?,
-			claim_count = ?, decision_count = ?, projected_write_count = ?, completed_at = ?
+			claim_count = ?, decision_count = decision_count + ?,
+			projected_write_count = projected_write_count + ?, completed_at = ?
 			WHERE id = ? AND status = 'running'`, request.BriefFailureClass,
 			generation.GenerationID,
 			generation.GenerationKey, len(request.Generation.Claims), len(generation.Decisions),
@@ -222,6 +412,10 @@ func (s *Store) applyPersonSweepWithAligner(
 			return peoplesweep.ErrLeaseLost
 		}
 		result.Mutations.AttemptRowsSucceeded = int(changed)
+		if err := tx.QueryRowContext(ctx, `SELECT projected_write_count FROM person_sweep_attempts
+			WHERE id = ?`, request.AttemptID).Scan(&result.AttemptProjectedWrites); err != nil {
+			return fmt.Errorf("load person sweep attempt writes: %w", err)
+		}
 		if err := s.refreshPersonSweepAttemptAndRunUsage(ctx, tx, request.AttemptID, request.RunID); err != nil {
 			return err
 		}
@@ -604,9 +798,6 @@ func (s *Store) advanceBoundPersonSweepCursorsTx(
 		if a.ExpectedReconcileKey != b.ExpectedReconcileKey {
 			return strings.Compare(a.ExpectedReconcileKey, b.ExpectedReconcileKey)
 		}
-		if a.ExpectedDocumentKey != b.ExpectedDocumentKey {
-			return strings.Compare(a.ExpectedDocumentKey, b.ExpectedDocumentKey)
-		}
 		return strings.Compare(a.NextReconcileKey, b.NextReconcileKey)
 	})
 	count := 0
@@ -615,13 +806,12 @@ func (s *Store) advanceBoundPersonSweepCursorsTx(
 		var args []any
 		switch advance.Mode {
 		case peoplesweep.GenerationCursorOptimistic:
-			query = `UPDATE person_sweep_cursors SET optimistic_sequence = ?, optimistic_document_key = ?,
+			query = `UPDATE person_sweep_cursors SET optimistic_sequence = ?,
 				updated_at = ` + s.dialect.Now() + `
 				WHERE person_id = ? AND source_lane = ? AND program_fingerprint = ?
-				AND catalog_fingerprint = ? AND optimistic_sequence = ? AND optimistic_document_key = ?`
-			args = []any{advance.NextSequence, advance.NextDocumentKey, advance.Key.PersonID, advance.Key.SourceLane,
-				advance.Key.ProgramFingerprint, advance.Key.CatalogFingerprint, advance.ExpectedSequence,
-				advance.ExpectedDocumentKey}
+				AND catalog_fingerprint = ? AND optimistic_sequence = ?`
+			args = []any{advance.NextSequence, advance.Key.PersonID, advance.Key.SourceLane,
+				advance.Key.ProgramFingerprint, advance.Key.CatalogFingerprint, advance.ExpectedSequence}
 		case peoplesweep.GenerationCursorReconciliation:
 			queryUpper := `SELECT reconcile_upper_key FROM person_sweep_cursors
 				WHERE person_id = ? AND source_lane = ? AND program_fingerprint = ?
@@ -634,48 +824,43 @@ func (s *Store) advanceBoundPersonSweepCursorsTx(
 				advance.Key.ProgramFingerprint, advance.Key.CatalogFingerprint).Scan(&upper); err != nil {
 				return 0, fmt.Errorf("lock person sweep reconciliation cursor: %w", err)
 			}
-			if (advance.NextReconcileKey >= upper && advance.NextDocumentKey == "") != advance.ReconciliationDone {
+			if (advance.NextReconcileKey >= upper) != advance.ReconciliationDone {
 				return 0, errors.New("person sweep reconciliation completion does not match upper bound")
 			}
-			query = `UPDATE person_sweep_cursors SET reconcile_after_key = ?, reconcile_document_key = ?,
+			query = `UPDATE person_sweep_cursors SET reconcile_after_key = ?,
 				reconciliation_complete = ?,
 				updated_at = ` + s.dialect.Now() + ` WHERE person_id = ? AND source_lane = ?
 				AND program_fingerprint = ? AND catalog_fingerprint = ?
-				AND optimistic_sequence = ? AND reconcile_after_key = ? AND reconcile_document_key = ?
+				AND optimistic_sequence = ? AND reconcile_after_key = ?
 				AND ? <= reconcile_upper_key AND reconciliation_complete = FALSE`
-			args = []any{advance.NextReconcileKey, advance.NextDocumentKey, advance.ReconciliationDone, advance.Key.PersonID,
+			args = []any{advance.NextReconcileKey, advance.ReconciliationDone, advance.Key.PersonID,
 				advance.Key.SourceLane, advance.Key.ProgramFingerprint, advance.Key.CatalogFingerprint,
-				advance.ExpectedSequence, advance.ExpectedReconcileKey, advance.ExpectedDocumentKey,
+				advance.ExpectedSequence, advance.ExpectedReconcileKey,
 				advance.NextReconcileKey}
 		case peoplesweep.GenerationCursorBackstop:
 			if advance.CapturedBackstopUpperKey == "" ||
 				(advance.ExpectedBackstopUpperKey == "" && advance.ExpectedReconcileKey != "") ||
 				(advance.ExpectedBackstopUpperKey != "" &&
 					advance.ExpectedBackstopUpperKey != advance.CapturedBackstopUpperKey) ||
-				!personSweepDocumentCoordinateAdvanced(advance.ExpectedReconcileKey,
-					advance.ExpectedDocumentKey, advance.NextReconcileKey, advance.NextDocumentKey) ||
+				advance.NextReconcileKey <= advance.ExpectedReconcileKey ||
 				advance.NextReconcileKey > advance.CapturedBackstopUpperKey ||
-				advance.BackstopComplete != (advance.NextReconcileKey == advance.CapturedBackstopUpperKey &&
-					advance.NextDocumentKey == "") {
+				advance.BackstopComplete != (advance.NextReconcileKey == advance.CapturedBackstopUpperKey) {
 				return 0, errors.New("person sweep backstop advance has invalid bounded progress")
 			}
-			nextUpper, nextAfter, nextDocument := advance.CapturedBackstopUpperKey,
-				advance.NextReconcileKey, advance.NextDocumentKey
+			nextUpper, nextAfter := advance.CapturedBackstopUpperKey, advance.NextReconcileKey
 			if advance.BackstopComplete {
-				nextUpper, nextAfter, nextDocument = "", "", ""
+				nextUpper, nextAfter = "", ""
 			}
 			query = `UPDATE person_sweep_cursors SET backstop_upper_key = ?, backstop_after_key = ?,
-				backstop_document_key = ?,
 				last_backstop_at = CASE WHEN ? THEN ? ELSE last_backstop_at END,
 				updated_at = ` + s.dialect.Now() + `
 				WHERE person_id = ? AND source_lane = ? AND program_fingerprint = ?
 				AND catalog_fingerprint = ? AND optimistic_sequence = ?
-				AND backstop_upper_key = ? AND backstop_after_key = ? AND backstop_document_key = ?`
-			args = []any{nextUpper, nextAfter, nextDocument, advance.BackstopComplete,
+				AND backstop_upper_key = ? AND backstop_after_key = ?`
+			args = []any{nextUpper, nextAfter, advance.BackstopComplete,
 				s.dialect.TimestampParam(request.CompletedAt), advance.Key.PersonID,
 				advance.Key.SourceLane, advance.Key.ProgramFingerprint, advance.Key.CatalogFingerprint,
-				advance.ExpectedSequence, advance.ExpectedBackstopUpperKey, advance.ExpectedReconcileKey,
-				advance.ExpectedDocumentKey}
+				advance.ExpectedSequence, advance.ExpectedBackstopUpperKey, advance.ExpectedReconcileKey}
 		default:
 			return 0, errors.New("apply person sweep has unsupported cursor advance mode")
 		}
@@ -690,10 +875,6 @@ func (s *Store) advanceBoundPersonSweepCursorsTx(
 		count++
 	}
 	return count, nil
-}
-
-func personSweepDocumentCoordinateAdvanced(from, fromDocument, to, toDocument string) bool {
-	return to > from || (to == from && toDocument > fromDocument)
 }
 
 func personSweepCursorApplyOrder(mode peoplesweep.GenerationCursorMode) int {
@@ -729,8 +910,7 @@ func (s *Store) finishPersonSweepWorkTx(
 		err = tx.QueryRowContext(ctx, `SELECT EXISTS (
 		SELECT 1 FROM person_sweep_cursors c WHERE c.person_id = ?
 		AND c.program_fingerprint = ? AND c.catalog_fingerprint = ?
-		AND (c.backstop_upper_key <> '' OR c.optimistic_document_key <> '' OR
-		c.reconcile_document_key <> '' OR
+		AND (c.backstop_upper_key <> '' OR
 		(c.reconciliation_complete = FALSE AND c.reconcile_after_key <> c.reconcile_upper_key) OR EXISTS (
 			SELECT 1 FROM person_sweep_changes ch WHERE ch.person_id = c.person_id
 			AND ch.source_lane = c.source_lane AND ch.sequence > c.optimistic_sequence)))`,

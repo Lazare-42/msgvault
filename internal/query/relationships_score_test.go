@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"math"
 	"testing"
 	"time"
@@ -11,6 +10,7 @@ import (
 )
 
 func TestRelationshipScore(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		signals RelationshipSignals
@@ -81,6 +81,7 @@ func TestRelationshipScore(t *testing.T) {
 // Log-compressing only the received term must flip that ordering by roughly
 // an order of magnitude, without changing how sent or meetings contribute.
 func TestRelationshipScoreLogCompressesReceivedVolume(t *testing.T) {
+	t.Parallel()
 	partner := RelationshipSignals{SentToThem: 131, ReceivedFromThem: 110, Modalities: 1}
 	notificationsBot := RelationshipSignals{SentToThem: 0.7, ReceivedFromThem: 31000, Modalities: 1}
 
@@ -98,6 +99,7 @@ func TestRelationshipScoreLogCompressesReceivedVolume(t *testing.T) {
 // outranks a received-heavy one-way counterpart even with far less sent
 // activity, since meetings stay linear while received is log-compressed.
 func TestRelationshipScoreMeetingsOutweighReceivedVolume(t *testing.T) {
+	t.Parallel()
 	meetingHeavy := RelationshipSignals{SentToThem: 5, MeetingsTogether: 20, Modalities: 1}
 	receivedHeavy := RelationshipSignals{SentToThem: 0.5, ReceivedFromThem: 500, Modalities: 1}
 
@@ -113,6 +115,7 @@ func TestRelationshipScoreMeetingsOutweighReceivedVolume(t *testing.T) {
 // owner-authored reply it passes the reciprocity gate, but its score is
 // sent-only — not inflated by subscription volume.
 func TestRelationshipsReceivedCreditsOnlyAuthors(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -148,7 +151,7 @@ func TestRelationshipsReceivedCreditsOnlyAuthors(t *testing.T) {
 	b.AddTo(replyID, listID, "Dev List")
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(), RelationshipsRequest{Now: now, Limit: 10})
+	result, err := engine.Relationships(t.Context(), RelationshipsRequest{Now: now, Limit: 10})
 	require.NoError(err)
 	require.Len(result.Rows, 1, "only the list passes the gate; the authors have no sent/meeting signal")
 
@@ -166,6 +169,7 @@ func TestRelationshipsReceivedCreditsOnlyAuthors(t *testing.T) {
 // of author-only credit: a person who authored 20 messages received by the
 // owner earns received_from_them = 20.
 func TestRelationshipsReceivedCountsAuthoredMessages(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -184,7 +188,8 @@ func TestRelationshipsReceivedCountsAuthoredMessages(t *testing.T) {
 	}
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(),
+	result, err := engine.Relationships(
+		t.Context(),
 		RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
 	require.NoError(err)
 	require.Len(result.Rows, 1)
@@ -201,6 +206,7 @@ func TestRelationshipsReceivedCountsAuthoredMessages(t *testing.T) {
 // credits its non-owner members (including silent ones listed only via
 // conversation_participants) when the latest message is incoming.
 func TestRelationshipsChatReceivedCreditUnchanged(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -227,7 +233,8 @@ func TestRelationshipsChatReceivedCreditUnchanged(t *testing.T) {
 	b.AddConversationParticipant(convID, silentID)
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(),
+	result, err := engine.Relationships(
+		t.Context(),
 		RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
 	require.NoError(err)
 	require.Len(result.Rows, 2)

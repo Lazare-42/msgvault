@@ -52,6 +52,9 @@ type Options struct {
 	DataDir      string
 	ExportDir    string
 	Version      string
+	// Distribution names who distributes the binary. When a package manager
+	// owns it, the update notice points at that package manager.
+	Distribution string
 
 	// AggregateLimit overrides the maximum number of aggregate rows to load.
 	// Zero uses the default (50,000).
@@ -68,6 +71,10 @@ type Options struct {
 	// PeopleBackend provides the People directory and contact workspace.
 	// When nil, embedders retain the three existing modes.
 	PeopleBackend peoplebrowser.Backend
+
+	// LocalTimezone is the IANA name of the system zone that Go reports as
+	// "Local"; empty when unknown.
+	LocalTimezone string
 
 	// ManifestSaver saves staged deletion manifests. When nil, manifests are
 	// saved under DataDir for tests or direct embedding.
@@ -394,6 +401,7 @@ type Model struct {
 	// People mode dependencies and state remain separate from every other mode.
 	peopleBackend peoplebrowser.Backend
 	peopleState   peopleState
+	localTimezone string
 
 	// Settings is a global shell surface, deliberately separate from the
 	// content-mode cycle so opening it cannot disturb content navigation.
@@ -402,7 +410,8 @@ type Model struct {
 	settingsRequestID uint64
 
 	// Version info for title bar
-	version string
+	version      string
+	distribution string
 
 	// Notice shown on the info line while aggregate data loads (e.g. the
 	// daemon is running live SQL because no analytics cache is built).
@@ -426,6 +435,7 @@ type Model struct {
 	// Global Stats (not view specific)
 	stats                 *query.TotalStats // Global stats
 	accounts              []query.AccountInfo
+	accountsLoaded        bool
 	collectionScopeLister query.CollectionScopeLister
 	collectionScopes      []query.CollectionScope
 	sourceScope           sourceScope
@@ -578,6 +588,7 @@ func New(engine query.Engine, opts Options) Model {
 		collectionScopeLister: opts.CollectionScopeLister,
 		sourceScope:           allSourceScope(),
 		peopleBackend:         opts.PeopleBackend,
+		localTimezone:         opts.LocalTimezone,
 		settingsBackend:       opts.SettingsBackend,
 		settings:              newSettingsState(),
 		actions: NewActionControllerWithOptions(engine, ActionControllerOptions{
@@ -588,6 +599,7 @@ func New(engine query.Engine, opts Options) Model {
 		}),
 		semanticSearch:     opts.SemanticSearch,
 		version:            opts.Version,
+		distribution:       opts.Distribution,
 		analyticsNotice:    opts.AnalyticsNotice,
 		aggregateLimit:     aggLimit,
 		threadMessageLimit: threadLimit,
@@ -1659,6 +1671,7 @@ func (m Model) handleTextStatsLoaded(msg textStatsLoadedMsg) (tea.Model, tea.Cmd
 
 // handleWindowSize processes window resize events.
 func (m Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
+	settingsFocusVisible := m.settingsFocusVisible()
 	m.transitionBuffer = "" // Clear frozen view on resize to re-render with new dimensions
 	m.width = msg.Width
 	m.height = msg.Height
@@ -1668,6 +1681,9 @@ func (m Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.height < 0 {
 		m.height = 0
+	}
+	if settingsFocusVisible && !m.settingsFocusVisible() {
+		m.revealSettingsFocus()
 	}
 	m.pageSize = max(m.height-headerFooterLines, 1)
 	if m.messageDetail != nil {
@@ -1780,6 +1796,7 @@ func (m Model) handleAccountsLoaded(msg accountsLoadedMsg) (tea.Model, tea.Cmd) 
 		}
 		return m, nil
 	}
+	m.accountsLoaded = true
 	if msg.catalogUnavailable {
 		keepKnownVirtualAccounts(msg.accounts, m.accounts)
 	}

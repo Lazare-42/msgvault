@@ -2,11 +2,28 @@ package query
 
 import (
 	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.kenn.io/msgvault/internal/identityindex"
 )
+
+// analyticalGroupPageSQL resolves optional labels after grouping and pagination.
+func analyticalGroupPageSQL(pageLabel, order, extra string) string {
+	if pageLabel != "" {
+		return `), page AS MATERIALIZED (
+	SELECT * FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?
+)
+SELECT group_key, ` + pageLabel + ` AS group_label, group_count, estimated_bytes, latest_at, total_count` + extra + `
+FROM page ORDER BY ` + order
+	}
+	return `)
+SELECT group_key, group_label, group_count, estimated_bytes, latest_at, total_count` + extra + `
+FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+}
 
 const maxExploreFilesLimit = 100
 
@@ -23,9 +40,20 @@ func (e *DuckDBEngine) ExploreGroups(ctx context.Context, request ExploreGroupRe
 	}
 	spec, err := exploreGroupExpressions(request.Dimension,
 		e.parquetPath(identityindex.DatasetPeople), e.parquetPath(identityindex.DatasetActivity),
-		e.parquetPath(datasetParticipantClusters))
+		e.parquetPath(datasetParticipantClusters), e.parquetPath(datasetParticipants), e.parquetPath(datasetPersonDisplayNames))
 	if err != nil {
 		return nil, err
+	}
+	timeGroup := request.Dimension == timeGranularityDay || request.Dimension == "year" || request.Dimension == timeGranularityMonth
+	var zone string
+	if timeGroup || request.GroupKey != "" {
+		if _, zone, err = validateRelationshipTimezone(request.Timezone); err != nil {
+			return nil, err
+		}
+	}
+	var groupArgs []any
+	if timeGroup {
+		groupArgs = append(groupArgs, zone)
 	}
 	order, err := exploreGroupOrder(request.Sort)
 	if err != nil {
@@ -45,6 +73,7 @@ func (e *DuckDBEngine) ExploreGroups(ctx context.Context, request ExploreGroupRe
 		return nil, err
 	}
 	conditions, args := buildExploreConditions(explore)
+	args = append(args, groupArgs...)
 	limit := request.Page.Limit
 	if limit == 0 {
 		limit = defaultExploreLimit
@@ -56,26 +85,40 @@ func (e *DuckDBEngine) ExploreGroups(ctx context.Context, request ExploreGroupRe
 		keyFilter = " WHERE group_key = ?"
 	}
 	buildPopulation := buildExploreFilteredClassifiedCTE
-	if spec.noLists && !exploreConditionsTouchParticipantLists(explore) {
+	if spec.noLists {
 		// The multiply-referenced filtered CTE otherwise materializes the
 		// wide view's participant lists before projection can discard them.
 		buildPopulation = buildExploreNarrowFilteredClassifiedCTE
 	}
 	queryText := buildPopulation(conditions, "NULL::BIGINT") +
 		exploreLogicalEntriesCTE(!spec.noLists)
+	byteExpression := "estimated_bytes"
+	if request.Dimension == timeGranularityDay {
+		byteExpression = exploreEstimatedBytesSQL
+	}
+	overview := request.GroupKey != "" && request.Dimension != timeGranularityDay
+	aggregateExtra, pageExtra := "", ", total_items"
+	if overview {
+		bucketFormat := "%Y-%m"
+		if request.Dimension == timeGranularityMonth {
+			bucketFormat = "%Y-%m-%d"
+		}
+		aggregateExtra = ", MIN(occurred_at) AS first_at, " + spec.groupBy + " AS selected_group_value, CAST(to_json(list_sort(list_transform(map_entries(histogram(strftime(timezone(?, timezone('UTC', occurred_at)), '" + bucketFormat + "'))), lambda e: struct_pack(bucket := e.key, count := e.value)))) AS VARCHAR) AS activity"
+		args = append(args, zone)
+		pageExtra += ", first_at, activity, (" + e.exploreGroupPeopleSQL(spec, request.Dimension) + ") AS people"
+	}
 	queryText += spec.cte + `
 ), grouped AS (
 	SELECT ` + spec.key + ` AS group_key, ` + spec.label + ` AS group_label,
 		COUNT(*)::BIGINT AS group_count,
-		COALESCE(SUM(estimated_bytes), 0)::BIGINT AS estimated_bytes,
-		MAX(occurred_at) AS latest_at
+		COALESCE(SUM(` + byteExpression + `), 0)::BIGINT AS estimated_bytes,
+		MAX(occurred_at) AS latest_at, SUM(COUNT(*)) OVER ()::BIGINT AS total_items` + aggregateExtra + `
 	FROM ` + spec.source + spec.fromSuffix + spec.whereSuffix + `
 	GROUP BY ` + spec.groupBy + `
 ), counted AS (
 	SELECT *, COUNT(*) OVER () AS total_count FROM grouped` + keyFilter + `
-)
-SELECT group_key, group_label, group_count, estimated_bytes, latest_at, total_count
-FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+`
+	queryText += analyticalGroupPageSQL(spec.pageLabel, order, pageExtra)
 	if request.GroupKey != "" {
 		args = append(args, request.GroupKey)
 	}
@@ -90,15 +133,68 @@ FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?`
 	}
 	for rows.Next() {
 		var row ExploreGroupRow
-		if err := rows.Scan(&row.Key, &row.Label, &row.Count, &row.EstimatedBytes, &row.LatestAt, &response.TotalCount); err != nil {
+		var totalItems int64
+		var firstAt time.Time
+		var activityJSON, peopleJSON string
+		destinations := []any{&row.Key, &row.Label, &row.Count, &row.EstimatedBytes, &row.LatestAt, &response.TotalCount, &totalItems}
+		if overview {
+			destinations = append(destinations, &firstAt, &activityJSON, &peopleJSON)
+		}
+		if err := rows.Scan(destinations...); err != nil {
 			return nil, fmt.Errorf("scan analytical group: %w", err)
+		}
+		if request.Dimension == "year" || request.Dimension == timeGranularityMonth {
+			row.TotalItems = totalItems
+		}
+		if overview {
+			detail := &ExploreGroupOverview{FirstAt: firstAt, Activity: []ExploreGroupActivity{}, CoParticipants: []ExploreGroupCoParticipant{}}
+			if err := json.Unmarshal([]byte(activityJSON), &detail.Activity, jsontext.AllowInvalidUTF8(true)); err != nil {
+				return nil, fmt.Errorf("decode group activity: %w", err)
+			}
+			if err := json.Unmarshal([]byte(peopleJSON), &detail.CoParticipants, jsontext.AllowInvalidUTF8(true)); err != nil {
+				return nil, fmt.Errorf("decode group people: %w", err)
+			}
+			response.Overview = detail
 		}
 		response.Rows = append(response.Rows, row)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate analytical groups: %w", err)
 	}
-	return response, nil
+	return withDayHeatLevels(request, response), nil
+}
+
+func (e *DuckDBEngine) exploreGroupPeopleSQL(spec groupExpressions, dimension string) string {
+	restriction := "le.entry_key IN (SELECT entry_key FROM selected_entries) AND NOT a.is_owner"
+	if dimension == "participant" {
+		restriction += " AND CAST(a.canonical_id AS VARCHAR) <> group_key"
+	}
+	label := "COALESCE(" + sqlIndexedPersonGroupLabelExpr(e.parquetPath(identityindex.DatasetPeople)) + ", " + sqlPersonGroupLabelExpr(e.parquetPath(datasetParticipants), e.parquetPath(datasetParticipantClusters), e.parquetPath(datasetPersonDisplayNames)) + ")"
+	return `WITH selected_entries AS (
+ SELECT entry_key FROM ` + spec.source + spec.fromSuffix + ` WHERE ` + spec.groupBy + ` = selected_group_value
+ ), edges AS (` + sqlActivityEntryEdges("a.canonical_id AS person_id", "a.is_direct AND "+restriction, "(a.is_direct OR a.is_conversation_member) AND "+restriction) + `
+ ), top_people AS (
+ SELECT person_id, CAST(person_id AS VARCHAR) AS group_key, COUNT(DISTINCT entry_key)::BIGINT AS count
+ FROM edges GROUP BY person_id ORDER BY count DESC, person_id LIMIT 3
+ ), labeled AS (
+ SELECT group_key AS key, ` + label + ` AS label, count FROM top_people
+ ) SELECT CAST(to_json(COALESCE(list(struct_pack(key := key, label := label, count := count)), [])) AS VARCHAR) FROM labeled`
+}
+
+// withDayHeatLevels assigns shared relationship heat levels only when the page
+// contains every day row; keyed lookups and other dimensions carry no level.
+func withDayHeatLevels(request ExploreGroupRequest, response *ExploreGroupResponse) *ExploreGroupResponse {
+	if request.Dimension != timeGranularityDay || request.GroupKey != "" || int64(len(response.Rows)) != response.TotalCount {
+		return response
+	}
+	signals := make([]identityindex.DailyTemperatureSignals, len(response.Rows))
+	for i, row := range response.Rows {
+		signals[i].Total = row.Count
+	}
+	for i, level := range identityindex.AssignRelationshipHeatLevels(signals) {
+		response.Rows[i].Level = level
+	}
+	return response
 }
 
 // groupExpressions describes how one grouping dimension renders into the
@@ -111,6 +207,8 @@ type groupExpressions struct {
 	key     string
 	label   string
 	groupBy string
+	// pageLabel is resolved after pagination; empty uses group_label.
+	pageLabel string
 	// cte is an extra CTE chunk interposed between the population CTEs and
 	// the grouped aggregate ("participant" canonicalization; empty
 	// otherwise). ExploreGroups chunks open by closing the still-open
@@ -126,8 +224,8 @@ type groupExpressions struct {
 	whereSuffix string
 	// noLists selects the logical_entries variant without participant list
 	// columns; dimensions that resolve participants/domains through
-	// relationship_activity edge joins set it. ExploreGroups also uses the
-	// narrow scalar input when its filters do not require participant lists.
+	// relationship_activity edge joins set it. ExploreGroups then also uses
+	// the narrow scalar input.
 	noLists bool
 }
 
@@ -169,21 +267,23 @@ func sqlActivityEntryEdges(selectExpr, messagePredicate, conversationPredicate s
 `
 }
 
-// sqlIndexedPersonGroupLabelExpr renders a canonical "People" group row's
-// label from the relationship_people dataset, which bakes the shared cluster
-// label policy (see person_label.go and the identity index builder) at build
-// time. Evaluating the policy's correlated best-name scan per group row
-// exceeds the interactive memory budget on production archives — as does ANY
-// second correlated participants subquery here — so grouping reads the
-// precomputed label with only a constant fallback. That fallback is
-// unreachable in practice: group keys come from the same activity edge
-// population (direct edges for message entries, direct-or-roster for chat
-// entries) the dataset's people_totals aggregates, so every key has a
-// directory row.
+// sqlIndexedPersonGroupLabelExpr reads the shared label from the sent-activity
+// directory. Draft-only Explore groups have no directory row, so their
+// canonical participant label is resolved after pagination.
 func sqlIndexedPersonGroupLabelExpr(peopleGlob string) string {
-	return "COALESCE(" +
-		"(SELECT dp.display_label FROM read_parquet('" + peopleGlob + "') dp WHERE dp.canonical_id = person_id), " +
-		"'Unknown person #' || CAST(person_id AS VARCHAR))"
+	return "(SELECT dp.display_label FROM read_parquet('" + peopleGlob + "') dp WHERE dp.canonical_id = person_id)"
+}
+
+// sqlPersonGroupLabelExpr applies the shared cluster-name policy only to
+// paged groups missing from the sent-activity directory. Membership equality
+// lets DuckDB join members without pairing every participant with every group.
+func sqlPersonGroupLabelExpr(participantsGlob, clustersGlob, personDisplayNamesGlob string) string {
+	memberFilter := func(id string) string {
+		return "COALESCE((SELECT c.canonical_id FROM read_parquet('" + clustersGlob + "') c WHERE c.participant_id = " + id + "), " + id + ") = CAST(group_key AS BIGINT)"
+	}
+	name := sqlClusterBestNameExpr(memberFilter("pbn.id"))
+	override := sqlPersonNameOverrideExpr(personDisplayNamesGlob, memberFilter("pnv.participant_id"))
+	return "(SELECT COALESCE(" + override + ", " + name + ", " + sqlPersonIdentifierFallbackExpr("pb") + ") FROM read_parquet('" + participantsGlob + "') pb WHERE pb.id = CAST(group_key AS BIGINT))"
 }
 
 // sqlMessageTypeGroupExpr renders the message-type group key/label: NULL or
@@ -203,10 +303,15 @@ func sqlMessageTypeGroupExpr() string {
 // dimension groups by canonical identity-cluster IDs. Membership is deduplicated
 // before aggregation so entries listing several aliases of one person count once.
 func exploreGroupExpressions(
-	dimension, peopleGlob, activityGlob, clustersGlob string,
+	dimension, peopleGlob, activityGlob, clustersGlob, participantsGlob, personDisplayNamesGlob string,
 ) (groupExpressions, error) {
 	simple := func(key string) groupExpressions {
 		return groupExpressions{key: key, label: key, groupBy: key, source: "logical_entries"}
+	}
+	timeGroup := func(format string) groupExpressions {
+		expr := "strftime(local_at, '" + format + "')"
+		return groupExpressions{key: expr, label: expr, groupBy: expr, source: "time_bucketed",
+			cte: `), time_bucketed AS (SELECT *, timezone(?, timezone('UTC', occurred_at)) AS local_at FROM logical_entries`}
 	}
 	switch dimension {
 	case "source":
@@ -219,12 +324,13 @@ func exploreGroupExpressions(
 		// participant_ids column this replaces. Chat entries also include
 		// the conversation roster and speakers in the filtered context.
 		return groupExpressions{
-			key:     "CAST(person_id AS VARCHAR)",
-			label:   sqlIndexedPersonGroupLabelExpr(peopleGlob),
-			groupBy: "person_id",
-			noLists: true,
-			cte:     exploreGroupMembershipCTE(dimension, activityGlob, clustersGlob),
-			source:  "group_entries",
+			key:       "CAST(person_id AS VARCHAR)",
+			label:     sqlIndexedPersonGroupLabelExpr(peopleGlob),
+			pageLabel: "COALESCE(group_label, " + sqlPersonGroupLabelExpr(participantsGlob, clustersGlob, personDisplayNamesGlob) + ", 'Unknown person #' || group_key)",
+			groupBy:   "person_id",
+			noLists:   true,
+			cte:       exploreGroupMembershipCTE(dimension, activityGlob, clustersGlob),
+			source:    "group_entries",
 		}, nil
 	case "domain":
 		// All edges for message entries: the aggregated participant_domains
@@ -246,9 +352,15 @@ func exploreGroupExpressions(
 	case "kind":
 		return simple("entry_kind"), nil
 	case "year":
-		return simple("strftime(occurred_at, '%Y')"), nil
+		return timeGroup("%Y"), nil
 	case timeGranularityMonth:
-		return simple("strftime(occurred_at, '%Y-%m')"), nil
+		return timeGroup("%Y-%m"), nil
+	case timeGranularityDay:
+		return groupExpressions{
+			key: "local_day", label: "local_day", groupBy: "local_day", source: "day_bucketed", noLists: true,
+			cte: `), day_bucketed AS (
+	SELECT *, strftime(timezone(?, timezone('UTC', occurred_at)), '%Y-%m-%d') AS local_day FROM classified`,
+		}, nil
 	default:
 		return groupExpressions{}, fmt.Errorf("%w: unknown group dimension %q", ErrInvalidExploreRequest, dimension)
 	}
@@ -262,11 +374,9 @@ func exploreGroupExpressions(
 func exploreGroupMembershipCTE(dimension, activityGlob, clustersGlob string) string {
 	domainCTE := ""
 	directJoin, resultJoin := "", ""
-	rosterJoin := `
-		LEFT JOIN read_parquet('` + quoteIdentitySQLPath(clustersGlob) + `') c
-			ON c.participant_id = p.id`
+	rosterJoin := ""
 	directValue := "a.canonical_id"
-	rosterValue := "COALESCE(c.canonical_id, p.id)"
+	rosterValue := "p.canonical_id"
 	rosterFilter := "le.entry_kind = 'conversation'"
 	resultValue := "gm.group_value AS person_id"
 	if dimension == "domain" {
@@ -278,7 +388,7 @@ func exploreGroupMembershipCTE(dimension, activityGlob, clustersGlob string) str
 	FROM participants WHERE domain <> '' GROUP BY lower(domain)`
 		directValue, rosterValue = "d.domain_id", "d.domain_id"
 		directJoin = " JOIN group_domains d ON d.domain = a.participant_domain"
-		rosterJoin = "\n\t\tJOIN group_domains d ON d.domain = lower(p.domain)"
+		rosterJoin = "\n\t\tJOIN group_domains d ON d.domain = p.participant_domain"
 		rosterFilter = "true"
 		resultJoin = " JOIN group_domains d ON d.domain_id = gm.group_value"
 		resultValue = "d.domain AS group_value"
@@ -299,13 +409,13 @@ func exploreGroupMembershipCTE(dimension, activityGlob, clustersGlob string) str
 			` + rosterValue + `
 		FROM logical_entries le
 		JOIN conversation_participants cp ON cp.conversation_id = le.conversation_id
-		JOIN participants p ON p.id = cp.participant_id` + rosterJoin + `
+		JOIN (` + identityindex.CanonicalParticipantsSQL("participants", "read_parquet('"+quoteIdentitySQLPath(clustersGlob)+"')") + `) p ON p.participant_id = cp.participant_id` + rosterJoin + `
 		WHERE ` + rosterFilter + `
 	) members
 	WHERE group_value IS NOT NULL
 	GROUP BY entry_id, group_value
 ), group_entries AS (
-	SELECT ` + resultValue + `, le.occurred_at, le.estimated_bytes
+	SELECT ` + resultValue + `, le.entry_key, le.occurred_at, le.estimated_bytes
 	FROM logical_entries le
 	JOIN group_members gm ON gm.entry_id =
 		CASE WHEN le.entry_kind = 'conversation'
@@ -326,6 +436,13 @@ func exploreGroupMembershipCTE(dimension, activityGlob, clustersGlob string) str
 func (e *DuckDBEngine) expandParticipantFilterClusters(ctx context.Context, explore ExploreRequest) (ExploreRequest, error) {
 	if err := validateIdentityPredicate(explore.Context); err != nil {
 		return explore, err
+	}
+	// Every public Explore/Files consumer prepares its predicate here. SentOnly and
+	// PersonInteractionsOnly requests need current relationship query sets even without a participant filter.
+	if explore.SentOnly || explore.PersonInteractionsOnly {
+		if err := e.relationshipQuerySetsError(); err != nil {
+			return explore, err
+		}
 	}
 	expanded, err := e.expandParticipantClusterMembers(ctx, explore.Context.ParticipantIDs)
 	if err != nil {

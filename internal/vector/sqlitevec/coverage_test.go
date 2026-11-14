@@ -3,7 +3,6 @@
 package sqlitevec
 
 import (
-	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -37,9 +36,10 @@ import (
 //
 // and verifies the load-bearing invariant live == embedded + blank + missing.
 func TestCoverageSplit_EmbeddedBlankMissing(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// A sqlitevec test must use a SQLite main store regardless of
 	// MSGVAULT_TEST_DB: the backend's Open-time probes run SQLite-dialect SQL
@@ -137,9 +137,10 @@ func TestCoverageSplit_EmbeddedBlankMissing(t *testing.T) {
 // With the live-intersected count the dead message drops out of embedded,
 // so embedded <= stamped <= live, blank >= 0, and the invariant holds.
 func TestCoverageSplit_NonLiveEmbeddedHoldsInvariant(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// See TestCoverageSplit_EmbeddedBlankMissing: a sqlitevec test must use a
 	// SQLite main store regardless of MSGVAULT_TEST_DB.
@@ -195,7 +196,8 @@ func TestCoverageSplit_NonLiveEmbeddedHoldsInvariant(t *testing.T) {
 
 	// Soft-delete one EMBEDDED message (deleted_from_source_at) — its
 	// embedding row stays behind, but it is no longer a live message.
-	_, err = st.DB().Exec(
+	_, err = st.DB().ExecContext(
+		t.Context(),
 		st.Rebind("UPDATE messages SET deleted_from_source_at = CURRENT_TIMESTAMP WHERE id = ?"),
 		embeddedA)
 	require.NoError(err, "soft-delete embeddedA")
@@ -220,9 +222,10 @@ func TestCoverageSplit_NonLiveEmbeddedHoldsInvariant(t *testing.T) {
 }
 
 func TestCoverageSplit_ScopedEmbeddedHoldsInvariant(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	st := testutil.NewSQLiteTestStore(t)
 	b, err := Open(ctx, Options{
@@ -280,9 +283,10 @@ func TestCoverageSplit_ScopedEmbeddedHoldsInvariant(t *testing.T) {
 }
 
 func TestFilteredCoverageRequiresLiveGenerationStampAndVector(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewSQLiteTestStore(t)
 	b, err := Open(ctx, Options{
 		Path: filepath.Join(t.TempDir(), "vectors.db"), Dimension: 8, MainDB: st.DB(),
@@ -320,9 +324,9 @@ func TestFilteredCoverageRequiresLiveGenerationStampAndVector(t *testing.T) {
 	require.NoError(b.Upsert(ctx, gen, chunks))
 	require.NoError(st.SetEmbedGen(ctx, []int64{valid, dedupLoser, sourceDeleted, noVector}, int64(gen)))
 	require.NoError(st.SetEmbedGen(ctx, []int64{wrongGeneration}, int64(gen)+99))
-	_, err = st.DB().Exec(`UPDATE messages SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`, dedupLoser)
+	_, err = st.DB().ExecContext(t.Context(), `UPDATE messages SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`, dedupLoser)
 	require.NoError(err)
-	_, err = st.DB().Exec(`UPDATE messages SET deleted_from_source_at = CURRENT_TIMESTAMP WHERE id = ?`, sourceDeleted)
+	_, err = st.DB().ExecContext(t.Context(), `UPDATE messages SET deleted_from_source_at = CURRENT_TIMESTAMP WHERE id = ?`, sourceDeleted)
 	require.NoError(err)
 
 	count, err := b.EmbeddedMessageCountForIDs(ctx, gen,
@@ -340,9 +344,10 @@ func TestFilteredCoverageRequiresLiveGenerationStampAndVector(t *testing.T) {
 // ignores out-of-scope messages entirely — a generation covering one account
 // activates even while another account's messages are unstamped.
 func TestCoverageSplit_SourceScopedEmbeddedHoldsInvariant(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	st := testutil.NewSQLiteTestStore(t)
 	srcA, err := st.GetOrCreateSource("gmail", "a@example.com")
@@ -410,9 +415,10 @@ func TestCoverageSplit_SourceScopedEmbeddedHoldsInvariant(t *testing.T) {
 // would swap in an empty index and retire the serving generation. force
 // remains the operator override.
 func TestActivateGeneration_RefusesEmptySourceScope(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	st := testutil.NewSQLiteTestStore(t)
 	srcA, err := st.GetOrCreateSource("gmail", "a@example.com")
@@ -461,9 +467,10 @@ func TestActivateGeneration_RefusesEmptySourceScope(t *testing.T) {
 }
 
 func TestSnapshotCoverageCountsSuppliedIDsWithinBatchLimit(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	b, err := Open(ctx, Options{Path: filepath.Join(t.TempDir(), "vectors.db"), Dimension: 4})
 	require.NoError(err)
 	t.Cleanup(func() { _ = b.Close() })

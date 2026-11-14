@@ -2,7 +2,6 @@ package importer
 
 import (
 	"bytes"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"log/slog"
@@ -16,6 +15,7 @@ import (
 )
 
 func TestIngestRawMessage_DeclaredUTF8HTML(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -35,8 +35,8 @@ func TestIngestRawMessage_DeclaredUTF8HTML(t *testing.T) {
 		"Subject: Meter reading\r\nMessage-ID: <reading@example.org>\r\nMIME-Version: 1.0\r\n" +
 		"Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n" + encoded.String())
 	digest := sha256.Sum256(raw)
-	err = IngestRawMessage(context.Background(), st, source.ID, "archive@example.org", "",
-		nil, "reading-1", hex.EncodeToString(digest[:]), raw, time.Time{}, slog.Default())
+	err = IngestRawMessage(t.Context(), st, source.ID, "archive@example.org", "",
+		nil, "reading-1", hex.EncodeToString(digest[:]), raw, time.Time{}, slog.Default(), nil)
 	require.NoError(err)
 
 	// The term occurs only in the body, so neither headers nor addresses can match.

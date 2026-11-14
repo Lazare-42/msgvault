@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -11,6 +10,7 @@ import (
 )
 
 func TestAggregations(t *testing.T) {
+	t.Parallel()
 	type testCase struct {
 		name    string
 		aggName string
@@ -70,7 +70,69 @@ func TestAggregations(t *testing.T) {
 	}
 }
 
+func TestAggregateByTime_AttachmentPlan(t *testing.T) {
+	t.Parallel()
+	t.Run("DateFilter", func(t *testing.T) {
+		env := newTestEnv(t)
+		opts := DefaultAggregateOptions()
+		opts.After = new(time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC))
+		opts.Before = new(time.Date(2024, 1, 17, 0, 0, 0, 0, time.UTC))
+
+		plan := aggregatePlan(t, env, opts)
+		assert.Contains(t, plan, "idx_attachments_message", plan)
+		assert.NotContains(t, plan, "SCAN attachments", plan)
+	})
+
+	t.Run("Unfiltered", func(t *testing.T) {
+		env := newTestEnv(t)
+		plan := aggregatePlan(t, env, DefaultAggregateOptions())
+		assert.Contains(t, plan, "SCAN attachments", plan)
+	})
+}
+
+func aggregatePlan(t *testing.T, env *testEnv, opts AggregateOptions) string {
+	t.Helper()
+	conditions, args := optsToFilterConditions(env.Engine.dialect, opts, "m.")
+	conditions = append(conditions, emailOnlyFilterM)
+	dim, err := aggDimensionForView(env.Engine.dialect, ViewTime, opts.TimeGranularity)
+	require.NoError(t, err)
+	sort, err := sortClause(opts)
+	require.NoError(t, err)
+	sqlText := buildAggregateSQL(dim, "", conditions, sort)
+	return dbtest.ExplainQueryPlan(t, env.DB, sqlText, append(args, 100)...)
+}
+
+func TestAggregateByLabel_AttachmentFields(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	// Message 2 has two attachments and both INBOX and IMPORTANT labels.
+	for _, filtered := range []bool{false, true} {
+		opts := DefaultAggregateOptions()
+		if filtered {
+			opts.After = new(time.Date(2024, 1, 16, 0, 0, 0, 0, time.UTC))
+			opts.Before = new(time.Date(2024, 1, 17, 0, 0, 0, 0, time.UTC))
+		}
+		rows, err := env.Engine.Aggregate(env.Ctx, ViewLabels, opts)
+		require.NoError(t, err)
+		want := map[string][2]int64{
+			"INBOX":     {35000, 3},
+			"IMPORTANT": {15000, 2},
+			"Work":      {20000, 1},
+		}
+		if filtered {
+			want = map[string][2]int64{"INBOX": {15000, 2}, "IMPORTANT": {15000, 2}}
+		}
+		got := make(map[string][2]int64, len(rows))
+		for _, row := range rows {
+			got[row.Key] = [2]int64{row.AttachmentSize, row.AttachmentCount}
+		}
+		assert.Equal(t, want, got, "filtered=%t", filtered)
+	}
+}
+
 func TestAggregateDefaultExcludesCalendarEvents(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 	calendarSenderID := env.AddParticipant(dbtest.ParticipantOpts{
 		Email:       new("calendar@example.com"),
@@ -97,6 +159,7 @@ func TestAggregateDefaultExcludesCalendarEvents(t *testing.T) {
 }
 
 func TestSubAggregateDefaultExcludesCalendarEvents(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 	aliceID := env.MustLookupParticipant("alice@example.com")
 	calendarRecipientID := env.AddParticipant(dbtest.ParticipantOpts{
@@ -126,6 +189,7 @@ func TestSubAggregateDefaultExcludesCalendarEvents(t *testing.T) {
 }
 
 func TestAggregateExplicitEmailMessageTypeIncludesLegacyRows(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 	legacySenderID := env.AddParticipant(dbtest.ParticipantOpts{
 		Email:       new("legacy@example.com"),
@@ -139,7 +203,7 @@ func TestAggregateExplicitEmailMessageTypeIncludesLegacyRows(t *testing.T) {
 		FromID:  legacySenderID,
 		ToIDs:   []int64{bobID},
 	})
-	_, err := env.DB.Exec(`UPDATE messages SET message_type = '' WHERE id = ?`, legacyMessageID)
+	_, err := env.DB.ExecContext(t.Context(), `UPDATE messages SET message_type = '' WHERE id = ?`, legacyMessageID)
 	require.NoError(t, err, "clear message_type")
 
 	opts := DefaultAggregateOptions()
@@ -156,6 +220,7 @@ func TestAggregateExplicitEmailMessageTypeIncludesLegacyRows(t *testing.T) {
 }
 
 func TestAggregateBySenderName_FallbackToEmail(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	noNameID := env.AddParticipant(dbtest.ParticipantOpts{Email: new("noname@test.com"), DisplayName: nil, Domain: "test.com"})
@@ -174,6 +239,7 @@ func TestAggregateBySenderName_FallbackToEmail(t *testing.T) {
 // both empty/NULL but phone_number is set. They must surface under the phone
 // number, not vanish from the SenderNames aggregate.
 func TestAggregateBySenderName_FallbackToPhone(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	phoneOnlyID := env.AddParticipant(dbtest.ParticipantOpts{
@@ -194,6 +260,7 @@ func TestAggregateBySenderName_FallbackToPhone(t *testing.T) {
 
 // TestAggregateByRecipientName_FallbackToPhone is the recipient-side analog.
 func TestAggregateByRecipientName_FallbackToPhone(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	phoneOnlyID := env.AddParticipant(dbtest.ParticipantOpts{
@@ -216,6 +283,7 @@ func TestAggregateByRecipientName_FallbackToPhone(t *testing.T) {
 }
 
 func TestAggregateBySenderName_EmptyStringFallback(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	env := newTestEnv(t)
 
@@ -250,6 +318,7 @@ func TestAggregateBySenderName_EmptyStringFallback(t *testing.T) {
 // sends under many author names over time; crediting all of its traffic to
 // one arbitrary stored name misrepresents the data (see break-test F4).
 func TestAggregateBySenderName_PerMessageNames(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	env := newTestEnv(t)
 
@@ -284,6 +353,7 @@ func TestAggregateBySenderName_PerMessageNames(t *testing.T) {
 // TestAggregateByRecipientName_PerMessageNames is the recipient-side analog of
 // TestAggregateBySenderName_PerMessageNames.
 func TestAggregateByRecipientName_PerMessageNames(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	env := newTestEnv(t)
 
@@ -314,6 +384,7 @@ func TestAggregateByRecipientName_PerMessageNames(t *testing.T) {
 }
 
 func TestAggregateByTime(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	opts := DefaultAggregateOptions()
@@ -333,10 +404,11 @@ func TestAggregateByTime(t *testing.T) {
 // being treated like a label join, which would multiply its counts or apply a
 // substring drill predicate.
 func TestSQLiteEngine_ListsAggregateAndDrill(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	env := newTestEnv(t)
-	_, err := env.DB.Exec(`UPDATE messages SET list_id = CASE id
+	_, err := env.DB.ExecContext(t.Context(), `UPDATE messages SET list_id = CASE id
 		WHEN 1 THEN '<dev_1@example.test>'
 		WHEN 2 THEN '<DEV_1@EXAMPLE.TEST>'
 		WHEN 3 THEN '<devA1@example.test>'
@@ -371,10 +443,11 @@ func TestSQLiteEngine_ListsAggregateAndDrill(t *testing.T) {
 // used for List-Id grouping or exact drill predicates. SQLite LOWER is ASCII
 // only, so the two spellings must be folded by the registered Unicode helper.
 func TestSQLiteEngine_ListsUnicodeCaseFold(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	env := newTestEnv(t)
-	_, err := env.DB.Exec(`UPDATE messages SET list_id = CASE id
+	_, err := env.DB.ExecContext(t.Context(), `UPDATE messages SET list_id = CASE id
 		WHEN 1 THEN '<ÉCOLE@example.test>'
 		WHEN 2 THEN '<école@example.test>'
 		ELSE NULL END`)
@@ -393,6 +466,7 @@ func TestSQLiteEngine_ListsUnicodeCaseFold(t *testing.T) {
 }
 
 func TestAggregateWithDateFilter(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	opts := DefaultAggregateOptions()
@@ -409,6 +483,7 @@ func TestAggregateWithDateFilter(t *testing.T) {
 }
 
 func TestSortingOptions(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	t.Run("SortBySizeDesc", func(t *testing.T) {
@@ -436,6 +511,7 @@ func TestSortingOptions(t *testing.T) {
 }
 
 func TestWithAttachmentsOnlyAggregate(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	opts := DefaultAggregateOptions()
@@ -462,6 +538,7 @@ func TestWithAttachmentsOnlyAggregate(t *testing.T) {
 // =============================================================================
 
 func TestSubAggregates(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		filter MessageFilter
@@ -517,6 +594,7 @@ func TestSubAggregates(t *testing.T) {
 }
 
 func TestSQLiteEngine_SubAggregateSourceScopePrecedence(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 	sourceOne := int64(1)
 	sourceTwo := env.AddSource(dbtest.SourceOpts{Identifier: "scope@example.com"})
@@ -589,6 +667,7 @@ func TestSQLiteEngine_SubAggregateSourceScopePrecedence(t *testing.T) {
 }
 
 func TestSubAggregate_MatchEmptySenderName(t *testing.T) {
+	t.Parallel()
 	env := newTestEnvWithEmptyBuckets(t)
 
 	filter := MessageFilter{EmptyValueTargets: map[ViewType]bool{ViewSenderNames: true}}
@@ -603,6 +682,7 @@ func TestSubAggregate_MatchEmptySenderName(t *testing.T) {
 }
 
 func TestSubAggregateIncludesDeletedMessages(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	filter := MessageFilter{Sender: "alice@example.com"}
@@ -627,6 +707,7 @@ func TestSubAggregateIncludesDeletedMessages(t *testing.T) {
 }
 
 func TestHideDeletedFromSourceAggregate(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	env := newTestEnv(t)
@@ -676,6 +757,7 @@ func TestHideDeletedFromSourceAggregate(t *testing.T) {
 }
 
 func TestSubAggregateByTime(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	env := newTestEnv(t)
 
@@ -701,6 +783,7 @@ func TestSubAggregateByTime(t *testing.T) {
 // =============================================================================
 
 func TestAggregateByRecipientName_FallbackToEmail(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	// Resolve participant IDs dynamically to avoid coupling to seed order.
@@ -716,6 +799,7 @@ func TestAggregateByRecipientName_FallbackToEmail(t *testing.T) {
 }
 
 func TestAggregateByRecipientName_EmptyStringFallback(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	// Resolve participant IDs dynamically to avoid coupling to seed order.
@@ -742,6 +826,7 @@ func TestAggregateByRecipientName_EmptyStringFallback(t *testing.T) {
 // TestSQLiteEngine_Aggregate_InvalidViewType verifies that invalid ViewType values
 // return a clear error from the Aggregate API.
 func TestSQLiteEngine_Aggregate_InvalidViewType(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	tests := []struct {
@@ -765,6 +850,8 @@ func TestSQLiteEngine_Aggregate_InvalidViewType(t *testing.T) {
 // (e.g., two labels with equal counts), results are sorted deterministically by key ASC.
 // This prevents flaky tests and non-deterministic UI ordering.
 func TestAggregateDeterministicOrderOnTies(t *testing.T) {
+	t.Parallel()
+	dbtest.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
 
 	// Create minimal test data using helpers, explicitly threading IDs to avoid
@@ -794,7 +881,7 @@ func TestAggregateDeterministicOrderOnTies(t *testing.T) {
 	env := &testEnv{
 		TestDB: tdb,
 		Engine: NewSQLiteEngine(tdb.DB),
-		Ctx:    context.Background(),
+		Ctx:    t.Context(),
 	}
 
 	// Default sort is by count DESC. Both labels have count=1, so they should
@@ -813,6 +900,7 @@ func TestAggregateDeterministicOrderOnTies(t *testing.T) {
 // TestAggregateByLabel_WithSearchQuery verifies that label: search in the
 // Labels aggregate view only shows matching labels (case-insensitive substring).
 func TestAggregateByLabel_WithSearchQuery(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	tests := []struct {
@@ -860,6 +948,7 @@ func TestAggregateByLabel_WithSearchQuery(t *testing.T) {
 }
 
 func TestAggregateLabelSearchStatsMatchRepeatedFilterRows(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	env := newTestEnv(t)
@@ -880,6 +969,7 @@ func TestAggregateLabelSearchStatsMatchRepeatedFilterRows(t *testing.T) {
 }
 
 func TestAggregateLabelSearchStatsCorrelateFilterAndText(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 	needle := env.AddLabel(dbtest.LabelOpts{Name: "Needle"})
 	env.AddMessageLabel(1, needle)
@@ -904,6 +994,7 @@ func TestAggregateLabelSearchStatsCorrelateFilterAndText(t *testing.T) {
 // TestSubAggregate_WithSearchQuery verifies that SubAggregate applies
 // SearchQuery to filter results (not silently dropped).
 func TestSubAggregate_WithSearchQuery(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	// SubAggregate by Labels under sender alice, search "work"
@@ -920,6 +1011,7 @@ func TestSubAggregate_WithSearchQuery(t *testing.T) {
 }
 
 func TestAggregateSearchMatchesDisplayedKeysAndStats(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		query   string
@@ -991,6 +1083,7 @@ func TestAggregateSearchMatchesDisplayedKeysAndStats(t *testing.T) {
 // TestEscapeSQLiteLike verifies that wildcard characters are escaped
 // so they match literally in label search.
 func TestEscapeSQLiteLike(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		input, want string
 	}{
@@ -1011,6 +1104,7 @@ func TestEscapeSQLiteLike(t *testing.T) {
 // recipients. Message 1 has to:bob AND to:carol; a search matching both
 // must still count message 1 once.
 func TestAggregateBySender_RecipientFilterNoOvercount(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	opts := DefaultAggregateOptions()
@@ -1031,6 +1125,7 @@ func TestAggregateBySender_RecipientFilterNoOvercount(t *testing.T) {
 // TestSQLiteEngine_SubAggregate_InvalidViewType verifies that invalid ViewType values
 // return a clear error from the SubAggregate API.
 func TestSQLiteEngine_SubAggregate_InvalidViewType(t *testing.T) {
+	t.Parallel()
 	env := newTestEnv(t)
 
 	tests := []struct {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/slack"
+	"go.kenn.io/msgvault/internal/textutil"
 )
 
 func newBackfillSlackMediaCmd() *cobra.Command {
@@ -39,12 +40,12 @@ Examples:
 			if len(args) > 0 {
 				flagTeam = args[0]
 			}
-			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), state)
 			if err != nil {
 				return err
 			}
 			defer cleanup()
-			sources, err := resolveSlackSyncSources(s, flagTeam)
+			sources, err := resolveSlackSyncSources(cmd.Context(), s, flagTeam)
 			if err != nil {
 				return err
 			}
@@ -80,7 +81,7 @@ Examples:
 			return slackMediaBackfillExit(
 				ctx.Err(),
 				runErrors,
-				rebuildCacheAfterWrite(cfg.DatabaseDSN(), state),
+				rebuildCacheAfterWrite(ctx, cfg.DatabaseDSN(), state),
 			)
 		},
 	}
@@ -88,9 +89,16 @@ Examples:
 }
 
 func writeSlackMediaBackfillSummary(out io.Writer, teamID string, sum *slack.ImportSummary) {
-	_, _ = fmt.Fprintf(out, "%s done in %s: %d messages, %d downloaded, %d still pending, %d skipped by policy\n",
+	_, _ = fmt.Fprintf(out, "%s done in %s: %d messages, %d downloaded, %d still pending, %d skipped by policy",
 		teamID, sum.Duration.Round(time.Second), sum.MessagesProcessed, sum.AttachmentsDownloaded,
 		sum.AttachmentsPending, sum.AttachmentsSkipped)
+	if sum.Errors > 0 {
+		_, _ = fmt.Fprintf(out, ", %d errors", sum.Errors)
+	}
+	if sum.FirstMediaError != "" {
+		_, _ = fmt.Fprintf(out, ", first media error: %s", textutil.SanitizeTerminal(sum.FirstMediaError))
+	}
+	_, _ = fmt.Fprintln(out)
 }
 
 func slackMediaBackfillExit(ctxErr error, runErrors []error, cacheErr error) error {

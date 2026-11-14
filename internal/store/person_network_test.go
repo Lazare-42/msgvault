@@ -1,7 +1,6 @@
 package store_test
 
 import (
-	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -37,7 +36,7 @@ func TestGetPersonNetworkContextUsesCuratedEdgesOnly(t *testing.T) {
 	require.NoError(s.ReplaceMessageRecipients(messageID, "from", []int64{root.ParticipantIDs[0]}, []string{"Root"}))
 	require.NoError(s.ReplaceMessageRecipients(messageID, "to", []int64{messageOnlyParticipantID}, []string{"Message Only"}))
 
-	graph, err := s.GetPersonNetworkContext(context.Background(), root.ID, store.PersonNetworkOptions{Depth: 2})
+	graph, err := s.GetPersonNetworkContext(t.Context(), root.ID, store.PersonNetworkOptions{Depth: 2})
 	require.NoError(err)
 	assert.Len(graph.Nodes, 3)
 	assert.Len(graph.Edges, 2)
@@ -138,12 +137,30 @@ func TestGetPersonNetworkContextBoundsHighDegreeEmploymentLayerInPublicOrder(t *
 	})
 	t.Cleanup(restore)
 
-	people := make([]*store.Person, 0, 1000)
+	people := make([]int64, 0, 1000)
+	values := make([]string, 1000)
+	args := make([]any, 0, 2000)
 	for index := range 1000 {
-		person := createNetworkPerson(t, f.Store, fmt.Sprintf("Zed %04d", index))
-		people = append(people, person)
-		createNetworkEmployment(t, f.Store, person.ID, organization.ID, true)
+		values[index] = "(?, ?)"
+		args = append(args, fmt.Sprintf("network-zed-%04d", index), fmt.Sprintf("Zed %04d", index))
 	}
+	rows, err := f.Store.DB().QueryContext(t.Context(), f.Store.Rebind(
+		`INSERT INTO persons (vcard_uid, display_name) VALUES `+strings.Join(values, ",")+` RETURNING id`), args...)
+	require.NoError(err)
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id int64
+		require.NoError(rows.Scan(&id))
+		people = append(people, id)
+	}
+	require.NoError(rows.Err())
+	require.NoError(rows.Close())
+	require.Len(people, 1000)
+	slices.Sort(people)
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+		`INSERT INTO employments (person_id, organization_id, is_current, is_primary, source)
+		SELECT id, ?, true, true, 'user' FROM persons WHERE vcard_uid LIKE 'network-zed-%' ORDER BY id`), organization.ID)
+	require.NoError(err)
 	earlier := createNetworkPerson(t, f.Store, "AAA Beyond Employment Page")
 	createNetworkEmployment(t, f.Store, earlier.ID, organization.ID, true)
 
@@ -152,8 +169,8 @@ func TestGetPersonNetworkContextBoundsHighDegreeEmploymentLayerInPublicOrder(t *
 	assert.True(graph.Truncated)
 	require.Len(graph.Nodes, 250)
 	wantHopTwo := []string{fmt.Sprintf("person:%d", earlier.ID)}
-	for _, person := range people[:247] {
-		wantHopTwo = append(wantHopTwo, fmt.Sprintf("person:%d", person.ID))
+	for _, id := range people[:247] {
+		wantHopTwo = append(wantHopTwo, fmt.Sprintf("person:%d", id))
 	}
 	assert.Equal(wantHopTwo, networkNodeIDsAtHop(graph.Nodes, 2),
 		"the kept layer prefix follows label order, not employment ID order")
@@ -480,6 +497,6 @@ func networkRelationshipSlugs(edges []store.NetworkEdge) []string {
 func employmentEdgeID(t *testing.T, s *store.Store, personID int64) int64 {
 	t.Helper()
 	var id int64
-	require.NoError(t, s.DB().QueryRow(s.Rebind(`SELECT id FROM employments WHERE person_id = ?`), personID).Scan(&id))
+	require.NoError(t, s.DB().QueryRowContext(t.Context(), s.Rebind(`SELECT id FROM employments WHERE person_id = ?`), personID).Scan(&id))
 	return id
 }

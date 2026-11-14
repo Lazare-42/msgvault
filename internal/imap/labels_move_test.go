@@ -1,7 +1,6 @@
 package imap
 
 import (
-	"context"
 	"strings"
 	"testing"
 
@@ -23,20 +22,20 @@ func TestClientModifyMessageLabelsMoveToFolder(t *testing.T) {
 	})
 	require. // "Recruiting" is not pre-created — the move must create it on demand.
 			NoError(client.ModifyMessageLabels(
-			context.Background(),
+			t.Context(),
 			id,
 			[]string{"folder:Recruiting"},
 			nil,
 		))
 
 	// Gone from INBOX...
-	_, err := client.GetMessageRaw(context.Background(), id)
+	_, err := client.GetMessageRaw(t.Context(), id)
 	require.Error(err)
 
 	// ...and present in Recruiting.
 	movedIDs := listMailboxMessageIDs(t, client, "Recruiting")
 	require.Len(movedIDs, 1)
-	raw, err := client.GetMessageRaw(context.Background(), movedIDs[0])
+	raw, err := client.GetMessageRaw(t.Context(), movedIDs[0])
 	require.NoError(err)
 	assert.Contains(string(raw.Raw), "Subject: file me")
 }
@@ -51,11 +50,11 @@ func TestClientMoveMessageToFolderReportsConfirmedMove(t *testing.T) {
 		Body:    "body",
 	})
 
-	moved, err := client.MoveMessageToFolder(context.Background(), id, "INBOX", "Archive")
+	moved, err := client.MoveMessageToFolder(t.Context(), id, "INBOX", "Archive")
 	require.NoError(err)
 	assert.True(moved)
 
-	moved, err = client.MoveMessageToFolder(context.Background(), id, "INBOX", "Archive")
+	moved, err = client.MoveMessageToFolder(t.Context(), id, "INBOX", "Archive")
 	require.NoError(err)
 	assert.False(moved, "stale source UID must report a no-op")
 }
@@ -68,7 +67,7 @@ func TestClientMoveMessageToFolderRejectsSourceMismatch(t *testing.T) {
 		Body:    "body",
 	})
 
-	moved, err := client.MoveMessageToFolder(context.Background(), id, "INBOX", "Queue")
+	moved, err := client.MoveMessageToFolder(t.Context(), id, "INBOX", "Queue")
 	require.ErrorContains(t, err, "source mailbox mismatch")
 	assert.False(t, moved)
 	assert.Len(t, listMailboxMessageIDs(t, client, "Archive"), 1)
@@ -84,7 +83,7 @@ func TestClientModifyMessageLabelsMoveToExistingFolderWithFlag(t *testing.T) {
 	})
 	require. // Archive pre-exists (created by the harness); a flag rides along with the move.
 			NoError(client.ModifyMessageLabels(
-			context.Background(),
+			t.Context(),
 			id,
 			[]string{"STARRED", "folder:Archive"},
 			nil,
@@ -107,7 +106,7 @@ func TestClientModifyMessageLabelsMoveToExistingFolderWithPlainCreateNO(t *testi
 	client := newTestClient(t, addr)
 
 	require.NoError(t, client.ModifyMessageLabels(
-		context.Background(),
+		t.Context(),
 		"INBOX|1",
 		[]string{"folder:Queue"},
 		nil,
@@ -124,7 +123,7 @@ func TestClientModifyMessageLabelsPreservesRealCreateError(t *testing.T) {
 	client := newTestClient(t, addr)
 
 	err := client.ModifyMessageLabels(
-		context.Background(),
+		t.Context(),
 		"INBOX|1",
 		[]string{"folder:Queue"},
 		nil,
@@ -143,10 +142,10 @@ func TestClientModifyMessageLabelsRefreshesMailboxExistence(t *testing.T) {
 	testutil.AppendIMAPMessage(t, user, "INBOX")
 	client := newTestClient(t, addr)
 	require.NoError(client.ModifyMessageLabels(
-		context.Background(), "INBOX|1", []string{"folder:Queue"}, nil))
+		t.Context(), "INBOX|1", []string{"folder:Queue"}, nil))
 	require.NoError(user.Delete("Queue"))
 	require.NoError(client.ModifyMessageLabels(
-		context.Background(), "INBOX|2", []string{"folder:Queue"}, nil))
+		t.Context(), "INBOX|2", []string{"folder:Queue"}, nil))
 
 	assert.Len(t, listMailboxMessageIDs(t, client, "Queue"), 1)
 }
@@ -161,14 +160,14 @@ func TestClientModifyMessageLabelsRecoversFromEmptyCopyUID(t *testing.T) {
 	}, missingUID)
 	client := newTestClient(t, addr)
 
-	moved, err := client.MoveMessageToFolder(context.Background(), "INBOX|999", "INBOX", "Queue")
+	moved, err := client.MoveMessageToFolder(t.Context(), "INBOX|999", "INBOX", "Queue")
 	require.NoError(err)
 	assert.False(moved, "empty COPYUID cannot confirm a move")
 
 	// Malformed COPYUID closes the first connection. A subsequent real move
 	// proves recovery left the client usable.
 	testutil.AppendIMAPMessage(t, user, "INBOX")
-	moved, err = client.MoveMessageToFolder(context.Background(), "INBOX|1", "INBOX", "Queue")
+	moved, err = client.MoveMessageToFolder(t.Context(), "INBOX|1", "INBOX", "Queue")
 	require.NoError(err)
 	assert.True(moved)
 	assert.Len(listMailboxMessageIDs(t, client, "Queue"), 1)
@@ -184,7 +183,7 @@ func TestClientModifyMessageLabelsMoveIdempotentWhenAlreadyThere(t *testing.T) {
 
 	// Moving to the mailbox it already lives in is a no-op, not an error.
 	require.NoError(t, client.ModifyMessageLabels(
-		context.Background(),
+		t.Context(),
 		id,
 		[]string{"folder:Archive"},
 		nil,
@@ -268,7 +267,7 @@ func TestClientModifyMessageLabelsAddRemoveKeyword(t *testing.T) {
 	_, uid, err := parseCompositeID(id)
 	require.NoError(err)
 	require.NoError(client.ModifyMessageLabels(
-		context.Background(),
+		t.Context(),
 		id,
 		[]string{"keyword:Handled"},
 		nil,
@@ -276,7 +275,7 @@ func TestClientModifyMessageLabelsAddRemoveKeyword(t *testing.T) {
 	flags := fetchMessageFlags(t, client, "INBOX", uid)
 	assert.True(flagsContainFold(flags, "Handled"), "flags %v should contain Handled", flags)
 	require.NoError(client.ModifyMessageLabels(
-		context.Background(),
+		t.Context(),
 		id,
 		nil,
 		[]string{"keyword:Handled"},
@@ -295,7 +294,7 @@ func TestClientModifyMessageLabelsKeywordWithFolderMove(t *testing.T) {
 	})
 	require. // The keyword STORE happens before the MOVE and travels with the message.
 			NoError(client.ModifyMessageLabels(
-			context.Background(),
+			t.Context(),
 			id,
 			[]string{"keyword:Handled", "folder:Archive"},
 			nil,

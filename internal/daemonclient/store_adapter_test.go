@@ -61,7 +61,7 @@ func TestRunCLISyncStreamsWithoutAbsoluteClientTimeout(t *testing.T) {
 		st.httpClient.Timeout = 10 * time.Millisecond
 
 		var output strings.Builder
-		err = st.RunCLISync(context.Background(), CLISyncRequest{Full: true}, func(stream, data string) error {
+		err = st.RunCLISync(t.Context(), CLISyncRequest{Full: true}, func(stream, data string) error {
 			assert.Equal("stdout", stream, "stream")
 			_, _ = output.WriteString(data)
 			return nil
@@ -89,7 +89,7 @@ func TestLegacyAdapterUsesClientRootContext(t *testing.T) {
 		srv.Close()
 	})
 
-	root, cancel := context.WithCancel(context.Background())
+	root, cancel := context.WithCancel(t.Context())
 	c, err := New(Config{
 		URL: srv.URL, AllowInsecure: true, Context: root,
 		RequestMode: RequestModeCLI,
@@ -133,7 +133,7 @@ func TestRunCLISyncSendsIncrementalFolderFilters(t *testing.T) {
 	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
 	require.NoError(err, "New")
 
-	err = st.RunCLISync(context.Background(), CLISyncRequest{
+	err = st.RunCLISync(t.Context(), CLISyncRequest{
 		Folders:     []string{"INBOX", "Archive"},
 		SkipFolders: []string{"Trash"},
 	}, func(string, string) error {
@@ -157,7 +157,7 @@ func TestRunCLISyncSendsExactSourceID(t *testing.T) {
 
 	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
 	require.NoError(t, err)
-	require.NoError(t, st.RunCLISync(context.Background(), CLISyncRequest{
+	require.NoError(t, st.RunCLISync(t.Context(), CLISyncRequest{
 		SourceID: 42, SourceIDSet: true,
 	}, func(string, string) error { return nil }))
 }
@@ -178,7 +178,7 @@ func TestRunCLISyncRejectsOldDaemonBeforeStartingSourceScopedSync(t *testing.T) 
 
 	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
 	require.NoError(t, err)
-	err = st.RunCLISync(context.Background(), CLISyncRequest{
+	err = st.RunCLISync(t.Context(), CLISyncRequest{
 		SourceID: 42, SourceIDSet: true,
 	}, func(string, string) error { return nil })
 	require.ErrorContains(t, err, "requires daemon API schema 2.4.0")
@@ -284,7 +284,7 @@ func TestRunCLICommandStreamsOutput(t *testing.T) {
 	var stdout strings.Builder
 	var stderr strings.Builder
 	err = st.RunCLICommand(
-		context.Background(),
+		t.Context(),
 		CLIRunRequest{
 			Args: []string{"remove-account", "alice@example.com", "--yes"},
 			Env:  map[string]string{"MSGVAULT_IMAP_PASSWORD": "secret"},
@@ -328,7 +328,7 @@ func TestRunCLICommandGrantDecisionUsesLocalDaemonProof(t *testing.T) {
 		URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client(), LocalDaemonToken: "runtime-secret",
 	})
 	require.NoError(err)
-	require.NoError(st.RunCLICommand(context.Background(), CLIRunRequest{
+	require.NoError(st.RunCLICommand(t.Context(), CLIRunRequest{
 		Args: []string{"add-account", "user@example.com", "--readonly"}, GrantDecided: true,
 	}, nil))
 	assert.Equal(1, requests)
@@ -338,7 +338,7 @@ func TestRunCLICommandGrantDecisionRequiresLocalDaemonProof(t *testing.T) {
 	st, err := New(Config{URL: "http://127.0.0.1:1", AllowInsecure: true})
 	require.NoError(t, err)
 
-	err = st.RunCLICommand(context.Background(), CLIRunRequest{
+	err = st.RunCLICommand(t.Context(), CLIRunRequest{
 		Args: []string{"add-account", "user@example.com", "--readonly"}, GrantDecided: true,
 	}, nil)
 
@@ -384,7 +384,7 @@ func TestPlanCLIAddCalendarUsesGeneratedClientAdapter(t *testing.T) {
 	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
 	require.NoError(err, "New")
 
-	got, err := st.PlanCLIAddCalendar(context.Background(), CLIAddCalendarPlanRequest{
+	got, err := st.PlanCLIAddCalendar(t.Context(), CLIAddCalendarPlanRequest{
 		Email:            "alice@example.com",
 		OAuthApp:         "acme",
 		OAuthAppExplicit: true,
@@ -434,7 +434,7 @@ func TestPlanCLIEmbeddingsUsesGeneratedClientAdapter(t *testing.T) {
 	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
 	require.NoError(err, "New")
 
-	got, err := st.PlanCLIEmbeddings(context.Background(), CLIEmbeddingsPlanRequest{
+	got, err := st.PlanCLIEmbeddings(t.Context(), CLIEmbeddingsPlanRequest{
 		Operation:    "activate",
 		GenerationID: 2,
 		Force:        true,
@@ -501,7 +501,7 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
 	require.NoError(err, "New")
 
-	got, err := st.PlanCLIDeleteStaged(context.Background(), CLIDeleteStagedPlanRequest{
+	got, err := st.PlanCLIDeleteStaged(t.Context(), CLIDeleteStagedPlanRequest{
 		BatchID:             "batch-123",
 		Permanent:           true,
 		Account:             "alice@example.com",
@@ -569,7 +569,7 @@ func TestCreateCLIDeletionManifestUsesGeneratedClientAdapter(t *testing.T) {
 		}
 	})
 
-	got, err := s.CreateCLIDeletionManifest(context.Background(), manifest)
+	got, err := s.CreateCLIDeletionManifest(t.Context(), manifest)
 	require.NoError(err, "CreateCLIDeletionManifest")
 	require.NotNil(got, "result")
 	assert.Equal(manifest.ID, got.ID, "id")
@@ -590,7 +590,7 @@ func TestCreateCLIDeletionManifestRejectsOldDaemonBeforeSubmittingVersionTwo(t *
 		ID: 42, Type: "gmail", Identifier: "account@example.invalid",
 	})
 
-	_, err := s.CreateCLIDeletionManifest(context.Background(), manifest)
+	_, err := s.CreateCLIDeletionManifest(t.Context(), manifest)
 	require.ErrorContains(t, err, "version-2 deletion manifests require daemon API schema 2.4.0")
 	assert.Zero(t, manifestPosts, "version-2 manifest must not be submitted to an older daemon")
 }
@@ -653,7 +653,7 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
 	require.NoError(err, "New")
 
-	got, err := st.PlanCLIDeduplicate(context.Background(), CLIDeduplicatePlanRequest{
+	got, err := st.PlanCLIDeduplicate(t.Context(), CLIDeduplicatePlanRequest{
 		Account:                    "alice@example.com",
 		Prefer:                     "gmail,mbox",
 		ContentHash:                true,
@@ -687,7 +687,7 @@ func TestPlanCLIDeduplicateRejectsOldDaemonBeforeSubmittingPlan(t *testing.T) {
 		writeJSONResponse(t, w, map[string]any{"items": []any{}})
 	})
 
-	_, err := s.PlanCLIDeduplicate(context.Background(), CLIDeduplicatePlanRequest{})
+	_, err := s.PlanCLIDeduplicate(t.Context(), CLIDeduplicatePlanRequest{})
 
 	require.ErrorContains(t, err, "deduplicate planning requires daemon API schema 2.13.0")
 	assert.Zero(t, planPosts, "plan must not be submitted to an older daemon")
@@ -793,7 +793,7 @@ func TestGetStatsRejectsEmptyGeneratedOKBody(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	_, err := s.GetCLIStats(context.Background(), "", "")
+	_, err := s.GetCLIStats(t.Context(), "", "")
 
 	require.Error(t, err, "empty 200 JSON body must fail")
 	assert.NotContains(t, err.Error(), "API error (200)", "empty success decode failures are not API errors")
@@ -812,7 +812,7 @@ func TestCreateCLICollectionRejectsEmptyGeneratedOKBody(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	_, err := s.CreateCLICollection(context.Background(), CLICollectionCreateRequest{Name: "archive"})
+	_, err := s.CreateCLICollection(t.Context(), CLICollectionCreateRequest{Name: "archive"})
 
 	require.Error(err, "empty 200 mutation body must fail")
 	assert.NotContains(err.Error(), "API error (200)", "empty success decode failures are not API errors")
@@ -979,7 +979,7 @@ func TestGetCLIStats_Success(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	stats, err := s.GetCLIStats(context.Background(), "", "Important")
+	stats, err := s.GetCLIStats(t.Context(), "", "Important")
 	require.NoError(t, err, "GetCLIStats")
 
 	require.NotNil(t, stats.Stats, "Stats")
@@ -1022,7 +1022,7 @@ func TestGetCLISearch_Success(t *testing.T) {
 
 	s := newTestStore(srv, "key")
 	resp, err := s.GetCLISearch(
-		context.Background(),
+		t.Context(),
 		CLISearchRequest{
 			Query:        "lunch",
 			Account:      "alice@example.com",
@@ -1070,7 +1070,7 @@ func TestGetCLISearch_DeletionScopeRequiresCompatibleDaemon(t *testing.T) {
 			t.Cleanup(srv.Close)
 
 			client := newTestStore(srv, "")
-			_, err := client.GetCLISearch(context.Background(), CLISearchRequest{
+			_, err := client.GetCLISearch(t.Context(), CLISearchRequest{
 				Query: "scope", DeletionScope: tt.deletionScope,
 			})
 			if tt.wantErr {
@@ -1189,7 +1189,7 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 	before := time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC)
 	sourceID := int64(77)
 	resp, err := s.GetCLIHybridSearch(
-		context.Background(),
+		t.Context(),
 		CLIHybridSearchRequest{
 			Query:          "lunch",
 			Collection:     "Important",
@@ -1288,7 +1288,7 @@ func TestGetCLIHybridSearchUsesGeneratedClientAdapter(t *testing.T) {
 	})
 
 	resp, err := s.GetCLIHybridSearch(
-		context.Background(),
+		t.Context(),
 		CLIHybridSearchRequest{
 			Query:        "lunch",
 			MessageTypes: []string{"sms", "mms"},
@@ -1335,10 +1335,13 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 		assert.Equal("true", r.Header.Get(apiprotocol.AllowPendingCountsHeader))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
+			"stale": true,
+			"as_of": "2024-02-03T04:05:06Z",
 			"accounts": [{
 				"id": 7,
 				"email": "alice@example.com",
-				"type": "gmail",
+				"type": "imap",
+				"auth_method": "xoauth2",
 				"display_name": "Alice",
 				"alias": "archive",
 				"message_count": 1234,
@@ -1356,17 +1359,21 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	accounts, _, err := s.GetCLIAccounts(context.Background())
+	accounts, _, err := s.GetCLIAccounts(t.Context())
 	require.NoError(
 		err, "GetCLIAccounts")
 
 	require.Len(accounts, 2, "accounts")
 	assert.Equal(int64(7), accounts[0].ID, "ID")
 	assert.Equal("alice@example.com", accounts[0].Email, "Email")
-	assert.Equal("gmail", accounts[0].Type, "Type")
+	assert.Equal("imap", accounts[0].Type, "Type")
+	assert.Equal("xoauth2", accounts[0].AuthMethod)
 	assert.Equal("Alice", accounts[0].DisplayName, "DisplayName")
 	assert.Equal("archive", accounts[0].Alias, "Alias")
 	assert.Equal(int64(1234), accounts[0].MessageCount, "MessageCount")
+	assert.True(accounts[0].Stale)
+	require.NotNil(accounts[0].AsOf)
+	assert.Equal("2024-02-03T04:05:06Z", accounts[0].AsOf.UTC().Format(time.RFC3339))
 	require.NotNil(accounts[0].LastSync, "LastSync")
 	assert.Equal("2024-01-02T03:04:05Z", accounts[0].LastSync.UTC().Format(time.RFC3339), "LastSync")
 	assert.Empty(accounts[0].SyncConfig, "gmail SyncConfig empty")
@@ -1419,7 +1426,7 @@ func TestCLICollectionMutations(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	createResult, err := s.CreateCLICollection(context.Background(), CLICollectionCreateRequest{
+	createResult, err := s.CreateCLICollection(t.Context(), CLICollectionCreateRequest{
 		Name:     collectionName,
 		Accounts: []string{"alice@example.com", "bob@example.com"},
 	})
@@ -1429,7 +1436,7 @@ func TestCLICollectionMutations(t *testing.T) {
 	assert.Equal(collectionName, createResult.Name, "create result name")
 	assert.Equal(2, createResult.SourceCount, "create source count")
 
-	addResult, err := s.AddCLICollectionSources(context.Background(), collectionName, CLICollectionSourcesRequest{
+	addResult, err := s.AddCLICollectionSources(t.Context(), collectionName, CLICollectionSourcesRequest{
 		Accounts: []string{"alice@example.com"},
 	})
 	require.NoError(
@@ -1438,7 +1445,7 @@ func TestCLICollectionMutations(t *testing.T) {
 	assert.Equal(collectionName, addResult.Name, "add result name")
 	assert.Equal(1, addResult.SourceCount, "add source count")
 
-	removeResult, err := s.RemoveCLICollectionSources(context.Background(), collectionName, CLICollectionSourcesRequest{
+	removeResult, err := s.RemoveCLICollectionSources(t.Context(), collectionName, CLICollectionSourcesRequest{
 		Accounts: []string{"bob@example.com"},
 	})
 	require.NoError(
@@ -1447,7 +1454,7 @@ func TestCLICollectionMutations(t *testing.T) {
 	assert.Equal(collectionName, removeResult.Name, "remove result name")
 	assert.Equal(1, removeResult.SourceCount, "remove source count")
 
-	deleteResult, err := s.DeleteCLICollection(context.Background(), collectionName)
+	deleteResult, err := s.DeleteCLICollection(t.Context(), collectionName)
 	require.NoError(
 		err, "DeleteCLICollection")
 
@@ -1468,7 +1475,7 @@ func TestGetCLICollection_NotFound(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	collection, err := s.GetCLICollection(context.Background(), "missing")
+	collection, err := s.GetCLICollection(t.Context(), "missing")
 
 	require.ErrorIs(err, store.ErrCollectionNotFound, "GetCLICollection(missing)")
 	assert.Nil(collection, "collection")
@@ -1486,7 +1493,7 @@ func TestRebuildCLIFTSStreamsProgress(t *testing.T) {
 
 	s := newTestStore(srv, "secret")
 	var progress [][2]int64
-	indexed, err := s.RebuildCLIFTS(context.Background(), func(done, total int64) {
+	indexed, err := s.RebuildCLIFTS(t.Context(), func(done, total int64) {
 		progress = append(progress, [2]int64{done, total})
 	})
 
@@ -1507,7 +1514,7 @@ func TestRebuildCLIFTSIgnoresUnknownStreamEvents(t *testing.T) {
 
 	s := newTestStore(srv, "secret")
 	var progress [][2]int64
-	indexed, err := s.RebuildCLIFTS(context.Background(), func(done, total int64) {
+	indexed, err := s.RebuildCLIFTS(t.Context(), func(done, total int64) {
 		progress = append(progress, [2]int64{done, total})
 	})
 
@@ -1528,7 +1535,7 @@ func TestRunCLIRepairEncodingStreamsOutput(t *testing.T) {
 
 	s := newTestStore(srv, "secret")
 	var output []string
-	err := s.RunCLIRepairEncoding(context.Background(), func(stream, data string) error {
+	err := s.RunCLIRepairEncoding(t.Context(), func(stream, data string) error {
 		output = append(output, stream+":"+data)
 		return nil
 	})
@@ -1580,7 +1587,7 @@ func TestRunCLIRepairMessageUsesGeneratedRequestAndStreamsOutput(t *testing.T) {
 	reference := "gmail-42"
 	sourceID := int64(7)
 	var output []string
-	err := s.RunCLIRepairMessage(context.Background(), generated.CLIRepairMessageRequest{
+	err := s.RunCLIRepairMessage(t.Context(), generated.CLIRepairMessageRequest{
 		Reference: &reference,
 		SourceID:  &sourceID,
 	}, func(stream, data string) error {
@@ -1619,7 +1626,7 @@ func TestRunCLIRepairMessageWithPreflightChecksCapabilityBeforePreflightAndReque
 	reference := "gmail-42"
 	var preflightStep atomic.Int32
 	err := s.RunCLIRepairMessageWithPreflight(
-		context.Background(),
+		t.Context(),
 		generated.CLIRepairMessageRequest{Reference: &reference},
 		func(context.Context) error {
 			preflightStep.Store(sequence.Add(1))
@@ -1661,7 +1668,7 @@ func TestRunCLIRepairMessageFailsClosedWithoutCompatibleSchema(t *testing.T) {
 
 			s := newTestStore(srv, "")
 			reference := "gmail-42"
-			err := s.RunCLIRepairMessage(context.Background(), generated.CLIRepairMessageRequest{
+			err := s.RunCLIRepairMessage(t.Context(), generated.CLIRepairMessageRequest{
 				Reference: &reference,
 			}, nil)
 
@@ -1695,7 +1702,7 @@ func TestRunCLIRepairMessagePropagatesCancellation(t *testing.T) {
 	})
 
 	s := newTestStore(srv, "")
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	audit := true
 	go func() {
@@ -1722,7 +1729,7 @@ func TestRebuildCLIFTSUsesGeneratedClientAdapter(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"complete","indexed":5}` + "\n"))
 	})
 
-	indexed, err := s.RebuildCLIFTS(context.Background(), nil)
+	indexed, err := s.RebuildCLIFTS(t.Context(), nil)
 
 	require.NoError(err, "RebuildCLIFTS")
 	assert.Equal(int64(5), indexed, "indexed")
@@ -1759,7 +1766,7 @@ func TestGetCLIIdentities_Success(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	rows, err := s.GetCLIIdentities(context.Background(), CLIIdentitiesRequest{
+	rows, err := s.GetCLIIdentities(t.Context(), CLIIdentitiesRequest{
 		Account:     "alice@example.com",
 		PrimaryOnly: true,
 	})
@@ -1811,7 +1818,7 @@ func TestGetCLIMessage_Success(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	msg, err := s.GetCLIMessage(context.Background(), "remote-42")
+	msg, err := s.GetCLIMessage(t.Context(), "remote-42")
 	require.NoError(t, err, "GetCLIMessage")
 
 	require.NotNil(t, msg, "message")
@@ -1834,7 +1841,7 @@ func TestGetCLIMessage_NotFound(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	_, err := s.GetCLIMessage(context.Background(), "missing")
+	_, err := s.GetCLIMessage(t.Context(), "missing")
 	require.ErrorIs(t, err, store.ErrMessageNotFound, "GetCLIMessage(missing)")
 	assert.Equal(t, int32(1), requests.Load(), "a missing message must not be retried")
 }
@@ -1874,7 +1881,7 @@ func TestGetCLIMessagePlainTextErrorBodies(t *testing.T) {
 			defer srv.Close()
 
 			s := newTestStore(srv, "key")
-			_, err := s.GetCLIMessage(context.Background(), "missing")
+			_, err := s.GetCLIMessage(t.Context(), "missing")
 			require.Error(t, err)
 			var decodeErr *runtime.ResponseDecodeError
 			assert.NotErrorAs(t, err, &decodeErr, "a plain-text error page is not a contract failure")
@@ -1980,7 +1987,7 @@ func TestGetCLIMessageRawUsesGeneratedClientAdapter(t *testing.T) {
 		_, _ = w.Write(raw)
 	})
 
-	got, sourceMessageID, err := s.GetCLIMessageRaw(context.Background(), "gmail-42")
+	got, sourceMessageID, err := s.GetCLIMessageRaw(t.Context(), "gmail-42")
 	require.NoError(err, "GetCLIMessageRaw")
 	assert.Equal(raw, got, "raw")
 	assert.Equal("gmail-42", sourceMessageID, "SourceMessageID")
@@ -1994,7 +2001,7 @@ func TestGetCLIMessageRaw_NotFound(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	_, _, err := s.GetCLIMessageRaw(context.Background(), "missing")
+	_, _, err := s.GetCLIMessageRaw(t.Context(), "missing")
 	require.ErrorIs(t, err, store.ErrMessageNotFound, "GetCLIMessageRaw(missing)")
 }
 
@@ -2006,7 +2013,7 @@ func TestGetCLIMessageRaw_NotFoundUsesStableErrorCode(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	_, _, err := s.GetCLIMessageRaw(context.Background(), "missing")
+	_, _, err := s.GetCLIMessageRaw(t.Context(), "missing")
 	require.ErrorIs(t, err, store.ErrMessageNotFound, "GetCLIMessageRaw(missing)")
 }
 
@@ -2019,7 +2026,7 @@ func TestGetCLIMessageRaw_NotFoundPreservesGeneratedDecodeError(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	_, _, err := s.GetCLIMessageRaw(context.Background(), "missing")
+	_, _, err := s.GetCLIMessageRaw(t.Context(), "missing")
 
 	var decodeErr *runtime.ResponseDecodeError
 	require.ErrorAs(t, err, &decodeErr, "GetCLIMessageRaw malformed 404 should preserve generated decode error")
@@ -2039,7 +2046,7 @@ func TestGetCLIAttachmentUsesGeneratedClientAdapter(t *testing.T) {
 		_, _ = w.Write(data)
 	})
 
-	got, err := s.GetCLIAttachment(context.Background(), contentHash)
+	got, err := s.GetCLIAttachment(t.Context(), contentHash)
 	require.NoError(err, "GetCLIAttachment")
 	assert.Equal(data, got, "data")
 }
@@ -2057,7 +2064,7 @@ func TestOpenCLIAttachmentUsesGeneratedClientAdapter(t *testing.T) {
 		_, _ = w.Write(data)
 	})
 
-	body, err := s.OpenCLIAttachment(context.Background(), contentHash)
+	body, err := s.OpenCLIAttachment(t.Context(), contentHash)
 	require.NoError(err, "OpenCLIAttachment")
 	defer func() { _ = body.Close() }()
 
@@ -2078,7 +2085,7 @@ func TestGetCLIAttachmentRejectsSameLengthCorruption(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	s := newTestStore(srv, "key")
-	_, err := s.GetCLIAttachment(context.Background(), contentHash)
+	_, err := s.GetCLIAttachment(t.Context(), contentHash)
 	require.ErrorIs(t, err, contentverify.ErrMismatch)
 }
 
@@ -2094,7 +2101,7 @@ func TestOpenCLIAttachmentRejectsSameLengthCorruption(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	s := newTestStore(srv, "key")
-	body, err := s.OpenCLIAttachment(context.Background(), contentHash)
+	body, err := s.OpenCLIAttachment(t.Context(), contentHash)
 	require.NoError(t, err)
 	_, readErr := io.ReadAll(body)
 	require.ErrorIs(t, readErr, contentverify.ErrMismatch)

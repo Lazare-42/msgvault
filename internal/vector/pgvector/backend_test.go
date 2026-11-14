@@ -3,12 +3,12 @@
 package pgvector
 
 import (
-	"context"
 	"database/sql"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/testutil/vectorcheckpoints"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -52,7 +52,7 @@ func TestBackend_CreateActivateRetire(t *testing.T) {
 
 func TestBackend_ActivateGenerationIfConvergedRejectsStaleJournal(t *testing.T) {
 	b, ctx, db := newBackendForTest(t)
-	_, err := db.Exec(`
+	_, err := db.ExecContext(t.Context(), `
 		CREATE TABLE embedding_change_clock (
 			singleton BIGINT PRIMARY KEY,
 			sequence BIGINT NOT NULL
@@ -61,12 +61,12 @@ func TestBackend_ActivateGenerationIfConvergedRejectsStaleJournal(t *testing.T) 
 	require.NoError(t, err)
 	gen, err := b.CreateGeneration(ctx, "m", 768, "")
 	require.NoError(t, err)
-	_, err = db.Exec(`UPDATE messages SET embed_gen = $1 WHERE id = 1`, int64(gen))
+	_, err = db.ExecContext(t.Context(), `UPDATE messages SET embed_gen = $1 WHERE id = 1`, int64(gen))
 	require.NoError(t, err)
 	require.NoError(t, b.AdvanceDocumentChangeWatermark(ctx, gen, 4))
 	require.NoError(t, b.SetDocumentReconcileCursor(ctx, gen, "done:4"))
 
-	_, err = db.Exec(`UPDATE embedding_change_clock SET sequence = 5 WHERE singleton = 1`)
+	_, err = db.ExecContext(t.Context(), `UPDATE embedding_change_clock SET sequence = 5 WHERE singleton = 1`)
 	require.NoError(t, err)
 	err = b.ActivateGenerationIfConverged(ctx, gen, 4)
 	require.ErrorIs(t, err, vector.ErrGenerationNotConverged)
@@ -105,11 +105,11 @@ func TestBackend_CoverageGate_SkipsDeleted(t *testing.T) {
 	db := openPGTestDB(t)
 	// testSetupPGSchema seeds a live message id=1; mark it deleted so the
 	// only message is excluded from the coverage universe.
-	_, err := db.Exec(`UPDATE messages SET deleted_from_source_at = NOW() WHERE id = 1`)
+	_, err := db.ExecContext(t.Context(), `UPDATE messages SET deleted_from_source_at = NOW() WHERE id = 1`)
 	require.NoError(
 		err, "soft-delete message")
 
-	ctx := context.Background()
+	ctx := t.Context()
 	b, err := Open(ctx, Options{DB: db, Dimension: 768})
 	require.NoError(
 		err, "Open")
@@ -651,4 +651,9 @@ func TestBackend_Search_SubjectFilter_CaseInsensitive(t *testing.T) {
 	if assert.Len(hits, 1, "escaped-wildcard subject filter hits") {
 		assert.Equal(int64(3), hits[0].MessageID, "want msg 3")
 	}
+}
+
+func TestBackendEmbeddingCheckpointLifecycle(t *testing.T) {
+	b, ctx, _ := newBackendForTest(t)
+	vectorcheckpoints.Lifecycle(ctx, t, b)
 }

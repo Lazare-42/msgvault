@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/pflag"
 	"go.kenn.io/msgvault/internal/accountops"
 	"go.kenn.io/msgvault/internal/agentgrant"
 	"go.kenn.io/msgvault/internal/apiprotocol"
@@ -29,11 +30,13 @@ import (
 	"go.kenn.io/msgvault/internal/deletion"
 	msgexport "go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/identityops"
+	imapclient "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/opserr"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/provideridentity"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/senderauth"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -120,6 +123,7 @@ type ContextCLIStore interface {
 	CountSourceDeletedMessagesContext(ctx context.Context, sourceIDs ...int64) (int64, error)
 	NeedsFTSBackfillQuickContext(ctx context.Context) bool
 	NeedsFTSBackfillContext(ctx context.Context) (bool, error)
+	BackfillFTSContext(ctx context.Context, progress func(done, total int64)) (int64, error)
 	RebuildFTSContext(ctx context.Context, progress func(done, total int64)) (int64, error)
 }
 
@@ -266,6 +270,10 @@ func (s *requestCLIStore) CountSourceDeletedMessages(sourceIDs ...int64) (int64,
 
 func (s *requestCLIStore) NeedsFTSBackfillQuick() bool {
 	return s.contextStore.NeedsFTSBackfillQuickContext(s.ctx)
+}
+
+func (s *requestCLIStore) BackfillFTS(progress func(done, total int64)) (int64, error) {
+	return s.contextStore.BackfillFTSContext(s.ctx, progress)
 }
 
 func (s *requestCLIStore) RebuildFTS(
@@ -679,6 +687,8 @@ type cliDeleteDedupedExecuteResponse struct {
 }
 
 type cliSearchResponse struct {
+	HasMore          bool                   `json:"has_more,omitzero"`
+	Hints            []query.SearchHint     `json:"hints,omitempty"`
 	HybridAvailable  bool                   `json:"hybrid_available,omitzero"`
 	Results          []query.MessageSummary `json:"results"`
 	ScopeLabel       string                 `json:"scope_label,omitempty"`
@@ -868,6 +878,7 @@ type cliAccountResponse struct {
 	Type               string     `json:"type"`
 	DisplayName        string     `json:"display_name"`
 	OAuthApp           string     `json:"oauth_app,omitempty"`
+	AuthMethod         string     `json:"auth_method,omitempty"`
 	MessageCount       int64      `json:"message_count"`
 	SourceDeletedCount int64      `json:"source_deleted_count"`
 	LastSync           *time.Time `json:"last_sync"`
@@ -887,28 +898,31 @@ type cliAccountResponse struct {
 }
 
 type cliMessageResponse struct {
-	RelatedMessageID     *int64                 `json:"related_message_id,omitempty"`
-	ID                   int64                  `json:"id"`
-	SourceMessageID      string                 `json:"source_message_id"`
-	RFC822MessageID      string                 `json:"rfc822_message_id,omitempty"`
-	ConversationID       int64                  `json:"conversation_id"`
-	SourceConversationID string                 `json:"source_conversation_id"`
-	Subject              string                 `json:"subject"`
-	MessageType          string                 `json:"message_type,omitempty"`
-	Snippet              string                 `json:"snippet"`
-	SentAt               time.Time              `json:"sent_at"`
-	ReceivedAt           *time.Time             `json:"received_at"`
-	DeletedAt            *time.Time             `json:"deleted_at"`
-	SizeEstimate         int64                  `json:"size_estimate"`
-	HasAttachments       bool                   `json:"has_attachments"`
-	From                 []cliMessageAddress    `json:"from"`
-	To                   []cliMessageAddress    `json:"to"`
-	Cc                   []cliMessageAddress    `json:"cc"`
-	Bcc                  []cliMessageAddress    `json:"bcc"`
-	Labels               []string               `json:"labels"`
-	Attachments          []cliMessageAttachment `json:"attachments"`
-	BodyText             string                 `json:"body_text"`
-	BodyHTML             string                 `json:"body_html"`
+	SenderAuth           *senderauth.Verdict       `json:"sender_auth,omitempty"`
+	RelatedMessageID     *int64                    `json:"related_message_id,omitempty"`
+	Calendar             *store.CalendarProjection `json:"calendar,omitempty"`
+	ID                   int64                     `json:"id"`
+	SourceMessageID      string                    `json:"source_message_id"`
+	RFC822MessageID      string                    `json:"rfc822_message_id,omitempty"`
+	ConversationID       int64                     `json:"conversation_id"`
+	SourceConversationID string                    `json:"source_conversation_id"`
+	Subject              string                    `json:"subject"`
+	MessageType          string                    `json:"message_type,omitempty"`
+	Snippet              string                    `json:"snippet"`
+	SentAt               time.Time                 `json:"sent_at"`
+	ReceivedAt           *time.Time                `json:"received_at"`
+	DeletedAt            *time.Time                `json:"deleted_at"`
+	SizeEstimate         int64                     `json:"size_estimate"`
+	HasAttachments       bool                      `json:"has_attachments"`
+	HiddenTextPresent    bool                      `json:"hidden_text_present"`
+	From                 []cliMessageAddress       `json:"from"`
+	To                   []cliMessageAddress       `json:"to"`
+	Cc                   []cliMessageAddress       `json:"cc"`
+	Bcc                  []cliMessageAddress       `json:"bcc"`
+	Labels               []string                  `json:"labels"`
+	Attachments          []cliMessageAttachment    `json:"attachments"`
+	BodyText             string                    `json:"body_text"`
+	BodyHTML             string                    `json:"body_html"`
 }
 
 type cliMessageAddress struct {
@@ -985,7 +999,7 @@ func (s *Server) handleCLIStats(w http.ResponseWriter, r *http.Request) {
 	}
 	cliStore = bindCLIStoreContext(r.Context(), cliStore)
 
-	scope, err := resolveCLIStatsScope(cliStore, account, collection)
+	scope, err := resolveCLIStatsScope(r.Context(), cliStore, account, collection)
 	if err != nil {
 		writeAPIHTTPError(w, s.cliScopeError(err))
 		return
@@ -1433,7 +1447,7 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeEvent := newCLINDJSONEventWriter[CLIRunEvent](w)
-	if err := runner.RunCLICommand(r.Context(), req, writeEvent); err != nil {
+	if err := runner.RunCLICommand(s.WithPublishedVectorConfig(r.Context()), req, writeEvent); err != nil {
 		if coded, ok := errors.AsType[*CLIRunCodedError](err); ok {
 			s.logger.Error("failed to run CLI command", "command", req.Args[0], "error_code", coded.Code, "cause", coded.Err)
 		} else {
@@ -1450,6 +1464,9 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cliRunEnvAllowedForCommand(args []string, name string) bool {
+	if name == clirun.EnvInlineOAuth {
+		return len(args) > 0 && args[0] == "add-inline"
+	}
 	if IsCLIRunDraftCreate(args) || IsCLIRunDraftLifecycle(args) || IsCLIRunDraftSendAs(args) {
 		return false
 	}
@@ -1467,9 +1484,11 @@ func (s *Server) cliRunEnvAllowedForCommand(args []string, name string) bool {
 		if enrichmentRun {
 			return s.cliRunPersonEnrichmentRunEnvAllowed(args, name)
 		}
-		personSuppression := args[1] == "enrichment" && args[2] == "suppress" &&
-			cliRunArgsContainFlag(args, "person")
-		return personSuppression && s.cfg != nil &&
+		if args[1] != "enrichment" || args[2] != "suppress" {
+			return false
+		}
+		flags, ok := cliRunPersonEnrichmentFlags(args[2:])
+		return ok && flags.Changed("person") && s.cfg != nil &&
 			s.cfg.People.Enrichment.SuppressionKeyEnv != "" &&
 			s.cfg.People.Enrichment.SuppressionKeyEnv == name
 	}
@@ -1482,26 +1501,18 @@ func (s *Server) cliRunEnvAllowedForCommand(args []string, name string) bool {
 // Local onboarding may supply the selected profile's key for one synthetic
 // check. Ordinary checks continue to use daemon-owned credentials.
 func (s *Server) cliRunSavedProviderCheckEnvAllowed(args []string, name string) bool {
-	fingerprint, ok := cliRunFlagValue(args, "if-fingerprint")
-	if !ok || !cliRunPersonProviderArgsAllowed("check", args[3:]) {
+	flags, ok := cliRunPersonProviderFlags("check", args[3:])
+	if !ok || !flags.Changed("if-fingerprint") {
 		return false
 	}
-	var profileName string
-	for i := 3; i < len(args); i++ {
-		if args[i] == "--if-fingerprint" {
-			i++
-		} else if !strings.HasPrefix(args[i], "--") {
-			profileName = args[i]
-		}
-	}
 	sweep, ok := s.currentPeopleSweepConfig()
-	if !ok || profileName == "" {
+	if !ok {
 		return false
 	}
 	sweep.Enabled = true
-	sweep.Provider = peoplesweep.ProviderSelection{Name: profileName}
+	sweep.Provider = peoplesweep.ProviderSelection{Name: flags.Arg(0)}
 	profile, err := sweep.Profile()
-	return err == nil && profile.Fingerprint == fingerprint &&
+	return err == nil && profile.Fingerprint == flags.Lookup("if-fingerprint").Value.String() &&
 		profile.Auth != peoplesweep.AuthNone && profile.Credential == peoplesweep.CredentialEnv &&
 		profile.CredentialRef == name
 }
@@ -1513,10 +1524,11 @@ func (s *Server) cliRunPersonEnrichmentRunEnvAllowed(args []string, name string)
 	if suppressionEnv := s.cfg.People.Enrichment.SuppressionKeyEnv; suppressionEnv != "" && suppressionEnv == name {
 		return true
 	}
-	providerName, ok := cliRunFlagValue(args, "provider")
+	flags, ok := cliRunPersonEnrichmentFlags(args[2:])
 	if !ok {
 		return false
 	}
+	providerName := flags.Lookup("provider").Value.String()
 	for _, provider := range s.cfg.People.Enrichment.Providers {
 		if provider.Enabled && provider.Name == providerName &&
 			provider.APIKeyEnv != "" && provider.APIKeyEnv == name {
@@ -1524,19 +1536,6 @@ func (s *Server) cliRunPersonEnrichmentRunEnvAllowed(args []string, name string)
 		}
 	}
 	return false
-}
-
-func cliRunFlagValue(args []string, name string) (string, bool) {
-	flag := "--" + name
-	for i, arg := range args {
-		if value, ok := strings.CutPrefix(arg, flag+"="); ok {
-			return value, value != ""
-		}
-		if arg == flag && i+1 < len(args) {
-			return args[i+1], args[i+1] != ""
-		}
-	}
-	return "", false
 }
 
 func cliRunArgsContainFlag(args []string, name string) bool {
@@ -1587,7 +1586,7 @@ func (s *Server) handleCLIEmbeddingsPlan(w http.ResponseWriter, r *http.Request)
 	if !requireSingleJSONValue(w, dec, "invalid_request") {
 		return
 	}
-	resp, err := planner.PlanCLIEmbeddings(r.Context(), req)
+	resp, err := planner.PlanCLIEmbeddings(s.WithPublishedVectorConfig(r.Context()), req)
 	if err != nil {
 		writeAPIHTTPError(w, newAPIHTTPError(http.StatusBadRequest, "embeddings_plan_failed", err.Error()))
 		return
@@ -1684,15 +1683,26 @@ const cliRunPersonCommand = "person"
 // cliRunCommandAllowed reports whether a proxied CLI command may run through
 // the daemon CLI runner. Most commands are admitted by their leading word
 // alone; command groups whose subcommand matters are checked against their
-// nested command path. Backup admits only the frozen create path, documents
-// admits only mutations that must run under the daemon's writer lock, and
-// person admits only the provider consent boundary and sweep operations.
-// cliRunStatusSubcommand is the read-only status subcommand shared by the
-// document and document-vector command groups.
-const cliRunStatusSubcommand = "status"
+// nested command path. Backup admits only the frozen create path, and person
+// admits only the provider consent boundary and sweep operations.
 
 func cliRunCommandAllowed(args []string) bool {
 	if len(args) == 0 {
+		return false
+	}
+	if args[0] == "source" {
+		if len(args) < 3 {
+			return false
+		}
+		switch args[1] {
+		case "facebook-comments", "instagram-comments":
+			return args[2] == "add" || args[2] == "sync"
+		case "feeds":
+			switch args[2] {
+			case "add", "list", "remove", "sync":
+				return true
+			}
+		}
 		return false
 	}
 	// Internal subprocess commands are callable only by their owning public
@@ -1712,28 +1722,6 @@ func cliRunCommandAllowed(args []string) bool {
 	if args[0] == "backup" {
 		return len(args) >= 2 && args[1] == "create"
 	}
-	if args[0] == "documents" {
-		if len(args) < 2 {
-			return false
-		}
-		if args[1] == "vectors" {
-			if len(args) < 3 {
-				return false
-			}
-			switch args[2] {
-			case "build", "consent", "rebuild", "resume", "retire", "retry", cliRunStatusSubcommand:
-				return true
-			default:
-				return false
-			}
-		}
-		switch args[1] {
-		case "build", "consent-mistral", "consent-docling", "purge-derived", "resume", "retire", "retry", cliRunStatusSubcommand:
-			return true
-		default:
-			return false
-		}
-	}
 	if args[0] == cliRunPersonCommand {
 		if len(args) < 3 {
 			return false
@@ -1747,6 +1735,11 @@ func cliRunCommandAllowed(args []string) bool {
 		case "sweep":
 			switch args[2] {
 			case "run", "status", "history":
+				return true
+			}
+		case "tiers":
+			switch args[2] {
+			case "preview", "explain":
 				return true
 			}
 		}
@@ -1763,10 +1756,12 @@ func cliRunCommandAllowed(args []string) bool {
 		"add-chatwoot",
 		"add-plaud",
 		"add-twenty",
+		"add-pocket",
 		"add-discord",
 		"add-granola",
 		"add-omi",
 		"add-imap",
+		"add-inline",
 		"add-muesli",
 		"add-notion-meetings",
 		"add-o365",
@@ -1776,6 +1771,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"add-twilio",
 		"backfill-beeper-media",
 		"backfill-discord-media",
+		"backfill-inline-media",
 		"backfill-slack-media",
 		"backfill-teams-media",
 		"build-embeddings",
@@ -1798,6 +1794,9 @@ func cliRunCommandAllowed(args []string) bool {
 		"import-messenger",
 		"import-pst",
 		"import-slackdump",
+		"import-telegram",
+		"import-discord-package",
+		"import-x",
 		"import-synctech-sms",
 		"import-whatsapp",
 		"list-deletions",
@@ -1805,6 +1804,8 @@ func cliRunCommandAllowed(args []string) bool {
 		"logs",
 		"pack-attachments",
 		"purge-excluded-media",
+		"policy",
+		"repair-attachment-roles",
 		"repair-dates",
 		"repair-identity",
 		"repair-labels",
@@ -1821,8 +1822,10 @@ func cliRunCommandAllowed(args []string) bool {
 		"sync-chatwoot",
 		"sync-plaud",
 		"sync-twenty",
+		"sync-pocket",
 		"sync-discord",
 		"sync-granola",
+		"sync-inline",
 		"sync-muesli",
 		"sync-omi",
 		"sync-notion-meetings",
@@ -1837,102 +1840,61 @@ func cliRunCommandAllowed(args []string) bool {
 }
 
 func cliRunPersonProviderArgsAllowed(operation string, args []string) bool {
-	boolFlags := map[string]bool{}
-	valueFlags := map[string]bool{}
-	maxPositionals := 0
+	_, ok := cliRunPersonProviderFlags(operation, args)
+	return ok
+}
+
+// cliRunPersonProviderFlags parses and checks the arguments of a person
+// provider operation, so credential forwarding reads the same values.
+func cliRunPersonProviderFlags(operation string, args []string) (*pflag.FlagSet, bool) {
+	flags := clirun.NewFlagSet()
+	maxPositionals := 1
 	switch operation {
 	case "list":
-		boolFlags["json"] = true
+		maxPositionals = 0
+		flags.Bool("json", false, "")
 	case "status":
-		maxPositionals = 1
-		for _, name := range []string{"all", "json", "semantic-embeddings"} {
-			boolFlags[name] = true
-		}
+		flags.Bool("all", false, "")
+		flags.Bool("json", false, "")
+		flags.Bool("semantic-embeddings", false, "")
 	case "consent":
-		maxPositionals = 1
-		for _, name := range []string{"yes", "json", "semantic-embeddings"} {
-			boolFlags[name] = true
-		}
+		flags.Bool("yes", false, "")
+		flags.Bool("json", false, "")
+		flags.Bool("semantic-embeddings", false, "")
 	case "revoke":
-		maxPositionals = 1
-		for _, name := range []string{"all", "json", "semantic-embeddings"} {
-			boolFlags[name] = true
-		}
-		valueFlags["if-fingerprint"] = true
-		valueFlags["fingerprint"] = true
+		flags.Bool("all", false, "")
+		flags.Bool("json", false, "")
+		flags.Bool("semantic-embeddings", false, "")
+		flags.String("if-fingerprint", "", "")
+		flags.String("fingerprint", "", "")
 	case "history":
-		maxPositionals = 1
-		boolFlags["json"] = true
-		valueFlags["limit"] = true
-		valueFlags["person"] = true
+		flags.Bool("json", false, "")
+		flags.Int("limit", 0, "")
+		flags.Int64("person", 0, "")
 	case "check":
-		maxPositionals = 1
-		boolFlags["json"] = true
-		valueFlags["if-fingerprint"] = true
+		flags.Bool("json", false, "")
+		flags.String("if-fingerprint", "", "")
 	case "reverify":
-		maxPositionals = 1
-		boolFlags["yes"] = true
-		boolFlags["json"] = true
+		flags.Bool("yes", false, "")
+		flags.Bool("json", false, "")
 	default:
-		return false
+		return nil, false
 	}
-
-	positionals := 0
-	guardedRevoke := false
-	pendingValueFlag := ""
-	consumeValue := func(name, value string) bool {
-		if value == "" || strings.HasPrefix(value, "-") {
-			return false
-		}
-		if name == "if-fingerprint" && !validPersonProviderFingerprint(value) {
-			return false
-		}
-		guardedRevoke = guardedRevoke || name == "if-fingerprint"
-		return true
+	if clirun.Parse(flags, args) != nil || flags.NArg() > maxPositionals {
+		return nil, false
 	}
-	for _, argument := range args {
-		if pendingValueFlag != "" {
-			if !consumeValue(pendingValueFlag, argument) {
-				return false
-			}
-			pendingValueFlag = ""
-			continue
-		}
-		if !strings.HasPrefix(argument, "--") {
-			positionals++
-			if positionals > maxPositionals || peoplesweep.ValidateProviderProfileName(argument) != nil {
-				return false
-			}
-			continue
-		}
-		nameValue := strings.TrimPrefix(argument, "--")
-		name, value, hasValue := strings.Cut(nameValue, "=")
-		if boolFlags[name] {
-			if hasValue {
-				if _, err := strconv.ParseBool(value); err != nil {
-					return false
-				}
-			}
-			continue
-		}
-		if !valueFlags[name] {
-			return false
-		}
-		if !hasValue {
-			pendingValueFlag = name
-			continue
-		}
-		if !consumeValue(name, value) {
-			return false
+	for _, profile := range flags.Args() {
+		if peoplesweep.ValidateProviderProfileName(profile) != nil {
+			return nil, false
 		}
 	}
-	if pendingValueFlag != "" {
-		return false
+	for _, name := range []string{"if-fingerprint", "fingerprint"} {
+		if flags.Changed(name) && !validPersonProviderFingerprint(flags.Lookup(name).Value.String()) {
+			return nil, false
+		}
 	}
-	if guardedRevoke && positionals != 1 {
-		return false
-	}
-	return true
+	// A guarded revoke or check names the profile whose fingerprint it guards.
+	return flags, !flags.Changed("if-fingerprint") || flags.NArg() == 1
 }
 
 func validPersonProviderFingerprint(fingerprint string) bool {
@@ -1948,100 +1910,69 @@ func validPersonProviderFingerprint(fingerprint string) bool {
 }
 
 func cliRunPersonEnrichmentAllowed(args []string) bool {
+	_, ok := cliRunPersonEnrichmentFlags(args)
+	return ok
+}
+
+// cliRunPersonEnrichmentFlags parses and checks the arguments of a person
+// enrichment operation, so credential forwarding reads the same values.
+func cliRunPersonEnrichmentFlags(args []string) (*pflag.FlagSet, bool) {
 	if len(args) == 0 {
-		return false
+		return nil, false
 	}
-	operation := args[0]
-	values, positionals, ok := cliRunStrictFlagValues(args[1:])
-	if !ok {
-		return false
-	}
-	allowed := func(names ...string) bool {
-		set := make(map[string]struct{}, len(names)+4)
-		for _, name := range names {
-			set[name] = struct{}{}
-		}
-		for _, name := range []string{"log-level", "verbose", "log-sql", "log-sql-slow-ms"} {
-			set[name] = struct{}{}
-		}
-		for name := range values {
-			if _, exists := set[name]; !exists {
-				return false
-			}
-		}
-		return true
-	}
-	switch operation {
+	flags := clirun.NewFlagSet()
+	parsed := func() bool { return clirun.Parse(flags, args[1:]) == nil }
+	switch args[0] {
 	case "status":
-		return len(positionals) == 0 && allowed("limit", "json")
+		flags.Int("limit", 0, "")
+		flags.Bool("json", false, "")
+		return flags, parsed() && flags.NArg() == 0
 	case "profiles":
-		return len(positionals) == 0 && allowed("json")
+		flags.Bool("json", false, "")
+		return flags, parsed() && flags.NArg() == 0
 	case "consent":
-		return len(positionals) == 1 && isLowerSHA256(positionals[0]) && allowed("json")
+		flags.Bool("json", false, "")
+		return flags, parsed() && flags.NArg() == 1 && isLowerSHA256(flags.Arg(0))
 	case "revoke":
-		return len(positionals) <= 1 && allowed("all", "json") &&
-			(len(positionals) == 0 || isLowerSHA256(positionals[0]))
+		flags.Bool("all", false, "")
+		flags.Bool("json", false, "")
+		return flags, parsed() && flags.NArg() <= 1 && (flags.NArg() == 0 || isLowerSHA256(flags.Arg(0)))
 	case "run":
-		return len(positionals) == 0 && allowed("person", "provider", "idempotency-key", "json") &&
-			cliRunPositiveInt(values["person"]) && cliRunSafeToken(values["provider"]) &&
-			cliRunSafeToken(values["idempotency-key"])
+		person := flags.Int64("person", 0, "")
+		provider := flags.String("provider", "", "")
+		idempotencyKey := flags.String("idempotency-key", "", "")
+		flags.Bool("json", false, "")
+		return flags, parsed() && flags.NArg() == 0 && *person > 0 &&
+			cliRunSafeToken(*provider) && cliRunSafeToken(*idempotencyKey)
 	case "suppress":
-		if len(positionals) != 0 || !allowed(
-			"person", "provider-namespace", "identifier-class", "normalization-version",
-			"key-id", "digest", "reason", "actor") {
-			return false
+		person := flags.Int64("person", 0, "")
+		namespace := flags.String("provider-namespace", "", "")
+		class := flags.String("identifier-class", "", "")
+		version := flags.String("normalization-version", "", "")
+		keyID := flags.String("key-id", "", "")
+		digest := flags.String("digest", "", "")
+		reason := flags.String("reason", "", "")
+		actor := flags.String("actor", "", "")
+		if !parsed() || flags.NArg() != 0 {
+			return nil, false
 		}
-		if person := values["person"]; person != "" {
-			return cliRunPositiveInt(person) && values["provider-namespace"] == "" &&
-				values["identifier-class"] == "" && values["normalization-version"] == "" &&
-				values["key-id"] == "" && values["digest"] == "" && values["actor"] == "" &&
-				(values["reason"] == "opt_out" || values["reason"] == "data_subject_request")
+		validReason := *reason == "opt_out" || *reason == "data_subject_request"
+		if flags.Changed("person") {
+			return flags, *person > 0 && *namespace == "" && *class == "" && *version == "" &&
+				*keyID == "" && *digest == "" && *actor == "" && validReason
 		}
-		namespace := values["provider-namespace"]
-		kind, fingerprint, found := strings.Cut(namespace, ":")
-		class := values["identifier-class"]
+		kind, fingerprint, found := strings.Cut(*namespace, ":")
 		versionByClass := map[string]string{
 			"email": "email-v1", "phone": "phone-v1", "public_profile_url": "public-url-v1",
 			"provider_person_id": "provider-person-id-v1", "name_company": "name-company-v1",
 		}
-		version, validClass := versionByClass[class]
-		return found && (kind == "exa" || kind == "sixtyfour") && isLowerSHA256(fingerprint) &&
-			validClass && values["normalization-version"] == version &&
-			isLowerSHA256(values["key-id"]) && isLowerSHA256(values["digest"]) &&
-			(values["reason"] == "opt_out" || values["reason"] == "data_subject_request") &&
-			values["actor"] == "cli"
+		wantVersion, validClass := versionByClass[*class]
+		return flags, found && (kind == "exa" || kind == "sixtyfour") && isLowerSHA256(fingerprint) &&
+			validClass && *version == wantVersion &&
+			isLowerSHA256(*keyID) && isLowerSHA256(*digest) && validReason && *actor == "cli"
 	default:
-		return false
+		return nil, false
 	}
-}
-
-func cliRunStrictFlagValues(args []string) (map[string]string, []string, bool) {
-	values := make(map[string]string)
-	positionals := make([]string, 0)
-	for _, arg := range args {
-		if !strings.HasPrefix(arg, "--") {
-			positionals = append(positionals, arg)
-			continue
-		}
-		nameValue := strings.TrimPrefix(arg, "--")
-		name, value, hasValue := strings.Cut(nameValue, "=")
-		if name == "" {
-			return nil, nil, false
-		}
-		if !hasValue {
-			value = "true"
-		}
-		if _, duplicate := values[name]; duplicate {
-			return nil, nil, false
-		}
-		values[name] = value
-	}
-	return values, positionals, true
-}
-
-func cliRunPositiveInt(value string) bool {
-	parsed, err := strconv.ParseInt(value, 10, 64)
-	return err == nil && parsed > 0
 }
 
 func cliRunSafeToken(value string) bool {
@@ -2102,7 +2033,6 @@ func (s *Server) cliRunEnvAllowed(name string) bool {
 	}
 	for _, keyEnv := range []string{
 		s.cfg.Vector.Embeddings.APIKeyEnv,
-		s.cfg.Attachments.Documents.APIKeyEnv,
 		s.configuredPeopleProviderKeyEnv(),
 		s.cfg.People.Enrichment.SuppressionKeyEnv,
 	} {
@@ -2444,7 +2374,7 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 			collection = scope.Collection.Name
 		}
 	} else if account != "" || collection != "" {
-		scope, err = resolveCLIStatsScope(cliStore, account, collection)
+		scope, err = resolveCLIStatsScope(r.Context(), cliStore, account, collection)
 		if err != nil {
 			writeAPIHTTPError(w, s.cliScopeError(err))
 			return
@@ -2479,7 +2409,7 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 	if grant == nil {
 		resp.IndexState = s.ensureCLISearchIndexAsync(cliStore, true)
 	}
-	results, err := s.queryEngineForContext(r.Context()).Search(r.Context(), parsed, limit, offset)
+	results, err := s.queryEngineForContext(r.Context()).Search(r.Context(), parsed, limit+1, offset)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -2487,6 +2417,10 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("CLI search failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "search_failed", err.Error())
 		return
+	}
+	resp.HasMore = len(results) > limit
+	if resp.HasMore {
+		results = results[:limit]
 	}
 	if includeSnippet {
 		metadata, err := s.searchMetadata(r.Context(), resultIDs(results), parsed, true)
@@ -2501,6 +2435,10 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if !s.maskQuerySummaries(w, r, results) {
+		return
+	}
+	// Search leaves summary BodyText empty; /cli/message serves full bodies.
 	resp.Results = results
 	if grant == nil && len(results) == 0 && offset == 0 && len(parsed.TextTerms) > 0 &&
 		len(parsed.AccountAddrs) == 0 && len(parsed.ReceivedAddrs) == 0 &&
@@ -2560,10 +2498,26 @@ func (s *Server) ensureCLISearchIndexAsync(cliStore CLIStore, mayRepair bool) st
 	if bound, ok := cliStore.(*requestCLIStore); ok {
 		cliStore = bound.CLIStore
 	}
+	s.importMu.Lock()
+	if s.importsClosed {
+		s.importMu.Unlock()
+		return state
+	}
+	finishIdle, ok := s.idleTracker.BeginMaintenanceWorkContext(s.importContext)
+	if !ok {
+		s.importMu.Unlock()
+		return state
+	}
+	s.importWG.Add(1)
+	s.importMu.Unlock()
 	s.ftsEnsureMayRepair = mayRepair
 	s.ftsEnsureRunning.Store(true)
 	s.ftsIndexState.Store(state)
-	go s.runCLISearchIndexEnsure(cliStore, knownIncomplete, !mayRepair)
+	go func() {
+		defer s.importWG.Done()
+		defer finishIdle()
+		s.runCLISearchIndexEnsure(cliStore, knownIncomplete, !mayRepair)
+	}()
 	return state
 }
 
@@ -2791,14 +2745,14 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 	if s.requestAuthentication(r).Grant != nil {
 		sources = slices.DeleteFunc(sources, func(src *store.Source) bool { return !slices.Contains(agentReadSourceIDs(r), src.ID) })
 	}
+	// Opted-in callers accept placeholder counts and immediate reuse of a matching catalog.
+	allowPending := r.Header.Get(apiprotocol.AllowPendingCountsHeader) == "true"
 	var grouped map[int64]store.SourceMessageCounts
 	var response cliAccountsResponse
 	if counter, ok := s.store.(sourceMessageCounter); ok && !s.sourceScopedRead(r) {
 		grouped, response.AsOf, response.Stale, err = s.accountCountSnapshots.get(
 			r.Context(), s.importContext, "", s.statsSnapshotWait, counter.CountMessagesBySourceContext,
 		)
-		// Older clients can't tell placeholder zeros from real counts, so only opted-in callers get them.
-		allowPending := r.Header.Get(apiprotocol.AllowPendingCountsHeader) == "true"
 		response.CountsPending = allowPending && errors.Is(err, errSnapshotWaitTimeout)
 		if err != nil && !response.CountsPending {
 			if s.writeIfContextError(w, err) {
@@ -2860,7 +2814,7 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 		} else {
 			virtual, _, stale, err = s.virtualAccountSnapshots.getVersion(
 				r.Context(), s.importContext, "", s.virtualAccountCatalogVersion(r.Context(), lister),
-				s.statsSnapshotWait, lister.ListVirtualAccountsContext,
+				s.statsSnapshotWait, allowPending, lister.ListVirtualAccountsContext,
 			)
 		}
 		// The catalog is extra detail; a slow or failed read still returns
@@ -2899,6 +2853,11 @@ func newCLIAccountResponse(src *store.Source, count, sourceDeleted int64) cliAcc
 		MessageCount:       count,
 		SourceDeletedCount: sourceDeleted,
 	}
+	if src.SourceType == "imap" && src.SyncConfig.Valid {
+		if cfg, err := imapclient.ConfigFromJSON(src.SyncConfig.String); err == nil {
+			account.AuthMethod = string(cfg.EffectiveAuthMethod())
+		}
+	}
 	if src.DisplayName.Valid {
 		account.DisplayName = src.DisplayName.String
 	}
@@ -2927,7 +2886,7 @@ func (s *Server) updateCLIAccount(
 	if settings, ok := s.store.(accountops.SettingsStore); ok {
 		result, err = accountops.UpdateAccount(ctx, settings, req)
 	} else {
-		result, err = accountops.UpdateDisplayName(cliStore, req)
+		result, err = accountops.UpdateDisplayName(ctx, cliStore, req)
 	}
 	if err != nil {
 		return accountops.UpdateResult{}, s.operationError(
@@ -3012,7 +2971,7 @@ func (s *Server) createCLICollection(
 		return collectionops.MutationResult{}, apiErr
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
-	result, err := collectionops.Create(cliStore, req)
+	result, err := collectionops.Create(ctx, cliStore, req)
 	if err != nil {
 		return collectionops.MutationResult{}, s.operationError(
 			err,
@@ -3033,7 +2992,7 @@ func (s *Server) addCLICollectionSources(
 		return collectionops.MutationResult{}, apiErr
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
-	result, err := collectionops.AddSources(cliStore, name, req)
+	result, err := collectionops.AddSources(ctx, cliStore, name, req)
 	if err != nil {
 		return collectionops.MutationResult{}, s.operationError(
 			err,
@@ -3054,7 +3013,7 @@ func (s *Server) removeCLICollectionSources(
 		return collectionops.MutationResult{}, apiErr
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
-	result, err := collectionops.RemoveSources(cliStore, name, req)
+	result, err := collectionops.RemoveSources(ctx, cliStore, name, req)
 	if err != nil {
 		return collectionops.MutationResult{}, s.operationError(
 			err,
@@ -3129,7 +3088,7 @@ func (s *Server) getCLIIdentities(
 	var sourceIDs []int64
 	switch {
 	case sourceIDSet:
-		src, err := identityops.ResolveSource(cliStore, identityops.SourceSelector{SourceID: sourceID})
+		src, err := identityops.ResolveSource(ctx, cliStore, identityops.SourceSelector{SourceID: sourceID})
 		if err != nil {
 			return cliIdentitiesResponse{}, s.cliScopeError(err)
 		}
@@ -3142,7 +3101,7 @@ func (s *Server) getCLIIdentities(
 				"primary_only requires account scope",
 			)
 		}
-		scope, err := resolveCLIAccountScope(cliStore, account)
+		scope, err := resolveCLIAccountScope(ctx, cliStore, account)
 		if err != nil {
 			return cliIdentitiesResponse{}, s.cliScopeError(err)
 		}
@@ -3155,7 +3114,7 @@ func (s *Server) getCLIIdentities(
 		}
 		sourceIDs = []int64{scope.Account.Source.ID}
 	case account != "" || collection != "":
-		scope, err := resolveCLIStatsScope(cliStore, account, collection)
+		scope, err := resolveCLIStatsScope(ctx, cliStore, account, collection)
 		if err != nil {
 			return cliIdentitiesResponse{}, s.cliScopeError(err)
 		}
@@ -3197,7 +3156,7 @@ func (s *Server) addCLIIdentity(ctx context.Context, req identityops.AddRequest)
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
 
-	result, err := identityops.Add(cliStore, req)
+	result, err := identityops.Add(ctx, cliStore, req)
 	if err != nil {
 		return identityops.AddResult{}, s.operationError(
 			err,
@@ -3293,7 +3252,7 @@ func (s *Server) handleCLIIdentityDiscover(w http.ResponseWriter, r *http.Reques
 
 	var externalEvidence []identityops.ExternalEvidence
 	if req.Provider {
-		source, resolveErr := identityops.ResolveSource(discoveryStore, req.SourceSelector)
+		source, resolveErr := identityops.ResolveSource(r.Context(), discoveryStore, req.SourceSelector)
 		if resolveErr != nil {
 			writeAPIHTTPError(w, s.operationError(
 				resolveErr,
@@ -3442,7 +3401,7 @@ func (s *Server) removeCLIIdentity(ctx context.Context, req identityops.RemoveRe
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
 
-	result, err := identityops.Remove(cliStore, req)
+	result, err := identityops.Remove(ctx, cliStore, req)
 	if err != nil {
 		return identityops.RemoveResult{}, s.operationError(
 			err,
@@ -3546,6 +3505,12 @@ func (s *Server) handleCLIMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	from := ""
+	if len(msg.From) == 1 {
+		from = msg.From[0].Email
+	}
+	msg.SenderAuth = s.senderAuth(r.Context(), msg.ID, msg.SourceID, msg.MessageType, from)
+	s.maskMessageDetail(r, msg)
 	writeJSON(w, http.StatusOK, cliMessageResponseFromQuery(msg))
 }
 
@@ -3620,16 +3585,18 @@ func (s *Server) handleCLIAttachment(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_content_hash", err.Error())
 		return
 	}
+	var attachments []query.AttachmentInfo
 	if s.requestAuthentication(r).Grant != nil {
-		if _, apiErr := s.attachmentCandidatesForRequest(r, contentHash); apiErr != nil {
+		var apiErr *apiHTTPError
+		attachments, apiErr = s.attachmentCandidatesForRequest(r, contentHash)
+		if apiErr != nil {
 			writeAPIHTTPError(w, apiErr)
 			return
 		}
 	}
 
-	releaseReadSnapshot(r)
 	if s.blobStore != nil {
-		rc, size, err := s.blobStore.OpenStream(r.Context(), contentHash)
+		rc, size, err := s.blobStore.OpenStream(store.WithoutReadSnapshotContext(r.Context()), contentHash)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				writeError(w, http.StatusNotFound, "not_found", "Attachment not found")
@@ -3644,11 +3611,20 @@ func (s *Server) handleCLIAttachment(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusRequestEntityTooLarge, "remote_attachment_too_large", "Attachment exceeds the remote client byte limit")
 			return
 		}
+		reader, _, apiErr := s.textAttachmentReader(w, r, rc, attachments)
+		if reader == nil {
+			_ = rc.Close()
+			if apiErr != nil {
+				writeAPIHTTPError(w, apiErr)
+			}
+			return
+		}
+		releaseReadSnapshot(r)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.Header().Set("X-Msgvault-Content-Hash", contentHash)
 		w.WriteHeader(http.StatusOK)
-		_, copyErr := io.Copy(w, rc)
+		_, copyErr := io.Copy(w, reader)
 		if err := errors.Join(copyErr, rc.Close()); err != nil {
 			s.logger.Error("failed to write CLI attachment", "content_hash", contentHash, "error", err)
 		}
@@ -3689,10 +3665,19 @@ func (s *Server) handleCLIAttachment(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	reader, _, apiErr := s.textAttachmentReader(w, r, f, attachments)
+	if reader == nil {
+		if apiErr != nil {
+			writeAPIHTTPError(w, apiErr)
+		}
+		return
+	}
+	releaseReadSnapshot(r)
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("X-Msgvault-Content-Hash", contentHash)
 	w.WriteHeader(http.StatusOK)
-	if _, err := io.Copy(w, f); err != nil {
+	if _, err := io.Copy(w, reader); err != nil {
 		s.logger.Error("failed to write CLI attachment", "content_hash", contentHash, "error", err)
 	}
 }
@@ -3729,6 +3714,8 @@ func (s *Server) resolveCLIMessage(r *http.Request, idStr string) (*query.Messag
 
 func cliMessageResponseFromQuery(msg *query.MessageDetail) cliMessageResponse {
 	return cliMessageResponse{
+		SenderAuth:           msg.SenderAuth,
+		Calendar:             msg.Calendar,
 		ID:                   msg.ID,
 		SourceMessageID:      msg.SourceMessageID,
 		RFC822MessageID:      msg.RFC822MessageID,
@@ -3743,6 +3730,7 @@ func cliMessageResponseFromQuery(msg *query.MessageDetail) cliMessageResponse {
 		DeletedAt:            msg.DeletedAt,
 		SizeEstimate:         msg.SizeEstimate,
 		HasAttachments:       msg.HasAttachments,
+		HiddenTextPresent:    msg.HiddenTextPresent,
 		From:                 cliMessageAddresses(msg.From),
 		To:                   cliMessageAddresses(msg.To),
 		Cc:                   cliMessageAddresses(msg.Cc),
@@ -3885,12 +3873,12 @@ func statsResponseFromStore(stats *store.Stats) StatsResponse {
 	}
 }
 
-func resolveCLIStatsScope(st CLIStore, account, collection string) (cliScope, error) {
+func resolveCLIStatsScope(ctx context.Context, st CLIStore, account, collection string) (cliScope, error) {
 	switch {
 	case account != "" && collection != "":
 		return cliScope{}, opserr.Invalid(errMutuallyExclusiveScope)
 	case account != "":
-		return resolveCLIAccountScope(st, account)
+		return resolveCLIAccountScope(ctx, st, account)
 	case collection != "":
 		return resolveCLICollectionScope(st, collection)
 	default:
@@ -3909,8 +3897,8 @@ func cliEmptyScopeMessage(account, collection string) string {
 	}
 }
 
-func resolveCLIAccountScope(st CLIStore, input string) (cliScope, error) {
-	scope, err := collectionops.ResolveAccount(st, input)
+func resolveCLIAccountScope(ctx context.Context, st CLIStore, input string) (cliScope, error) {
+	scope, err := collectionops.ResolveAccountContext(ctx, st, input)
 	return cliScope{Account: scope}, err
 }
 

@@ -101,7 +101,7 @@ func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return usageErr(cmd, err)
 	}
-	s, cleanup, err := openWritableStoreAndInitForInvocation(state)
+	s, cleanup, err := openWritableStoreAndInitForInvocation(cmd.Context(), state)
 	if err != nil {
 		return err
 	}
@@ -313,7 +313,7 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(ctx
 		), nil
 
 	case sourceTypeIMAP:
-		var opts []imaplib.Option
+		opts := []imaplib.Option{imaplib.WithMaxCommandsPerMinute(cfg.Sync.IMAPMaxCommandsPerMinute)}
 		opts = append(opts, imapOpts...)
 
 		var since, before time.Time
@@ -749,7 +749,33 @@ func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(ctx conte
 	return nil
 }
 
-// trimFolderFilter trims whitespace from folder names and removes empty
+// imapSyncFolderFilter uses saved exclusions unless command folder flags
+// replace the saved filter for this run.
+func imapSyncFolderFilter(ctx context.Context, s *store.Store, identifier string, state *invocation, folders, skipFolders []string) imaplib.Option {
+	folders = parseFolderFilter(folders)
+	skipFolders = parseFolderFilter(skipFolders)
+	cfg := state.cfg
+	if len(folders) == 0 && len(skipFolders) == 0 {
+		if len(cfg.Sync.IMAPSkipFolders) > 0 {
+			state.imapFolderAccounts.Do(func() {
+				sources, err := s.ListSourcesContext(ctx, sourceTypeIMAP)
+				if err != nil {
+					state.logger.Warn("could not check IMAP folder exclusion accounts", "error", err)
+					return
+				}
+				for account := range cfg.Sync.IMAPSkipFolders {
+					if !slices.ContainsFunc(sources, func(src *store.Source) bool { return src.Identifier == account }) {
+						state.logger.Warn("IMAP folder exclusions match no stored account; copy the ACCOUNT identifier from msgvault list-accounts", "account", account)
+					}
+				}
+			})
+		}
+		skipFolders = parseFolderFilter(cfg.Sync.IMAPSkipFolders[identifier])
+	}
+	return imaplib.WithFolderFilter(folders, skipFolders)
+}
+
+// parseFolderFilter trims whitespace from folder names and removes empty
 // entries. Returns nil when the input slice is empty.
 func parseFolderFilter(folders []string) []string {
 	if len(folders) == 0 {

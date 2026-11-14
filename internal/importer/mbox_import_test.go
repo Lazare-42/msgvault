@@ -24,6 +24,7 @@ import (
 )
 
 func TestImportMbox_IngestsMessagesThreadsAndAttachments(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -68,7 +69,7 @@ func TestImportMbox_IngestsMessagesThreadsAndAttachments(t *testing.T) {
 	mboxPath := filepath.Join(tmp, "hey-export.mbox")
 	require.NoError(os.WriteFile(mboxPath, []byte(mboxData.String()), 0600), "write mbox")
 
-	summary, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	summary, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "hey",
 		Identifier:         "me@hey.com",
 		Labels:             []string{"hey"},
@@ -89,30 +90,31 @@ func TestImportMbox_IngestsMessagesThreadsAndAttachments(t *testing.T) {
 		msgLabelCount     int
 		attachmentCount   int
 	)
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM sources WHERE source_type = 'hey' AND identifier = 'me@hey.com'`).Scan(&sourceCount), "count sources")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM sources WHERE source_type = 'hey' AND identifier = 'me@hey.com'`).Scan(&sourceCount), "count sources")
 	require.Equal(1, sourceCount, "sourceCount")
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM conversations`).Scan(&conversationCount), "count conversations")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM conversations`).Scan(&conversationCount), "count conversations")
 	require.Equal(1, conversationCount, "conversationCount")
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
 	require.Equal(2, messageCount, "messageCount")
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM message_raw`).Scan(&rawCount), "count message_raw")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM message_raw`).Scan(&rawCount), "count message_raw")
 	require.Equal(2, rawCount, "rawCount")
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM labels WHERE name = 'hey'`).Scan(&labelCount), "count labels")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM labels WHERE name = 'hey'`).Scan(&labelCount), "count labels")
 	require.Equal(1, labelCount, "labelCount")
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM message_labels`).Scan(&msgLabelCount), "count message_labels")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM message_labels`).Scan(&msgLabelCount), "count message_labels")
 	require.Equal(2, msgLabelCount, "msgLabelCount")
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM attachments`).Scan(&attachmentCount), "count attachments")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments`).Scan(&attachmentCount), "count attachments")
 	require.Equal(1, attachmentCount, "attachmentCount")
 
 	// Verify attachment file exists.
 	var storagePath string
-	require.NoError(st.DB().QueryRow(`SELECT storage_path FROM attachments LIMIT 1`).Scan(&storagePath), "select storage_path")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT storage_path FROM attachments LIMIT 1`).Scan(&storagePath), "select storage_path")
 	require.NotEmpty(storagePath, "storage_path empty")
 	_, err = os.Stat(filepath.Join(attachmentsDir, filepath.FromSlash(storagePath)))
 	require.NoError(err, "attachment file missing")
 }
 
 func TestImportMbox_NoAttachmentsStillRecordsAttachmentMetadata(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -139,7 +141,7 @@ func TestImportMbox_NoAttachmentsStillRecordsAttachmentMetadata(t *testing.T) {
 	mboxPath := filepath.Join(tmp, "export.mbox")
 	require.NoError(os.WriteFile(mboxPath, []byte(mboxData.String()), 0600), "write mbox")
 
-	summary, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	summary, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -150,14 +152,14 @@ func TestImportMbox_NoAttachmentsStillRecordsAttachmentMetadata(t *testing.T) {
 	require.Equal(int64(1), summary.MessagesAdded, "MessagesAdded")
 
 	var attachmentRows int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM attachments`).Scan(&attachmentRows), "count attachments")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments`).Scan(&attachmentRows), "count attachments")
 	require.Equal(0, attachmentRows, "attachmentRows")
 
 	var (
 		hasAttachments  bool
 		attachmentCount int
 	)
-	require.NoError(st.DB().QueryRow(`SELECT has_attachments, attachment_count FROM messages WHERE subject = 'Hello' LIMIT 1`).Scan(&hasAttachments, &attachmentCount), "select message attachment metadata")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT has_attachments, attachment_count FROM messages WHERE subject = 'Hello' LIMIT 1`).Scan(&hasAttachments, &attachmentCount), "select message attachment metadata")
 	require.True(hasAttachments, "has_attachments")
 	require.Equal(1, attachmentCount, "attachment_count")
 }
@@ -165,6 +167,7 @@ func TestImportMbox_NoAttachmentsStillRecordsAttachmentMetadata(t *testing.T) {
 // TestImportMboxPersistsListID catches an offline MIME import that parses the
 // List-Id header but drops it before the shared message persistence boundary.
 func TestImportMboxPersistsListID(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	assert := assert.New(t)
 	require := require.New(t)
 	tmp := t.TempDir()
@@ -181,7 +184,7 @@ func TestImportMboxPersistsListID(t *testing.T) {
 	mboxData := "From alice@example.com Mon Jan 1 12:00:00 2024\n" + string(raw)
 	require.NoError(os.WriteFile(mboxPath, []byte(mboxData), 0600), "write mbox")
 
-	_, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	_, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType: "mbox",
 		Identifier: "owner@example.com",
 		NoResume:   true,
@@ -189,13 +192,14 @@ func TestImportMboxPersistsListID(t *testing.T) {
 	require.NoError(err, "import mbox")
 
 	var listID sql.NullString
-	require.NoError(st.DB().QueryRow(`SELECT list_id FROM messages`).Scan(&listID),
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT list_id FROM messages`).Scan(&listID),
 		"read imported list ID")
 	assert.True(listID.Valid, "list ID should be present")
 	assert.Equal("<announce.example.org>", listID.String, "list ID")
 }
 
 func TestImportMbox_IsIdempotentAcrossPathChanges(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -242,7 +246,7 @@ func TestImportMbox_IsIdempotentAcrossPathChanges(t *testing.T) {
 	require.NoError(os.WriteFile(mboxPath1, []byte(mboxData.String()), 0600), "write mbox1")
 	require.NoError(os.WriteFile(mboxPath2, []byte(mboxData.String()), 0600), "write mbox2")
 
-	_, err := ImportMbox(context.Background(), st, mboxPath1, MboxImportOptions{
+	_, err := ImportMbox(t.Context(), st, mboxPath1, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -251,10 +255,10 @@ func TestImportMbox_IsIdempotentAcrossPathChanges(t *testing.T) {
 	require.NoError(err, "ImportMbox")
 
 	var messageCount int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
 	require.Equal(2, messageCount, "messageCount")
 
-	_, err = ImportMbox(context.Background(), st, mboxPath2, MboxImportOptions{
+	_, err = ImportMbox(t.Context(), st, mboxPath2, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -262,7 +266,7 @@ func TestImportMbox_IsIdempotentAcrossPathChanges(t *testing.T) {
 	})
 	require.NoError(err, "ImportMbox (second path)")
 
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages (second path)")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages (second path)")
 	require.Equal(2, messageCount, "messageCount (second path)")
 }
 
@@ -273,6 +277,7 @@ func TestParseFromLineDate_NamedTimezone(t *testing.T) {
 }
 
 func TestImportMbox_InvalidInput_ReturnsErrorAndFailsSync(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -282,7 +287,7 @@ func TestImportMbox_InvalidInput_ReturnsErrorAndFailsSync(t *testing.T) {
 	mboxPath := filepath.Join(tmp, "not-mbox.txt")
 	require.NoError(os.WriteFile(mboxPath, []byte("this is not an mbox file\n"), 0600), "write file")
 
-	_, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	_, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -291,11 +296,12 @@ func TestImportMbox_InvalidInput_ReturnsErrorAndFailsSync(t *testing.T) {
 	require.Error(err)
 
 	var status string
-	require.NoError(st.DB().QueryRow(`SELECT status FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status), "select status")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status), "select status")
 	require.Equal(store.SyncStatusFailed, status)
 }
 
 func TestImportMbox_IdenticalRawMessagesAreImportedSeparately(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -326,7 +332,7 @@ func TestImportMbox_IdenticalRawMessagesAreImportedSeparately(t *testing.T) {
 	mboxPath := filepath.Join(tmp, "dup.mbox")
 	require.NoError(os.WriteFile(mboxPath, []byte(mboxData.String()), 0600), "write mbox")
 
-	summary, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	summary, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -339,11 +345,12 @@ func TestImportMbox_IdenticalRawMessagesAreImportedSeparately(t *testing.T) {
 	require.Equal(int64(0), summary.Errors, "Errors")
 
 	var messageCount int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
 	require.Equal(2, messageCount, "messageCount")
 }
 
 func TestImportMbox_RerunRepairsMissingRawInsteadOfSkipping(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -372,7 +379,7 @@ func TestImportMbox_RerunRepairsMissingRawInsteadOfSkipping(t *testing.T) {
 	// Create a partial ingest: message row exists, but no message_raw row.
 	src, err := st.GetOrCreateSource("mbox", "me@example.com")
 	require.NoError(err, "get/create source")
-	convID, err := st.EnsureConversation(src.ID, "thread1", "Thread")
+	convID, err := st.EnsureConversation(t.Context(), src.ID, "thread1", "Thread")
 	require.NoError(err, "ensure conversation")
 
 	sum := sha256.Sum256(raw)
@@ -387,7 +394,7 @@ func TestImportMbox_RerunRepairsMissingRawInsteadOfSkipping(t *testing.T) {
 	})
 	require.NoError(err, "upsert message")
 
-	summary, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	summary, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -397,7 +404,7 @@ func TestImportMbox_RerunRepairsMissingRawInsteadOfSkipping(t *testing.T) {
 	require.Equal(int64(0), summary.MessagesSkipped, "MessagesSkipped")
 
 	var rawCount int
-	require.NoError(st.DB().QueryRow(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), `
 		SELECT COUNT(*)
 		FROM message_raw mr
 		JOIN messages m ON m.id = mr.message_id
@@ -407,6 +414,7 @@ func TestImportMbox_RerunRepairsMissingRawInsteadOfSkipping(t *testing.T) {
 }
 
 func TestImportMbox_RerunRetriesAttachmentsAfterStoreFailure(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -439,7 +447,7 @@ func TestImportMbox_RerunRetriesAttachmentsAfterStoreFailure(t *testing.T) {
 
 	// Attachment storage is best-effort: the ingest succeeds even
 	// though the attachment file couldn't be written to disk.
-	_, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	_, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -450,19 +458,20 @@ func TestImportMbox_RerunRetriesAttachmentsAfterStoreFailure(t *testing.T) {
 
 	// Message + raw MIME are committed inside the atomic transaction.
 	var rawCount int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM message_raw`).Scan(&rawCount), "count message_raw")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM message_raw`).Scan(&rawCount), "count message_raw")
 	require.Equal(1, rawCount, "rawCount")
 
 	// Attachment was not stored because disk write failed, but the
 	// attachment count correction updated the metadata to reflect this.
 	var attachmentCount int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM attachments`).Scan(&attachmentCount), "count attachments")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM attachments`).Scan(&attachmentCount), "count attachments")
 	require.Equal(0, attachmentCount, "attachmentCount")
 
 	// Metadata was corrected to reflect zero stored attachments.
 	var hasAttachments bool
 	var metaCount int
-	require.NoError(st.DB().QueryRow(
+	require.NoError(st.DB().QueryRowContext(
+		t.Context(),
 		`SELECT has_attachments, attachment_count FROM messages LIMIT 1`,
 	).Scan(&hasAttachments, &metaCount), "select attachment metadata")
 	require.False(hasAttachments, "has_attachments should be false")
@@ -473,7 +482,7 @@ func TestImportMbox_RerunRetriesAttachmentsAfterStoreFailure(t *testing.T) {
 	require.NoError(os.Remove(attachmentsDir), "remove attachments file")
 	require.NoError(os.MkdirAll(attachmentsDir, 0700), "mkdir attachments dir")
 
-	summary, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	summary, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -485,13 +494,14 @@ func TestImportMbox_RerunRetriesAttachmentsAfterStoreFailure(t *testing.T) {
 }
 
 func TestImportMbox_ErrorsCauseSyncFailed(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
 	tmp := t.TempDir()
 
 	dbPath := filepath.Join(tmp, "msgvault.db")
 	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
-	_, err := st.DB().Exec(`DROP TABLE messages`)
+	_, err := st.DB().ExecContext(t.Context(), `DROP TABLE messages`)
 	require.NoError(err, "drop messages")
 
 	raw := email.NewMessage().
@@ -513,7 +523,7 @@ func TestImportMbox_ErrorsCauseSyncFailed(t *testing.T) {
 	mboxPath := filepath.Join(tmp, "export.mbox")
 	require.NoError(os.WriteFile(mboxPath, []byte(mboxData.String()), 0600), "write mbox")
 
-	summary, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	summary, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -526,12 +536,13 @@ func TestImportMbox_ErrorsCauseSyncFailed(t *testing.T) {
 		status      string
 		errorsCount int
 	)
-	require.NoError(st.DB().QueryRow(`SELECT status, errors_count FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &errorsCount), "select sync")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status, errors_count FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &errorsCount), "select sync")
 	require.Equal(store.SyncStatusFailed, status)
 	assert.NotZero(errorsCount, "errorsCount")
 }
 
 func TestImportMbox_SoftErrorsDoNotFailSync(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	assert := assert.New(t)
 	tmp := t.TempDir()
@@ -557,7 +568,7 @@ func TestImportMbox_SoftErrorsDoNotFailSync(t *testing.T) {
 	mboxPath := filepath.Join(tmp, "export.mbox")
 	require.NoError(os.WriteFile(mboxPath, []byte(mboxData), 0600), "write mbox")
 
-	summary, err := ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	summary, err := ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -572,12 +583,13 @@ func TestImportMbox_SoftErrorsDoNotFailSync(t *testing.T) {
 		status      string
 		errorsCount int
 	)
-	require.NoError(st.DB().QueryRow(`SELECT status, errors_count FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &errorsCount), "select sync")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status, errors_count FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &errorsCount), "select sync")
 	require.Equal(store.SyncStatusCompleted, status)
 	assert.NotZero(errorsCount, "errorsCount")
 }
 
 func TestImportMbox_CheckpointDoesNotAdvancePastFailedIngest(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -633,7 +645,7 @@ func TestImportMbox_CheckpointDoesNotAdvancePastFailedIngest(t *testing.T) {
 	wantOffset := r.NextFromOffset()
 	_ = f.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
 	calls := 0
@@ -667,7 +679,7 @@ func TestImportMbox_CheckpointDoesNotAdvancePastFailedIngest(t *testing.T) {
 		status string
 		cursor string
 	)
-	require.NoError(st.DB().QueryRow(`SELECT status, cursor_before FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &cursor), "select sync")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status, cursor_before FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &cursor), "select sync")
 	require.Equal(store.SyncStatusRunning, status)
 
 	var cp mboxCheckpoint
@@ -675,11 +687,11 @@ func TestImportMbox_CheckpointDoesNotAdvancePastFailedIngest(t *testing.T) {
 	require.Equal(wantOffset, cp.Offset, "checkpoint offset")
 
 	var messageCount int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
 	require.Equal(2, messageCount, "messageCount")
 
 	// Resume the interrupted sync and ensure already-ingested messages are not duplicated.
-	_, err = ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+	_, err = ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           false,
@@ -687,17 +699,18 @@ func TestImportMbox_CheckpointDoesNotAdvancePastFailedIngest(t *testing.T) {
 	})
 	require.NoError(err, "ImportMbox (resume)")
 
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages (resume)")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages (resume)")
 	require.Equal(4, messageCount, "messageCount (resume)")
 
 	for _, subj := range []string{"msg1", "msg2", "msg3", "msg4"} {
 		var c int
-		require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages WHERE subject = ?`, subj).Scan(&c), "count subject %q", subj)
+		require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages WHERE subject = ?`, subj).Scan(&c), "count subject %q", subj)
 		assert.Equal(t, 1, c, "subject %q count", subj)
 	}
 }
 
 func TestImportMbox_InvalidResumeOffsetBeyondEOF_FailsSync(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -721,7 +734,7 @@ func TestImportMbox_InvalidResumeOffsetBeyondEOF_FailsSync(t *testing.T) {
 	require.NoError(saveMboxCheckpoint(st, syncID, absPath, fi.Size()+1, 0, &cp), "save checkpoint")
 	require.NoError(st.FailSync(syncID, "worker stopped"), "fail prior sync")
 
-	_, err = ImportMbox(context.Background(), st, absPath, MboxImportOptions{
+	_, err = ImportMbox(t.Context(), st, absPath, MboxImportOptions{
 		SourceType: "mbox",
 		Identifier: "me@example.com",
 		NoResume:   false,
@@ -730,15 +743,16 @@ func TestImportMbox_InvalidResumeOffsetBeyondEOF_FailsSync(t *testing.T) {
 	require.ErrorContains(err, "beyond end of file")
 
 	var status string
-	require.NoError(st.DB().QueryRow(`SELECT status FROM sync_runs WHERE id = ?`, syncID).Scan(&status), "select sync")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status FROM sync_runs WHERE id = ?`, syncID).Scan(&status), "select sync")
 	require.Equal(store.SyncStatusFailed, status)
 
 	var messageCount int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
 	require.Equal(0, messageCount, "messageCount")
 }
 
 func TestImportMbox_RejectsLiveSyncOwner(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "msgvault.db")
@@ -761,6 +775,7 @@ func TestImportMbox_RejectsLiveSyncOwner(t *testing.T) {
 }
 
 func TestImportMbox_ResumesCheckpointAfterWorkerExit(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	assert := assert.New(t)
 	require := require.New(t)
 	tmp := t.TempDir()
@@ -791,11 +806,9 @@ func TestImportMbox_ResumesCheckpointAfterWorkerExit(t *testing.T) {
 	assert.Equal(int64(len(mboxData)), summary.ResumedOffset)
 }
 
-func TestImportMbox_HardErrorsStopsMultiFileLoop(t *testing.T) {
+func TestImportMbox_HardIngestErrorLeavesNoMessages(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
-	// Verify that when ImportMbox reports HardErrors, the caller's
-	// multi-file loop should break. This simulates the control flow
-	// in import_mbox.go where HardErrors now stops subsequent files.
 	tmp := t.TempDir()
 
 	dbPath := filepath.Join(tmp, "msgvault.db")
@@ -805,11 +818,6 @@ func TestImportMbox_HardErrorsStopsMultiFileLoop(t *testing.T) {
 		From("Alice <alice@example.com>").
 		Subject("File1").
 		Body("body1\n").
-		Bytes()
-	raw2 := email.NewMessage().
-		From("Alice <alice@example.com>").
-		Subject("File2").
-		Body("body2\n").
 		Bytes()
 
 	writeMbox := func(name string, raw []byte) string {
@@ -825,14 +833,13 @@ func TestImportMbox_HardErrorsStopsMultiFileLoop(t *testing.T) {
 	}
 
 	path1 := writeMbox("file1.mbox", raw1)
-	path2 := writeMbox("file2.mbox", raw2)
 
 	// Inject ingest failure to cause HardErrors on file1.
 	failIngest := func(_ context.Context, _ *store.Store, _ int64, _ string, _ string, _ []int64, _ string, _ string, _ *mbox.Message, _ *slog.Logger) error {
 		return errors.New("injected failure")
 	}
 
-	sum1, err := ImportMbox(context.Background(), st, path1, MboxImportOptions{
+	sum1, err := ImportMbox(t.Context(), st, path1, MboxImportOptions{
 		SourceType:         "mbox",
 		Identifier:         "me@example.com",
 		NoResume:           true,
@@ -842,15 +849,9 @@ func TestImportMbox_HardErrorsStopsMultiFileLoop(t *testing.T) {
 	require.NoError(err, "ImportMbox file1")
 	require.True(sum1.HardErrors, "expected HardErrors=true for file1")
 
-	// Simulate the multi-file loop: if HardErrors, skip file2.
-	// This is the behavior we're testing: the loop breaks.
-	// Verify file2 was NOT processed.
 	var msgCount int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&msgCount), "count messages")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT COUNT(*) FROM messages`).Scan(&msgCount), "count messages")
 	require.Equal(0, msgCount, "msgCount (file1 failed)")
-
-	// File2 should not have been imported.
-	_ = path2 // would be processed if loop didn't break
 }
 
 type cancelOnLogMessageHandler struct {
@@ -890,6 +891,7 @@ func (h *cancelOnLogMessageHandler) WithGroup(name string) slog.Handler {
 }
 
 func TestImportMbox_CheckpointAdvancesPastReaderErrors(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require := require.New(t)
 	tmp := t.TempDir()
 
@@ -921,7 +923,7 @@ func TestImportMbox_CheckpointAdvancesPastReaderErrors(t *testing.T) {
 	wantOffset := r.NextFromOffset()
 	_ = f.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
 	log := slog.New(&cancelOnLogMessageHandler{
@@ -947,7 +949,7 @@ func TestImportMbox_CheckpointAdvancesPastReaderErrors(t *testing.T) {
 		status string
 		cursor string
 	)
-	require.NoError(st.DB().QueryRow(`SELECT status, cursor_before FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &cursor), "select sync")
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT status, cursor_before FROM sync_runs ORDER BY started_at DESC LIMIT 1`).Scan(&status, &cursor), "select sync")
 	require.Equal(store.SyncStatusRunning, status)
 
 	var cp mboxCheckpoint

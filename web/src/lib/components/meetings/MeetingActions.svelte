@@ -1,25 +1,29 @@
 <script lang="ts">
-  import { Button, Card, EmptyState } from '@kenn-io/kit-ui';
+  import { Disclosure, Button, Card, EmptyState } from '@kenn-io/kit-ui';
   import { onDestroy, untrack } from 'svelte';
 
   import type { APIClient } from '../../api/client';
   import type {
     ActionCoverage,
-    ActionRow,
     ActionsPage,
     MeetingActionsRequest,
     MeetingRef,
   } from '../../api/generated/models';
   import { createMeetingsAPI } from '../../meetings/api';
+  import MeetingActionRow from './MeetingActionRow.svelte';
   import { MeetingActionsController } from '../../meetings/controller.svelte';
 
   let {
     client,
+    compact = false,
+    showHeading = true,
     request = undefined,
     evidence = undefined,
     onOpenMeeting = undefined,
   }: {
     client: APIClient;
+    compact?: boolean;
+    showHeading?: boolean;
     request?: MeetingActionsRequest;
     evidence?: ActionsPage;
     onOpenMeeting?: (meeting: MeetingRef) => void;
@@ -55,22 +59,31 @@
   }
 
   function coverageSummary(coverage: ActionCoverage): string {
-    return `Coverage: ${coverage.available} available · ${coverage.partial} partial · ${coverage.unsupported} unsupported · ${coverage.unavailable} unavailable`;
+    return `Action item records by meeting: ${coverage.available} complete · ${coverage.partial} partial · ${coverage.unsupported} not supported · ${coverage.unavailable} unavailable`;
   }
 
-  function assignee(row: ActionRow): string {
-    const { assignee_name: name, assignee_email: email } = row.action;
-    if (name && email) return `${name} · ${email}`;
-    return name || email || 'Unassigned';
-  }
-
-  function openMeeting(event: MouseEvent, meeting: MeetingRef): void {
-    if (!onOpenMeeting) return;
-    event.preventDefault();
-    onOpenMeeting(meeting);
-  }
 </script>
 
+{#if compact}
+  <section class="compact-actions" aria-label="Action items">
+    {#if showHeading}<h3>Action items</h3>{/if}
+    {#if controller.loading}<p role="status">Loading action items…</p>{/if}
+    {#if controller.error}
+      <p role="alert">{controller.error.message}</p>
+      {#if controller.error.recovery === 'retry' || controller.error.recovery === 'reload'}<Button label="Retry action items" onclick={retry} />{/if}
+    {/if}
+    {#if displayedPage}
+      {#if displayedPage.rows.length === 0}<p>{emptyState(displayedPage.coverage)}</p>{/if}
+      <ul>
+        {#each displayedPage.rows as row (`${row.meeting.message_id}:${row.action.locator}`)}
+          <MeetingActionRow {row} compact {onOpenMeeting} />
+        {/each}
+      </ul>
+      <Disclosure variant="plain">{#snippet summary()}Evidence coverage{/snippet}<p>{coverageSummary(displayedPage.coverage)}</p></Disclosure>
+      {#if request && displayedPage.next_cursor && !controller.error}<Button label="Show more" disabled={controller.loading} onclick={() => void controller.loadMore()} />{/if}
+    {/if}
+  </section>
+{:else}
 <section class="meeting-actions" aria-labelledby={headingID}>
   <Card level="inset" padding="sm">
     <header class="actions-heading">
@@ -105,22 +118,11 @@
         </div>
       </div>
       {#if displayedPage.rows.length === 0}
-        <EmptyState title={emptyState(displayedPage.coverage)} description="Source evidence is shown without local completion state." />
+        <EmptyState title={emptyState(displayedPage.coverage)} description="Action item status comes from the meeting record." />
       {:else}
         <ol>
           {#each displayedPage.rows as row (`${row.meeting.message_id}:${row.action.locator}`)}
-            <li>
-              <strong>{row.action.title}</strong>
-              {#if row.action.description}<p>{row.action.description}</p>{/if}
-              <dl>
-                <div><dt>Source status</dt><dd>{row.action.source_status != null && row.action.source_status !== row.action.status ? `${row.action.status} (source: ${row.action.source_status})` : row.action.status}</dd></div>
-                <div><dt>Assignee</dt><dd>{assignee(row)}</dd></div>
-                {#if row.action.due_date}<div><dt>Due</dt><dd>{row.action.due_date}</dd></div>{/if}
-              </dl>
-              <a href={row.meeting.archive_path} onclick={(event) => openMeeting(event, row.meeting)}>
-                Open archived meeting
-              </a>
-            </li>
+            <MeetingActionRow {row} {onOpenMeeting} />
           {/each}
         </ol>
       {/if}
@@ -134,13 +136,17 @@
   </Card>
 </section>
 
+{/if}
+
 <style>
+  .compact-actions { display: grid; gap: var(--space-3); padding: var(--pane-pad-y) var(--pane-pad-x); border-top: 1px solid var(--border-muted); }
+  .compact-actions h3 { font-size: var(--font-size-sm); }
+  .compact-actions ul { display: grid; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
+  .compact-actions :global(.kit-disclosure) { font-size: var(--font-size-xs); color: var(--text-muted); }
   .meeting-actions { min-width: 0; }
 
   h3,
-  p,
-  dl,
-  dd {
+  p {
     margin: 0;
   }
 
@@ -188,35 +194,6 @@
   li {
     color: var(--text-secondary);
     font-size: var(--font-size-sm);
-  }
-  ol > li { padding: var(--space-4) 0; border-top: 1px solid var(--border-muted); }
-  ol > li:first-child { border-top: 0; }
-
-  li > * + * {
-    margin-top: var(--space-2);
-  }
-
-  dl {
-    display: flex;
-    flex-wrap: wrap;
-    gap: var(--space-2) var(--space-4);
-  }
-
-  dl div {
-    display: inline-flex;
-    gap: var(--space-1);
-  }
-
-  dt::after {
-    content: ':';
-  }
-
-  dd {
-    color: var(--text-primary);
-  }
-
-  a {
-    color: var(--link-ink);
   }
   .showing { margin-top: var(--space-3); color: var(--text-muted); font-size: var(--font-size-xs); }
 </style>

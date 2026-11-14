@@ -1,7 +1,6 @@
 package beeper
 
 import (
-	"context"
 	"slices"
 	"strings"
 	"testing"
@@ -11,45 +10,44 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestImportRetriesTransientMessageListFailure(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
+// serial: changes fetchRetryBackoff.
+func TestImportMessageListRetries(t *testing.T) {
 	oldBackoff := fetchRetryBackoff
 	fetchRetryBackoff = []time.Duration{0, 0}
 	t.Cleanup(func() { fetchRetryBackoff = oldBackoff })
 
-	base := time.Now().Add(-30 * 24 * time.Hour).UTC().Truncate(time.Second)
-	f := newFakeBeeper(t)
-	f.addChat(budgetTestChat("!flaky:beeper.local", 5, base))
-	f.failMessageListTimes("!flaky:beeper.local", 2)
-	imp, _, done := newTestImporter(t, f)
-	defer done()
+	for _, test := range []struct {
+		name     string
+		failures int
+	}{
+		{name: "transient failures absorbed", failures: 2},
+		{name: "retries exhausted", failures: 3},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			base := time.Now().Add(-30 * 24 * time.Hour).UTC().Truncate(time.Second)
+			f := newFakeBeeper(t)
+			f.addChat(budgetTestChat("!flaky:beeper.local", 5, base))
+			f.failMessageListTimes("!flaky:beeper.local", test.failures)
+			imp, _, done := newTestImporter(t, f)
+			defer done()
 
-	sum, err := imp.Import(context.Background(), ImportOptions{AccountID: "signal"})
-	require.NoError(err, "two transient failures are absorbed by retries")
-	assert.Zero(sum.FetchErrors)
-	assert.Equal(5, countBeeperMessages(t, imp))
+			sum, err := imp.Import(t.Context(), ImportOptions{AccountID: "signal"})
+			if test.failures == 2 {
+				require.NoError(err, "two transient failures are absorbed by retries")
+				assert.Zero(sum.FetchErrors)
+				assert.Equal(5, countBeeperMessages(t, imp))
+			} else {
+				var partial *PartialSyncError
+				require.ErrorAs(err, &partial)
+				assert.EqualValues(1, sum.FetchErrors)
+			}
+		})
+	}
 }
 
-func TestImportGivesUpAfterRetries(t *testing.T) {
-	require := require.New(t)
-	oldBackoff := fetchRetryBackoff
-	fetchRetryBackoff = []time.Duration{0, 0}
-	t.Cleanup(func() { fetchRetryBackoff = oldBackoff })
-
-	base := time.Now().Add(-30 * 24 * time.Hour).UTC().Truncate(time.Second)
-	f := newFakeBeeper(t)
-	f.addChat(budgetTestChat("!flaky:beeper.local", 5, base))
-	f.failMessageListTimes("!flaky:beeper.local", 3)
-	imp, _, done := newTestImporter(t, f)
-	defer done()
-
-	sum, err := imp.Import(context.Background(), ImportOptions{AccountID: "signal"})
-	var partial *PartialSyncError
-	require.ErrorAs(err, &partial)
-	assert.EqualValues(t, 1, sum.FetchErrors)
-}
-
+// serial: changes fetchRetryBackoff.
 func TestTailProbeFailureRemainsDueAndCountsAsFetchError(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -62,7 +60,7 @@ func TestTailProbeFailureRemainsDueAndCountsAsFetchError(t *testing.T) {
 	f.addChat(budgetTestChat(chatID, 2, time.Now().Add(-60*24*time.Hour)))
 	imp, st, done := newTestImporter(t, f)
 	defer done()
-	_, err := imp.Import(context.Background(), ImportOptions{AccountID: "signal"})
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: "signal"})
 	require.NoError(err)
 	src, err := st.GetOrCreateSource(sourceTypeBeeper, "signal")
 	require.NoError(err)
@@ -74,11 +72,11 @@ func TestTailProbeFailureRemainsDueAndCountsAsFetchError(t *testing.T) {
 	state.LastTailScan = previousScan
 	blob, err := state.Marshal()
 	require.NoError(err)
-	_, err = st.DB().Exec(st.Rebind(`UPDATE sync_runs SET cursor_after = ? WHERE id = ?`), blob, run.ID)
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE sync_runs SET cursor_after = ? WHERE id = ?`), blob, run.ID)
 	require.NoError(err)
 
 	f.failMessageListTimes(chatID, len(fetchRetryBackoff)+1)
-	sum, err := imp.Import(context.Background(), ImportOptions{AccountID: "signal"})
+	sum, err := imp.Import(t.Context(), ImportOptions{AccountID: "signal"})
 	var partial *PartialSyncError
 	require.ErrorAs(err, &partial)
 	assert.EqualValues(1, sum.FetchErrors)
@@ -91,7 +89,7 @@ func TestTailProbeFailureRemainsDueAndCountsAsFetchError(t *testing.T) {
 		"a failed probe is not marked complete for this scan")
 
 	f.resetRequests()
-	_, err = imp.Import(context.Background(), ImportOptions{AccountID: "signal"})
+	_, err = imp.Import(t.Context(), ImportOptions{AccountID: "signal"})
 	require.NoError(err)
 	assert.True(slices.ContainsFunc(f.requests(), func(req string) bool {
 		return strings.Contains(req, "/v1/chats/"+chatID+"/messages") && strings.Contains(req, "direction=before")
@@ -99,6 +97,7 @@ func TestTailProbeFailureRemainsDueAndCountsAsFetchError(t *testing.T) {
 }
 
 func TestListMessagesPageDoesNotRetryPermanentErrors(t *testing.T) {
+	t.Parallel()
 	f := newFakeBeeper(t)
 	chat := budgetTestChat("!bad-request:beeper.local", 2, time.Now().Add(-48*time.Hour))
 	f.addChat(chat)

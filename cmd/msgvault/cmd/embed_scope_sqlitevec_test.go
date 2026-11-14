@@ -27,7 +27,7 @@ import (
 // fakeEmbeddingsServer answers OpenAI-compatible /embeddings requests with
 // one deterministic dim-4 vector per input, recording how many inputs it was
 // asked to embed.
-func fakeEmbeddingsServer(t *testing.T, embedded *int) *httptest.Server {
+func fakeEmbeddingsServer(t *testing.T, embedded *int, dimensions ...int) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -38,19 +38,11 @@ func fakeEmbeddingsServer(t *testing.T, embedded *int) *httptest.Server {
 			return
 		}
 		*embedded += len(req.Input)
-		type item struct {
-			Embedding []float32 `json:"embedding"`
-			Index     int       `json:"index"`
+		dimension := 4
+		if len(dimensions) > 0 {
+			dimension = dimensions[0]
 		}
-		payload := struct {
-			Data  []item `json:"data"`
-			Model string `json:"model"`
-		}{Model: "test-model"}
-		for i := range req.Input {
-			payload.Data = append(payload.Data, item{Embedding: []float32{1, 0, 0, 0}, Index: i})
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(payload)
+		_ = writeFakeEmbeddingResponse(w, len(req.Input), dimension)
 	}))
 	t.Cleanup(srv.Close)
 	return srv
@@ -61,7 +53,7 @@ func fakeEmbeddingsServer(t *testing.T, embedded *int) *httptest.Server {
 func seedTwoAccountMainDB(t *testing.T, dataDir string) {
 	t.Helper()
 	s := testutil.NewSQLiteTestStoreAt(t, filepath.Join(dataDir, "msgvault.db"))
-	_, err := s.DB().Exec(`
+	_, err := s.DB().ExecContext(t.Context(), `
 INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'a@example.com'), (2, 'gmail', 'b@example.com');
 INSERT INTO conversations (id, source_id, conversation_type) VALUES (1, 1, 'email_thread'), (2, 2, 'email_thread');
 INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, subject) VALUES
@@ -77,7 +69,7 @@ func embedGenByID(t *testing.T, dataDir string) map[int64]sql.NullInt64 {
 	db, err := sql.Open("sqlite3", filepath.Join(dataDir, "msgvault.db"))
 	require.NoError(t, err, "open main db handle")
 	defer func() { require.NoError(t, db.Close()) }()
-	rows, err := db.Query(`SELECT id, embed_gen FROM messages ORDER BY id`)
+	rows, err := db.QueryContext(t.Context(), `SELECT id, embed_gen FROM messages ORDER BY id`)
 	require.NoError(t, err, "read embed_gen")
 	defer func() { _ = rows.Close() }()
 	out := map[int64]sql.NullInt64{}
@@ -287,7 +279,7 @@ func TestRunEmbedLivePersonGateStopsLaterBatchesAfterConfigDeletion(t *testing.T
 	// the startup configuration while the live person policy remains absent.
 	mainStore, err = store.Open(filepath.Join(dataDir, "msgvault.db"))
 	require.NoError(err)
-	_, err = mainStore.DB().Exec(`
+	_, err = mainStore.DB().ExecContext(t.Context(), `
 		INSERT INTO messages
 			(id, conversation_id, source_id, source_message_id, message_type, subject)
 		VALUES (3, 1, 1, 'post-removal-message', 'email', 'post-removal message');
@@ -327,7 +319,7 @@ func TestRunEmbed_AccountScopedRebuildRefusesEmptyScope(t *testing.T) {
 	seedTwoAccountMainDB(t, dataDir)
 	s, err := store.Open(filepath.Join(dataDir, "msgvault.db"))
 	require.NoError(err, "open main db")
-	_, err = s.DB().Exec(`INSERT INTO sources (id, source_type, identifier) VALUES (3, 'gmail', 'c@example.com')`)
+	_, err = s.DB().ExecContext(t.Context(), `INSERT INTO sources (id, source_type, identifier) VALUES (3, 'gmail', 'c@example.com')`)
 	require.NoError(err, "seed empty account")
 	require.NoError(s.Close())
 

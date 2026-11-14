@@ -33,6 +33,13 @@ public site has three levels; keep their responsibilities distinct.
   links. Prefer relative `.md` links between docs; use `/docs/.../` in website
   HTML and `/docs/assets/static/` or `/docs/assets/generated/` for docs media.
 
+For a command that has not shipped, put `Not in the latest release yet` before
+its README block. For installer output, print `Not in the latest release yet`
+immediately before the command and put `# Not in the latest release yet` before
+the output in the source. See the
+[release-commands guide](https://github.com/kenn-io/actions/tree/main/release-commands#mark-unreleased-commands)
+for details.
+
 ## Living architecture and historical records
 
 Architecture pages describe the system now. Use sections for purpose, current
@@ -102,7 +109,7 @@ it does not authorize reuse in ordinary tests.
 
 Refresh the Web UI images with `make docs-web-screenshots`. The script imports
 the pinned fixture into a temporary archive, builds and starts its own daemon,
-and captures Everything and Relationships at 1920 × 1080. It keeps the normal
+and captures Messages and Relationships at 1920 × 1080. It keeps the normal
 build toolchain and caches. Set `MSGVAULT_DOCS_SCREENSHOT_OUTPUT_DIR` to retain
 captures outside the hydrated asset directory while reviewing them.
 

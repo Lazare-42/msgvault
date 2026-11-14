@@ -47,11 +47,6 @@ type Dialect interface {
 	// the Time aggregate view.
 	TimeTruncExpression(column string, granularity string) string
 
-	// FTSSearchExpression returns the SQL boolean expression (with a ?
-	// placeholder for the search term) to use in a WHERE clause for
-	// full-text search. SQLite: messages_fts MATCH; PostgreSQL: tsvector @@.
-	FTSSearchExpression() string
-
 	// HasFTSTableSQL returns SQL to probe whether the FTS index exists.
 	// Returns a single-row, single-column integer: 1 if present, 0 if absent.
 	HasFTSTableSQL() string
@@ -76,7 +71,7 @@ type Dialect interface {
 	FTSLivenessSQL() string
 
 	// FTSJoin returns a JOIN clause that must be added to the FROM clause
-	// when using FTSSearchExpression. Empty string if no join is needed
+	// for full-text search. Empty string if no join is needed
 	// (PostgreSQL has the tsvector column on messages directly).
 	FTSJoin() string
 
@@ -95,11 +90,6 @@ type Dialect interface {
 	// needed. PostgreSQL uses messages.indexing_version; SQLite's FTS5 table
 	// has a durable body column and needs no separate version watermark.
 	FTSBodySearchReadinessSQL() string
-
-	// SanitizeFTSQuery converts a raw user search string to a form safe to
-	// pass to FTSSearchExpression. Returns "" if the result is empty after
-	// sanitization (caller should treat as no-match).
-	SanitizeFTSQuery(query string) string
 
 	// BoolTrueExpr returns a SQL boolean expression that is true when col
 	// holds a "true" value. SQLite stores booleans as 0/1 INTEGER so we
@@ -121,6 +111,9 @@ type Dialect interface {
 	DateComparison(column, operator string) string
 	DateOrderExpression(column string) string
 
+	// SourceTimelineColumn returns the source expression for date-sorted listings.
+	SourceTimelineColumn() string
+
 	// messageBodyContextBackend selects the backend-native highlighter used to
 	// extract exact context for body-index hits.
 	messageBodyContextBackend() messageBodyContextBackend
@@ -128,6 +121,8 @@ type Dialect interface {
 
 // SQLiteQueryDialect implements Dialect for SQLite.
 type SQLiteQueryDialect struct{}
+
+func (SQLiteQueryDialect) SourceTimelineColumn() string { return "coalesce(m.source_id, m.source_id)" }
 
 func (SQLiteQueryDialect) Rebind(query string) string { return query }
 
@@ -155,15 +150,11 @@ func (SQLiteQueryDialect) TimeTruncExpression(column string, granularity string)
 		return fmt.Sprintf("strftime('%%Y', %s)", column)
 	case timeGranularityMonth:
 		return fmt.Sprintf("strftime('%%Y-%%m', %s)", column)
-	case "day":
+	case timeGranularityDay:
 		return fmt.Sprintf("strftime('%%Y-%%m-%%d', %s)", column)
 	default:
 		return fmt.Sprintf("strftime('%%Y-%%m', %s)", column)
 	}
-}
-
-func (SQLiteQueryDialect) FTSSearchExpression() string {
-	return "messages_fts MATCH ?"
 }
 
 func (SQLiteQueryDialect) HasFTSTableSQL() string {
@@ -202,27 +193,10 @@ func (d SQLiteQueryDialect) BuildFTSBodyTerm(terms []string) (expr string, arg s
 
 func (SQLiteQueryDialect) FTSBodySearchReadinessSQL() string { return "" }
 
-// SanitizeFTSQuery strips FTS5 metacharacters from a single query string
-// and wraps it in quotes for literal phrase interpretation with prefix match.
-func (SQLiteQueryDialect) SanitizeFTSQuery(query string) string {
-	var b strings.Builder
-	for _, r := range query {
-		switch r {
-		case '"', '*', ':', '-', '(', ')', '.':
-			continue
-		default:
-			b.WriteRune(r)
-		}
-	}
-	clean := strings.TrimSpace(b.String())
-	if clean == "" {
-		return ""
-	}
-	return `"` + clean + `"*`
-}
-
 // PostgreSQLQueryDialect implements Dialect for PostgreSQL.
 type PostgreSQLQueryDialect struct{}
+
+func (PostgreSQLQueryDialect) SourceTimelineColumn() string { return "m.source_id" }
 
 // Rebind converts ? placeholders to $1, $2, ... for PostgreSQL.
 // Delegates to sqldialect so store.PostgreSQLDialect.Rebind stays in
@@ -256,22 +230,11 @@ func (PostgreSQLQueryDialect) TimeTruncExpression(column string, granularity str
 		return fmt.Sprintf("to_char(%s AT TIME ZONE 'UTC', 'YYYY')", column)
 	case timeGranularityMonth:
 		return fmt.Sprintf("to_char(%s AT TIME ZONE 'UTC', 'YYYY-MM')", column)
-	case "day":
+	case timeGranularityDay:
 		return fmt.Sprintf("to_char(%s AT TIME ZONE 'UTC', 'YYYY-MM-DD')", column)
 	default:
 		return fmt.Sprintf("to_char(%s AT TIME ZONE 'UTC', 'YYYY-MM')", column)
 	}
-}
-
-// FTSSearchExpression uses to_tsquery (not plainto_tsquery) so the
-// bound argument can carry prefix-match operators ("invo:*" matches
-// "invoice"); BuildFTSTerm and SanitizeFTSQuery both emit arguments in
-// that shape, and the store dialect's FTSSearchClause does the same.
-// Keeping all three aligned prevents the next caller from binding a
-// :*-shaped argument into plainto_tsquery and silently getting a
-// literal-phrase match.
-func (PostgreSQLQueryDialect) FTSSearchExpression() string {
-	return "m.search_fts @@ to_tsquery('simple', ?)"
 }
 
 func (PostgreSQLQueryDialect) HasFTSTableSQL() string {
@@ -294,49 +257,21 @@ func (PostgreSQLQueryDialect) FTSLivenessSQL() string { return "" }
 // FTSJoin: PostgreSQL's tsvector column lives on messages — no join needed.
 func (PostgreSQLQueryDialect) FTSJoin() string { return "" }
 
-// BuildFTSTerm for PostgreSQL to_tsquery: tokenize each user term into
-// letter/digit-only lexemes via sqldialect.EscapeTSQueryTerm (shared
-// with store.PostgreSQLDialect) so punctuation like `-`, `.`, `@`
-// becomes a lexeme boundary rather than ending up in an invalid
-// tsquery, append :* for prefix match, AND lexemes with " & ".
+// BuildFTSTerm matches each term's pieces in order, with a final prefix.
 func (PostgreSQLQueryDialect) BuildFTSTerm(terms []string) (expr string, arg string) {
-	tsTerms := make([]string, 0, len(terms))
-	for _, term := range terms {
-		for _, lex := range sqldialect.EscapeTSQueryTerm(term) {
-			tsTerms = append(tsTerms, lex+":*")
-		}
-	}
-	if len(tsTerms) == 0 {
+	arg = sqldialect.TSQuery(terms, "", " & ")
+	if arg == "" {
 		return "FALSE", ""
 	}
-	return "m.search_fts @@ to_tsquery('simple', ?)", strings.Join(tsTerms, " & ")
+	return sqldialect.PostgreSQLSearchPredicate("?", terms), arg
 }
 
 func (PostgreSQLQueryDialect) BuildFTSBodyTerm(terms []string) (expr string, arg string) {
-	termGroups := make([]string, 0, len(terms))
-	for _, term := range terms {
-		lexemes := sqldialect.EscapeTSQueryTerm(term)
-		parts := make([]string, len(lexemes))
-		for i, lexeme := range lexemes {
-			suffix := ":D"
-			if i == len(lexemes)-1 {
-				suffix = ":*D"
-			}
-			parts[i] = lexeme + suffix
-		}
-		switch len(parts) {
-		case 0:
-			continue
-		case 1:
-			termGroups = append(termGroups, parts[0])
-		default:
-			termGroups = append(termGroups, "("+strings.Join(parts, " <-> ")+")")
-		}
-	}
-	if len(termGroups) == 0 {
+	arg = sqldialect.TSQuery(terms, "", " & ")
+	if arg == "" {
 		return "FALSE", ""
 	}
-	return "m.search_fts @@ to_tsquery('simple', ?)", strings.Join(termGroups, " & ")
+	return sqldialect.PostgreSQLBodyPredicate("?", terms), arg
 }
 
 func (PostgreSQLQueryDialect) FTSBodySearchReadinessSQL() string {
@@ -346,22 +281,8 @@ func (PostgreSQLQueryDialect) FTSBodySearchReadinessSQL() string {
 	)
 }
 
-// SanitizeFTSQuery builds a tsquery arg from a single user string using the
-// allowlist tokenizer sqldialect.EscapeTSQueryTerm: the input is split on every
-// rune that isn't a Unicode letter or digit, and each resulting lexeme is
-// suffixed with ":*" for prefix matching and joined with " & ". This mirrors
-// BuildFTSTerm exactly so both PG FTS paths emit the same lexeme set, and
-// guarantees no tsquery metacharacter (`<`, `=`, `&`, etc.) ever reaches
-// to_tsquery. Returns "" if the input collapses to nothing usable.
-func (PostgreSQLQueryDialect) SanitizeFTSQuery(query string) string {
-	var parts []string
-	for _, lex := range sqldialect.EscapeTSQueryTerm(query) {
-		parts = append(parts, lex+":*")
-	}
-	return strings.Join(parts, " & ")
-}
-
 func (SQLiteQueryDialect) DateOrderExpression(column string) string {
-	return sqliteutil.TimestampKeyFunction + "(" + column + ")"
+	// Keep zero times undated, as the timestamp key does.
+	return "NULLIF(julianday(" + column + "), " + sqliteutil.ZeroTimeJulianDay + ")"
 }
 func (PostgreSQLQueryDialect) DateOrderExpression(column string) string { return column }

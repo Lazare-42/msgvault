@@ -21,6 +21,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/embed"
 )
@@ -465,7 +466,7 @@ func TestVoyageClient_EmbedDocumentsUsesNestedDocumentInput(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := newVoyageClient(server.URL + "/v1")
 
-	got, err := client.EmbedDocuments(context.Background(), []embed.DocumentInput{
+	got, err := client.EmbedDocuments(t.Context(), []embed.DocumentInput{
 		{Chunks: []string{"first", "second"}},
 		{Chunks: []string{"third"}},
 	})
@@ -708,7 +709,7 @@ func TestVoyageClient_EmbedQueryUsesQueryRole(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	got, err := newVoyageClient(server.URL+"/v1").EmbedQuery(context.Background(), "find this")
+	got, err := newVoyageClient(server.URL+"/v1").EmbedQuery(t.Context(), "find this")
 
 	require.NoError(t, err)
 	assert.Equal("/v1/contextualizedembeddings", captured.Path)
@@ -755,7 +756,7 @@ func TestVoyageClient_RejectsDuplicateOuterIndex(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := newVoyageClient(server.URL).EmbedDocuments(context.Background(), []embed.DocumentInput{
+	_, err := newVoyageClient(server.URL).EmbedDocuments(t.Context(), []embed.DocumentInput{
 		{Chunks: []string{"first"}},
 		{Chunks: []string{"second"}},
 	})
@@ -776,7 +777,7 @@ func TestVoyageClient_RejectsDuplicateInnerIndex(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := newVoyageClient(server.URL).EmbedDocuments(context.Background(), []embed.DocumentInput{
+	_, err := newVoyageClient(server.URL).EmbedDocuments(t.Context(), []embed.DocumentInput{
 		{Chunks: []string{"first", "second"}},
 	})
 
@@ -820,7 +821,7 @@ func TestVoyageClient_RejectsMalformedIndexedResponse(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 
-			_, err := newVoyageClient(server.URL).EmbedDocuments(context.Background(), []embed.DocumentInput{
+			_, err := newVoyageClient(server.URL).EmbedDocuments(t.Context(), []embed.DocumentInput{
 				{Chunks: []string{"first"}},
 			})
 
@@ -858,7 +859,7 @@ func TestVoyageClient_Size400ReturnsBatchToWorker(t *testing.T) {
 		{Chunks: []string{"c1"}},
 	}
 
-	_, err := newVoyageClient(server.URL).EmbedDocuments(context.Background(), documents)
+	_, err := newVoyageClient(server.URL).EmbedDocuments(t.Context(), documents)
 
 	require.ErrorIs(err, embed.ErrDocumentTooLarge)
 	assert.Equal([][][]string{
@@ -876,7 +877,7 @@ func TestVoyageClient_OneDocumentSize400ReturnsDocumentTooLarge(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	_, err := newVoyageClient(server.URL).EmbedDocuments(context.Background(), []embed.DocumentInput{
+	_, err := newVoyageClient(server.URL).EmbedDocuments(t.Context(), []embed.DocumentInput{
 		{Chunks: []string{"a1", "a2"}},
 	})
 
@@ -940,7 +941,7 @@ func TestVoyageClient_AuthAndParameter4xxFailFast(t *testing.T) {
 
 			_, err := newVoyageClient(server.URL, func(cfg *embed.VoyageConfig) {
 				cfg.MaxRetries = 5
-			}).EmbedQuery(context.Background(), "query")
+			}).EmbedQuery(t.Context(), "query")
 
 			require.Error(t, err)
 			require.NotErrorIs(t, err, embed.ErrDocumentTooLarge)
@@ -976,7 +977,7 @@ func TestVoyageClient_RetriesTransientResponses(t *testing.T) {
 
 			got, err := newVoyageClient(server.URL, func(cfg *embed.VoyageConfig) {
 				cfg.MaxRetries = 2
-			}).EmbedQuery(context.Background(), "query")
+			}).EmbedQuery(t.Context(), "query")
 
 			require.NoError(t, err)
 			assert.Equal(t, []float32{1, 1, 1, 1}, got)
@@ -1006,4 +1007,34 @@ func TestVoyageClientBeforeRequestFencesQueryRetry(t *testing.T) {
 	require.ErrorIs(t, err, vector.ErrSemanticPersonEmbeddingConsentRequired)
 	assert.Equal(t, int32(1), requests.Load(),
 		"revocation after the first 429 must fence the Voyage query retry")
+}
+
+func TestVoyageEmbedDocumentRequestsFinishesInFlightRequestBeforeYielding(t *testing.T) {
+	require := require.New(t)
+	ctx, requestYield := jobctx.WithPreemption(t.Context())
+	var requests [][][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got := decodeVoyageRequest(t, r)
+		requests = append(requests, got.Inputs)
+		// A waiting sync asks the pass to yield while this request is in flight.
+		requestYield()
+		writeVoyageResponse(t, w, sequentialVoyageResults(got.Inputs))
+	}))
+	defer server.Close()
+	client := embed.NewVoyageClient(embed.VoyageConfig{
+		Endpoint: server.URL, Model: "voyage-context-4", Dimension: 4,
+		Limits: embed.RequestLimits{MaxDocuments: 1},
+	})
+
+	var completed []int
+	err := client.EmbedDocumentRequests(ctx,
+		[]embed.DocumentInput{{Chunks: []string{"first"}}, {Chunks: []string{"second"}}}, nil,
+		func(first int, vectors [][][]float32) error {
+			completed = append(completed, first)
+			require.Len(vectors, 1)
+			return nil
+		})
+	require.ErrorIs(err, jobctx.ErrYieldedToWaiter)
+	assert.Equal(t, [][][]string{{{"first"}}}, requests, "the second request is never sent")
+	assert.Equal(t, []int{0}, completed, "the in-flight request reaches the caller before the pass yields")
 }

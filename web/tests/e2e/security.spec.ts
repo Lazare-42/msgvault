@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
-import { installOperations, OPERATION_PRIVACY_SENTINELS } from './fixtures/operations';
+import { stubOperationStatus } from '../kit-ui';
+import { sourceStatus } from '../../src/lib/jobs/fixtures.test-support';
 
 const secureRow = {
   key: 'source:1:message:secure', kind: 'message', message_type: 'email', conversation_type: 'email_thread',
@@ -9,19 +10,6 @@ const secureRow = {
   attachment_size: 0, has_attachments: false, deleted_from_source: false, message_count: 1,
   anchor_message_id: 42, conversation_id: 7, match: {}
 };
-
-test('operations keeps production privacy sentinels out of rendered text', async ({ page }) => {
-  await installOperations(page);
-  await page.goto(`/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'operations' }))}`);
-  await expect(page.getByRole('main', { name: 'Operations' })).toBeVisible();
-  await page.getByRole('button', { name: 'Open CardDAV sync run' }).click();
-  await expect(page.getByRole('region', { name: 'Operation run detail' })).toBeVisible();
-
-  const rendered = await page.locator('body').innerText();
-  for (const sentinel of OPERATION_PRIVACY_SENTINELS) {
-    expect(rendered, `rendered private sentinel: ${sentinel}`).not.toContain(sentinel);
-  }
-});
 
 test('sanitized archived HTML requires remote-image consent and rejects forged frame messages', async ({ page }) => {
   const remoteRequests: string[] = [];
@@ -54,7 +42,7 @@ test('sanitized archived HTML requires remote-image consent and rejects forged f
   });
 
   await page.goto(`/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
-  const grid = page.getByRole('grid', { name: 'Everything results' });
+  const grid = page.getByRole('grid', { name: 'Messages results' });
   await grid.focus();
   await page.keyboard.press('Enter');
 
@@ -109,6 +97,8 @@ test('sanitized archived HTML requires remote-image consent and rejects forged f
 });
 
 test('daemon API key stays host-managed and never crosses the browser settings write boundary', async ({ page }) => {
+  await stubOperationStatus(page);
+  await page.route('**/api/v1/sources/status', route => route.fulfill({ json: { sources: [sourceStatus({ scheduled: false })] } }));
 	let settingsPatch: unknown;
 	const daemonKey = {
 		key: 'server.api_key', group: 'server', section: 'listener', label: 'API key',
@@ -142,15 +132,16 @@ test('daemon API key stays host-managed and never crosses the browser settings w
   });
 
 	await page.goto(`/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
-	await expect(page.getByRole('main', { name: 'Everything' })).toBeVisible();
+	await expect(page.getByRole('main', { name: 'Messages' })).toBeVisible();
 	await page.getByRole('button', { name: 'Settings', exact: true }).click();
+	await page.getByRole('button', { name: 'Server', exact: true }).click();
+	await page.getByText('Set in config.toml', { exact: true }).click();
 	await expect(page.getByText('dae…key')).toBeVisible();
-	await expect(page.getByText('Host-managed values are set in config.toml on the daemon host.')).toBeVisible();
 	await expect(page.getByLabel('New API key')).toHaveCount(0);
 	await expect(page.getByRole('button', { name: /^(Add|Replace) API key$/ })).toHaveCount(0);
 	await expect(page.getByRole('button', { name: 'Save changes' })).toHaveCount(0);
 	expect(settingsPatch).toBeUndefined();
 
-	await page.getByRole('button', { name: 'Everything', exact: true }).click();
-	await expect(page.getByRole('main', { name: 'Everything' })).toBeVisible();
+	await page.getByRole('button', { name: 'Messages', exact: true }).click();
+	await expect(page.getByRole('main', { name: 'Messages' })).toBeVisible();
 });

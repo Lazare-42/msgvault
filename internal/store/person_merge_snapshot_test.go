@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"compress/zlib"
-	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -34,28 +33,28 @@ func TestCapturePersonMergeSnapshotIncludesRootsBindingsAndReferencedRows(t *tes
 	require.NoError(err)
 	require.True(created)
 
-	_, err = st.AddPersonNameContext(context.Background(), survivor.ID, PersonNameInput{
+	_, err = st.AddPersonNameContext(t.Context(), survivor.ID, PersonNameInput{
 		NameKind: PersonNameFormatted, Formatted: new("Survivor Name"),
 		Envelope: ValueEnvelopeInput{Source: ProvenanceUser},
 	})
 	require.NoError(err)
-	_, err = st.AddPersonNameContext(context.Background(), absorbed.ID, PersonNameInput{
+	_, err = st.AddPersonNameContext(t.Context(), absorbed.ID, PersonNameInput{
 		NameKind: PersonNameFormatted, Formatted: new("Absorbed Name"),
 		Envelope: ValueEnvelopeInput{Source: ProvenanceVCardImport, SourceRef: new("card-2")},
 	})
 	require.NoError(err)
-	_, err = st.RetirePersonUIDAliasContext(context.Background(), "retired-before-merge", &survivor.ID, "test")
+	_, err = st.RetirePersonUIDAliasContext(t.Context(), "retired-before-merge", &survivor.ID, "test")
 	require.NoError(err)
 	source, err := st.GetOrCreateSource("gmail", "snapshot@example.com")
 	require.NoError(err)
-	candidate, _, err := st.UpsertIdentityMatchCandidateContext(context.Background(), IdentityMatchCandidateInput{
+	candidate, _, err := st.UpsertIdentityMatchCandidateContext(t.Context(), IdentityMatchCandidateInput{
 		LeftKind: IdentityMatchPerson, LeftID: survivor.ID,
 		RightKind: IdentityMatchPerson, RightID: absorbed.ID,
 		Basis: IdentityMatchDisplayName, State: IdentityMatchStateCandidate,
 		Source: ProvenanceUser, SourceID: &source.ID,
 	})
 	require.NoError(err)
-	evidence, err := st.AddIdentityMatchEvidenceContext(context.Background(), candidate.ID, IdentityMatchEvidenceInput{
+	evidence, err := st.AddIdentityMatchEvidenceContext(t.Context(), candidate.ID, IdentityMatchEvidenceInput{
 		EvidenceKind: "shared_name", Source: ProvenanceUser, SourceID: &source.ID,
 	})
 	require.NoError(err)
@@ -65,10 +64,10 @@ func TestCapturePersonMergeSnapshotIncludesRootsBindingsAndReferencedRows(t *tes
 	require.NoError(err)
 
 	var snapshot personMergeSnapshot
-	require.NoError(st.withTxContext(context.Background(), func(tx *loggedTx) error {
+	require.NoError(st.withTxContext(t.Context(), func(tx *loggedTx) error {
 		var captureErr error
 		snapshot, captureErr = st.capturePersonMergeSnapshotTx(
-			context.Background(), tx, survivor.ID, absorbed.ID,
+			t.Context(), tx, survivor.ID, absorbed.ID,
 		)
 		return captureErr
 	}))
@@ -118,8 +117,8 @@ func TestPersonMergeTableInventoryClassifiesEveryPersonReference(t *testing.T) {
 }
 
 func TestPostgresPersonMergeTableInventoryClassifiesEveryPersonReference(t *testing.T) {
-	dbURL := skipUnlessPostgresInternal(t)
-	assertPersonMergeTableInventory(t, newPGStoreInternal(t, dbURL))
+	skipUnlessPostgresInternal(t)
+	assertPersonMergeTableInventory(t, newPGStoreInternal(t))
 }
 
 func assertPersonMergeTableInventory(t *testing.T, st *Store) {
@@ -135,21 +134,19 @@ func assertPersonMergeTableInventory(t *testing.T, st *Store) {
 		  AND foreign_key."table" = 'persons'
 		ORDER BY child.name, foreign_key."from"`
 	if st.IsPostgreSQL() {
-		query = `SELECT constraints.table_name, columns.column_name
-			FROM information_schema.table_constraints constraints
-			JOIN information_schema.key_column_usage columns
-			  ON columns.constraint_catalog = constraints.constraint_catalog
-			 AND columns.constraint_schema = constraints.constraint_schema
-			 AND columns.constraint_name = constraints.constraint_name
-			JOIN information_schema.constraint_column_usage target
-			  ON target.constraint_catalog = constraints.constraint_catalog
-			 AND target.constraint_schema = constraints.constraint_schema
-			 AND target.constraint_name = constraints.constraint_name
-			WHERE constraints.constraint_type = 'FOREIGN KEY'
-			  AND constraints.table_schema = current_schema()
-			  AND target.table_schema = current_schema()
-			  AND target.table_name = 'persons'
-			ORDER BY constraints.table_name, columns.column_name`
+		query = `SELECT child.relname, columns.attname
+			FROM pg_catalog.pg_constraint constraints
+			JOIN pg_catalog.pg_namespace namespace ON namespace.oid = constraints.connamespace
+			JOIN pg_catalog.pg_class child ON child.oid = constraints.conrelid
+			JOIN pg_catalog.pg_class target ON target.oid = constraints.confrelid
+			CROSS JOIN LATERAL unnest(constraints.conkey) AS key(attnum)
+			JOIN pg_catalog.pg_attribute columns
+			  ON columns.attrelid = child.oid AND columns.attnum = key.attnum
+			WHERE constraints.contype = 'f'
+			  AND namespace.nspname = current_schema()
+			  AND target.relnamespace = namespace.oid
+			  AND target.relname = 'persons'
+			ORDER BY child.relname, columns.attname`
 	}
 	rows, err := st.db.Query(query)
 	require.NoError(err)

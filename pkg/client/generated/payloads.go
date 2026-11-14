@@ -128,6 +128,8 @@ type UnlinkIdentityParticipantsBody = IdentityLinkRequest
 
 type ImportMeetingBody = MeetingImportRequest
 
+type ImportMessageBody = MessageImportRequest
+
 type ImportMuesliBody = MuesliRemoteRequest
 
 type ImportMuesliRecordingBody = runtime.File
@@ -139,6 +141,8 @@ type PrepareKataEvidenceBody = KataEvidencePrepareRequest
 type CreateKataIssueBody = KataIssueCreateRequest
 
 type LinkKataEvidenceBody = KataEvidenceLinkRequest
+
+type SnoozeLoopBody = SnoozeLoopRequest
 
 type ListMeetingActionItemsBody = MeetingActionsRequest
 

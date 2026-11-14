@@ -219,48 +219,6 @@ CREATE TRIGGER IF NOT EXISTS trg_person_embedding_runs_terminal_immutable
 BEFORE UPDATE ON person_embedding_runs FOR EACH ROW WHEN OLD.state <> 'running'
 BEGIN SELECT RAISE(ABORT, 'terminal operation invocation is immutable'); END;
 
-CREATE TABLE IF NOT EXISTS document_extraction_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    invocation_key TEXT NOT NULL UNIQUE CHECK (
-        length(CAST(invocation_key AS BLOB)) BETWEEN 1 AND 128 AND trim(invocation_key) = invocation_key),
-    trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'scheduled')),
-    state TEXT NOT NULL DEFAULT 'running' CHECK (state IN ('running', 'succeeded', 'partial', 'failed', 'cancelled')),
-    started_at DATETIME NOT NULL,
-    finished_at DATETIME,
-    error_code TEXT CHECK (error_code IS NULL OR error_code IN ('invocation_cancelled', 'invocation_timeout', 'invocation_rate_limited', 'invocation_authentication_failed', 'invocation_upstream_failed', 'invocation_invalid_output', 'invocation_safety_limit', 'invocation_archive_drift', 'invocation_daemon_restarted', 'invocation_internal', 'invocation_unsafe_error_redacted')),
-    attempted INTEGER NOT NULL DEFAULT 0 CHECK (attempted >= 0),
-    succeeded INTEGER NOT NULL DEFAULT 0 CHECK (succeeded >= 0),
-    failed INTEGER NOT NULL DEFAULT 0 CHECK (failed >= 0),
-    CHECK ((state = 'running' AND finished_at IS NULL AND error_code IS NULL) OR
-           (state <> 'running' AND finished_at IS NOT NULL))
-);
-CREATE INDEX IF NOT EXISTS idx_document_extraction_runs_operations_order ON document_extraction_runs(started_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_document_extraction_runs_active ON document_extraction_runs(state, id) WHERE state = 'running';
-CREATE TRIGGER IF NOT EXISTS trg_document_extraction_runs_terminal_immutable
-BEFORE UPDATE ON document_extraction_runs FOR EACH ROW WHEN OLD.state <> 'running'
-BEGIN SELECT RAISE(ABORT, 'terminal operation invocation is immutable'); END;
-
-CREATE TABLE IF NOT EXISTS document_embedding_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    invocation_key TEXT NOT NULL UNIQUE CHECK (
-        length(CAST(invocation_key AS BLOB)) BETWEEN 1 AND 128 AND trim(invocation_key) = invocation_key),
-    trigger TEXT NOT NULL CHECK (trigger IN ('manual', 'scheduled')),
-    state TEXT NOT NULL DEFAULT 'running' CHECK (state IN ('running', 'succeeded', 'partial', 'failed', 'cancelled')),
-    started_at DATETIME NOT NULL,
-    finished_at DATETIME,
-    error_code TEXT CHECK (error_code IS NULL OR error_code IN ('invocation_cancelled', 'invocation_timeout', 'invocation_rate_limited', 'invocation_authentication_failed', 'invocation_upstream_failed', 'invocation_invalid_output', 'invocation_safety_limit', 'invocation_archive_drift', 'invocation_daemon_restarted', 'invocation_internal', 'invocation_unsafe_error_redacted')),
-    attempted INTEGER NOT NULL DEFAULT 0 CHECK (attempted >= 0),
-    succeeded INTEGER NOT NULL DEFAULT 0 CHECK (succeeded >= 0),
-    failed INTEGER NOT NULL DEFAULT 0 CHECK (failed >= 0),
-    CHECK ((state = 'running' AND finished_at IS NULL AND error_code IS NULL) OR
-           (state <> 'running' AND finished_at IS NOT NULL))
-);
-CREATE INDEX IF NOT EXISTS idx_document_embedding_runs_operations_order ON document_embedding_runs(started_at DESC, id DESC);
-CREATE INDEX IF NOT EXISTS idx_document_embedding_runs_active ON document_embedding_runs(state, id) WHERE state = 'running';
-CREATE TRIGGER IF NOT EXISTS trg_document_embedding_runs_terminal_immutable
-BEFORE UPDATE ON document_embedding_runs FOR EACH ROW WHEN OLD.state <> 'running'
-BEGIN SELECT RAISE(ABORT, 'terminal operation invocation is immutable'); END;
-
 CREATE TABLE IF NOT EXISTS visual_embedding_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     invocation_key TEXT NOT NULL UNIQUE CHECK (
@@ -524,14 +482,11 @@ CREATE TABLE IF NOT EXISTS person_sweep_cursors (
     program_fingerprint         TEXT NOT NULL,
     catalog_fingerprint         TEXT NOT NULL,
     optimistic_sequence         INTEGER NOT NULL CHECK (optimistic_sequence >= 0),
-    optimistic_document_key     TEXT NOT NULL DEFAULT '',
     reconcile_upper_key         TEXT NOT NULL,
     reconcile_after_key         TEXT NOT NULL,
-    reconcile_document_key      TEXT NOT NULL DEFAULT '',
     reconciliation_complete     BOOLEAN NOT NULL,
     backstop_upper_key           TEXT NOT NULL DEFAULT '',
     backstop_after_key           TEXT NOT NULL DEFAULT '',
-    backstop_document_key        TEXT NOT NULL DEFAULT '',
     last_backstop_at            DATETIME,
     created_at                  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at                  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1417,6 +1372,7 @@ CREATE TABLE IF NOT EXISTS messages (
 
     -- RFC 2919 List-Id for email list membership
     list_id TEXT,
+    hidden_text_present BOOLEAN NOT NULL DEFAULT 0,
 
     -- Message classification
     message_type TEXT NOT NULL,  -- 'email', 'imessage', 'sms', 'mms', 'rcs', 'whatsapp', 'fbmessenger', 'teams'
@@ -1435,6 +1391,7 @@ CREATE TABLE IF NOT EXISTS messages (
     identity_is_from_me BOOLEAN NOT NULL DEFAULT FALSE,
     account_address TEXT,
     account_path TEXT,
+    email_linkage_outcome TEXT,
     draft_authored BOOLEAN NOT NULL DEFAULT FALSE, -- once filed as a draft, kept after the draft is retired
 
     -- Content
@@ -1538,7 +1495,8 @@ CREATE TABLE IF NOT EXISTS message_recipients (
     -- identity discovery reads it so merges cannot rewrite evidence.
     -- NULL on rows from writers without envelope addresses (non-email
     -- importers, legacy rows).
-    email_address TEXT
+    email_address TEXT,
+    is_relayed BOOLEAN NOT NULL DEFAULT FALSE
 
     -- Uniqueness spans the normalized envelope address so one participant
     -- can carry several alias snapshots on the same message (two aliases of
@@ -1606,6 +1564,43 @@ CREATE TABLE IF NOT EXISTS whatsapp_outbox (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Matrix events archived while encrypted. The ciphertext stays after recovery,
+-- so a replay conflict can return a recovered message to its placeholder.
+CREATE TABLE IF NOT EXISTS matrix_encrypted_events (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    ciphertext TEXT NOT NULL,
+    recovered BOOLEAN NOT NULL DEFAULT FALSE,
+    tried_stamp TEXT,   -- key backup state of the last failed attempt
+    tried_at INTEGER    -- Unix seconds of the last failed attempt
+);
+CREATE INDEX IF NOT EXISTS idx_matrix_encrypted_events_pending
+    ON matrix_encrypted_events(conversation_id, message_id) WHERE NOT recovered;
+CREATE INDEX IF NOT EXISTS idx_matrix_encrypted_events_pending_session
+    ON matrix_encrypted_events(conversation_id, session_id, message_id) WHERE NOT recovered;
+
+-- The first event to use each Megolm message index in a room. Later events
+-- with the same index are replays and stay encrypted.
+CREATE TABLE IF NOT EXISTS matrix_megolm_claims (
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL,
+    message_index INTEGER NOT NULL,
+    event_id TEXT NOT NULL,
+    PRIMARY KEY (conversation_id, session_id, message_index)
+);
+
+-- Edits that arrived for a Matrix message whose keys are still unavailable.
+CREATE TABLE IF NOT EXISTS matrix_pending_edits (
+    target_message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    event_id TEXT NOT NULL,
+    origin_ts INTEGER NOT NULL,
+    event TEXT NOT NULL,
+    PRIMARY KEY (target_message_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_matrix_pending_edits_event
+    ON matrix_pending_edits(event_id);
 
 -- ============================================================================
 -- ATTACHMENTS & MEDIA
@@ -1848,6 +1843,18 @@ CREATE TABLE IF NOT EXISTS message_raw (
     compression TEXT DEFAULT 'zlib',
     encryption_version INTEGER DEFAULT 0
 );
+
+-- Explicit MIME identifiers (In-Reply-To, References, attached originals),
+-- indexed across archived email copies. A copy's own Message-ID is
+-- messages.rfc822_message_id. messages.email_linkage_outcome IS NULL marks a
+-- copy whose keys are not derived yet.
+CREATE TABLE IF NOT EXISTS email_link_keys (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('reply', 'reference', 'attached')),
+    value TEXT NOT NULL,
+    PRIMARY KEY (message_id, kind, value)
+);
+CREATE INDEX IF NOT EXISTS idx_email_link_keys_value ON email_link_keys(value, message_id);
 
 -- Resumable cursor for the bounded, raw-MIME-only attachment role repair.
 CREATE TABLE IF NOT EXISTS attachment_role_repair_progress (
@@ -2103,6 +2110,7 @@ CREATE INDEX IF NOT EXISTS idx_person_sweep_sync_publications_source
 -- status='error' is actionable and contributes to sync_runs.errors_count.
 -- status='skipped' records expected item churn, such as Gmail messages that
 -- were deleted between a history/list response and raw-message fetch.
+-- status='resolved' records successful acquisition after an earlier failure.
 CREATE TABLE IF NOT EXISTS sync_run_items (
     id INTEGER PRIMARY KEY,
     sync_run_id INTEGER NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
@@ -2371,6 +2379,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id
 -- and idx_messages_source below already orders ties by rowid, so the
 -- composite added no coverage beyond the single-column index.
 CREATE INDEX IF NOT EXISTS idx_messages_source ON messages(source_id);
+-- Only listings that write coalesce(m.source_id, m.source_id) use this timeline index.
+CREATE INDEX IF NOT EXISTS idx_messages_source_sent_at ON messages(coalesce(source_id, source_id), sent_at);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_type ON messages(message_type);
@@ -2380,7 +2390,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_reply_to_message_id ON messages(reply_to
     WHERE reply_to_message_id IS NOT NULL;
 
 -- Message recipients
--- idx_message_recipients_email_from is built after legacy column migrations in Store.
+-- Recipient address indexes are built after legacy column migrations in Store.
 CREATE INDEX IF NOT EXISTS idx_message_recipients_message ON message_recipients(message_id);
 CREATE INDEX IF NOT EXISTS idx_message_recipients_participant ON message_recipients(participant_id, recipient_type);
 
@@ -2426,6 +2436,8 @@ CREATE INDEX IF NOT EXISTS idx_sync_runs_operations_running
     ON sync_runs(started_at DESC, id DESC) WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS idx_sync_runs_operations_succeeded
     ON sync_runs(started_at DESC, id DESC) WHERE status = 'completed' AND errors_count = 0;
+CREATE INDEX IF NOT EXISTS idx_sync_runs_completed
+    ON sync_runs(source_id, completed_at DESC, id DESC) WHERE status = 'completed';
 
 -- A cursor page binds the exact membership/order view across every operation
 -- ledger. Aggregate counter checkpoints do not affect this revision.
@@ -2465,28 +2477,6 @@ AFTER DELETE ON person_embedding_runs
 BEGIN UPDATE operation_history_state SET membership_revision = membership_revision + 1 WHERE singleton = 1; END;
 CREATE TRIGGER IF NOT EXISTS trg_operation_history_person_embedding_update
 AFTER UPDATE ON person_embedding_runs
-WHEN OLD.started_at IS NOT NEW.started_at OR OLD.state IS NOT NEW.state
-BEGIN UPDATE operation_history_state SET membership_revision = membership_revision + 1 WHERE singleton = 1; END;
-
-CREATE TRIGGER IF NOT EXISTS trg_operation_history_document_extraction_insert
-AFTER INSERT ON document_extraction_runs
-BEGIN UPDATE operation_history_state SET membership_revision = membership_revision + 1 WHERE singleton = 1; END;
-CREATE TRIGGER IF NOT EXISTS trg_operation_history_document_extraction_delete
-AFTER DELETE ON document_extraction_runs
-BEGIN UPDATE operation_history_state SET membership_revision = membership_revision + 1 WHERE singleton = 1; END;
-CREATE TRIGGER IF NOT EXISTS trg_operation_history_document_extraction_update
-AFTER UPDATE ON document_extraction_runs
-WHEN OLD.started_at IS NOT NEW.started_at OR OLD.state IS NOT NEW.state
-BEGIN UPDATE operation_history_state SET membership_revision = membership_revision + 1 WHERE singleton = 1; END;
-
-CREATE TRIGGER IF NOT EXISTS trg_operation_history_document_embedding_insert
-AFTER INSERT ON document_embedding_runs
-BEGIN UPDATE operation_history_state SET membership_revision = membership_revision + 1 WHERE singleton = 1; END;
-CREATE TRIGGER IF NOT EXISTS trg_operation_history_document_embedding_delete
-AFTER DELETE ON document_embedding_runs
-BEGIN UPDATE operation_history_state SET membership_revision = membership_revision + 1 WHERE singleton = 1; END;
-CREATE TRIGGER IF NOT EXISTS trg_operation_history_document_embedding_update
-AFTER UPDATE ON document_embedding_runs
 WHEN OLD.started_at IS NOT NEW.started_at OR OLD.state IS NOT NEW.state
 BEGIN UPDATE operation_history_state SET membership_revision = membership_revision + 1 WHERE singleton = 1; END;
 
@@ -3504,6 +3494,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_match_candidates_edge
         left_kind, left_id, right_kind, right_id, basis,
         service_id, scope_kind, scope_value, normalized_value
     );
+CREATE INDEX IF NOT EXISTS idx_identity_match_candidates_right
+    ON identity_match_candidates(right_kind, right_id);
 CREATE INDEX IF NOT EXISTS idx_identity_match_candidates_state
     ON identity_match_candidates(state, id);
 CREATE INDEX IF NOT EXISTS idx_identity_match_candidates_value
@@ -3645,346 +3637,6 @@ CREATE TABLE IF NOT EXISTS attachment_pack_index (
     crc32c      BIGINT NOT NULL
 );
 
--- ==========================================================================
--- DOCUMENT ATTACHMENT EXTRACTION
--- ==========================================================================
-
--- Immutable hosted-extraction policy. A policy change creates a new profile;
--- mixed profiles may serve while an incremental rebuild is in progress.
-CREATE TABLE IF NOT EXISTS document_extraction_profiles (
-    id                    TEXT PRIMARY KEY,
-    fingerprint           TEXT NOT NULL UNIQUE,
-    provider              TEXT NOT NULL,
-    endpoint              TEXT NOT NULL,
-    region                TEXT NOT NULL,
-    model                 TEXT NOT NULL,
-    retention_posture     TEXT NOT NULL,
-    training_posture      TEXT NOT NULL,
-    allowed_media_types   JSON NOT NULL,
-    include_inline        BOOLEAN NOT NULL DEFAULT FALSE,
-    policy_json           JSON NOT NULL,
-    enabled               BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    retired_at            DATETIME
-);
-
--- Recording consent is separate from supplying a key or enabling config.
-CREATE TABLE IF NOT EXISTS document_provider_consents (
-    profile_id            TEXT PRIMARY KEY REFERENCES document_extraction_profiles(id) ON DELETE CASCADE,
-    profile_fingerprint   TEXT NOT NULL,
-    retention_posture     TEXT NOT NULL,
-    training_posture      TEXT NOT NULL,
-    consented_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
--- A bounded full rebuild snapshots exact canonical owners once. This keeps a
--- limited/resumed rebuild from selecting its first page forever while normal
--- attachment reconciliation continues independently.
-CREATE TABLE IF NOT EXISTS document_extraction_rebuilds (
-    id                    TEXT PRIMARY KEY,
-    profile_id            TEXT NOT NULL REFERENCES document_extraction_profiles(id) ON DELETE CASCADE,
-    extraction_input_key  TEXT NOT NULL,
-    state                 TEXT NOT NULL CHECK (state IN ('building', 'completed')),
-    created_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    completed_at          DATETIME
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_document_extraction_rebuilds_active
-    ON document_extraction_rebuilds(profile_id, extraction_input_key)
-    WHERE state = 'building';
-
-CREATE TABLE IF NOT EXISTS document_extraction_rebuild_targets (
-    rebuild_id            TEXT NOT NULL REFERENCES document_extraction_rebuilds(id) ON DELETE CASCADE,
-    canonical_blob_hash   TEXT NOT NULL CHECK (length(canonical_blob_hash) = 64),
-    PRIMARY KEY (rebuild_id, canonical_blob_hash)
-);
-
--- Immutable attempts owned by canonical bytes, not an attachment-row ID.
-CREATE TABLE IF NOT EXISTS document_extractions (
-    id                    TEXT PRIMARY KEY,
-    profile_id            TEXT NOT NULL REFERENCES document_extraction_profiles(id) ON DELETE CASCADE,
-    rebuild_id            TEXT REFERENCES document_extraction_rebuilds(id) ON DELETE SET NULL,
-    canonical_blob_hash   TEXT NOT NULL CHECK (length(canonical_blob_hash) = 64),
-    extraction_input_key  TEXT NOT NULL DEFAULT 'original',
-    -- Media type of the occurrence the claim uploaded through. A head only
-    -- covers its owner while the representative occurrence still selects
-    -- this route; NULL predates route tracking and always matches.
-    source_media_type     TEXT,
-    state                 TEXT NOT NULL CHECK (state IN ('staging', 'ready', 'terminal', 'tombstoned')),
-    lease_owner           TEXT,
-    lease_fence           INTEGER NOT NULL DEFAULT 0,
-    lease_until           DATETIME,
-    attempt_count         INTEGER NOT NULL DEFAULT 0,
-    request_count         INTEGER NOT NULL DEFAULT 0 CHECK (request_count >= 0),
-    retry_count           INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0 AND retry_count <= request_count),
-    provider_latency_ms   INTEGER NOT NULL DEFAULT 0 CHECK (provider_latency_ms >= 0),
-    next_retry_at         DATETIME,
-    local_bytes           INTEGER NOT NULL,
-    provider_bytes        INTEGER,
-    units_processed       INTEGER,
-    returned_model        TEXT,
-    manifest_checksum     TEXT,
-    normalization_version INTEGER,
-    document_family       TEXT,
-    unit_kind             TEXT,
-    normalized_truncated  BOOLEAN NOT NULL DEFAULT FALSE,
-    terminal_reason       TEXT,
-    failure_reason        TEXT,
-    failure_detail        TEXT,
-    source_sequence       INTEGER NOT NULL DEFAULT 0,
-    created_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    published_at          DATETIME,
-    CHECK (local_bytes >= 0),
-    CHECK (provider_bytes IS NULL OR provider_bytes >= 0),
-    CHECK (units_processed IS NULL OR units_processed >= 0)
-);
-
-CREATE INDEX IF NOT EXISTS idx_document_extractions_owner
-    ON document_extractions(profile_id, canonical_blob_hash, extraction_input_key, state);
-CREATE INDEX IF NOT EXISTS idx_document_extractions_lease
-    ON document_extractions(state, lease_until);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_document_extractions_vector_identity
-    ON document_extractions(id, profile_id, canonical_blob_hash, extraction_input_key, source_sequence);
-
-CREATE TABLE IF NOT EXISTS document_extraction_conversions (
-    extraction_id        TEXT PRIMARY KEY REFERENCES document_extractions(id) ON DELETE CASCADE,
-    provider_media_type TEXT NOT NULL,
-    pdf_sha256           TEXT NOT NULL CHECK (length(pdf_sha256) = 64),
-    pdf_bytes            INTEGER NOT NULL CHECK (pdf_bytes > 0),
-    pages                INTEGER NOT NULL CHECK (pages > 0),
-    policy_fingerprint   TEXT NOT NULL,
-    converter_version    TEXT NOT NULL,
-    spans                JSON NOT NULL
-);
-
--- One renewable claim per stable content owner. The monotonic fence prevents
--- an expired worker from publishing after a later worker has taken ownership.
-CREATE TABLE IF NOT EXISTS document_extraction_claims (
-    profile_id            TEXT NOT NULL REFERENCES document_extraction_profiles(id) ON DELETE CASCADE,
-    canonical_blob_hash   TEXT NOT NULL,
-    extraction_input_key  TEXT NOT NULL,
-    extraction_id         TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE CASCADE,
-    lease_owner           TEXT NOT NULL,
-    lease_fence           INTEGER NOT NULL,
-    lease_until           DATETIME NOT NULL,
-    updated_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (profile_id, canonical_blob_hash, extraction_input_key)
-);
-
--- The only serving pointer. Candidate revisions are unreachable until this
--- row switches in the same transaction that publishes their derivatives.
-CREATE TABLE IF NOT EXISTS document_extraction_heads (
-    profile_id            TEXT NOT NULL REFERENCES document_extraction_profiles(id) ON DELETE CASCADE,
-    canonical_blob_hash   TEXT NOT NULL,
-    extraction_input_key  TEXT NOT NULL,
-    extraction_id         TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE CASCADE,
-    source_sequence       INTEGER NOT NULL DEFAULT 0,
-    switched_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (profile_id, canonical_blob_hash, extraction_input_key)
-);
-
-CREATE TABLE IF NOT EXISTS document_units (
-    extraction_id         TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE CASCADE,
-    unit_index            INTEGER NOT NULL,
-    unit_kind             TEXT NOT NULL,
-    text                  TEXT NOT NULL,
-    header_text           TEXT,
-    footer_text           TEXT,
-    width                 INTEGER,
-    height                INTEGER,
-    dpi                    INTEGER,
-    checksum              TEXT NOT NULL,
-    char_count            INTEGER NOT NULL,
-    truncated             BOOLEAN NOT NULL DEFAULT FALSE,
-    heading_marks         JSON NOT NULL DEFAULT '[]',
-    PRIMARY KEY (extraction_id, unit_index),
-    CHECK (unit_index >= 0),
-    CHECK (char_count >= 0)
-);
-
-CREATE TABLE IF NOT EXISTS document_chunks (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    extraction_id         TEXT NOT NULL REFERENCES document_extractions(id) ON DELETE CASCADE,
-    chunk_key             TEXT NOT NULL,
-    ordinal               INTEGER NOT NULL,
-    text                  TEXT NOT NULL,
-    heading_path          JSON NOT NULL,
-    first_unit_index      INTEGER NOT NULL,
-    last_unit_index       INTEGER NOT NULL,
-    synthetic_prefix_len  INTEGER NOT NULL DEFAULT 0,
-    checksum              TEXT NOT NULL,
-    char_count            INTEGER NOT NULL,
-    table_chunk           BOOLEAN NOT NULL DEFAULT FALSE,
-    code_chunk            BOOLEAN NOT NULL DEFAULT FALSE,
-    truncated             BOOLEAN NOT NULL DEFAULT FALSE,
-    UNIQUE (extraction_id, chunk_key),
-    UNIQUE (extraction_id, ordinal),
-    CHECK (ordinal >= 0),
-    CHECK (first_unit_index >= 0 AND last_unit_index >= first_unit_index),
-    CHECK (synthetic_prefix_len >= 0 AND char_count >= 0)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_document_chunks_vector_identity
-    ON document_chunks(id, extraction_id, chunk_key, checksum);
-
-CREATE TABLE IF NOT EXISTS document_chunk_spans (
-    extraction_id         TEXT NOT NULL,
-    chunk_key             TEXT NOT NULL,
-    span_ordinal          INTEGER NOT NULL,
-    unit_index            INTEGER NOT NULL,
-    start_char            INTEGER NOT NULL,
-    end_char              INTEGER NOT NULL,
-    synthetic             BOOLEAN NOT NULL DEFAULT FALSE,
-    PRIMARY KEY (extraction_id, chunk_key, span_ordinal),
-    FOREIGN KEY (extraction_id, chunk_key)
-        REFERENCES document_chunks(extraction_id, chunk_key) ON DELETE CASCADE,
-    FOREIGN KEY (extraction_id, unit_index)
-        REFERENCES document_units(extraction_id, unit_index) ON DELETE CASCADE,
-    CHECK (span_ordinal >= 0),
-    CHECK (start_char >= 0 AND end_char >= start_char)
-);
-
--- Occurrence identity is source-part based when authoritative. attachment_id
--- is only the current representative and may change after provider resync.
-CREATE TABLE IF NOT EXISTS document_occurrences (
-    occurrence_key        TEXT PRIMARY KEY,
-    attachment_id         INTEGER NOT NULL UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
-    message_id            INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
-    source_id             INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    source_part_key       TEXT,
-    stable_source_part    BOOLEAN NOT NULL DEFAULT FALSE,
-    canonical_blob_hash   TEXT NOT NULL CHECK (length(canonical_blob_hash) = 64),
-    filename              TEXT,
-    mime_type             TEXT,
-    attachment_role       TEXT NOT NULL,
-    role_source           TEXT NOT NULL,
-    source_sequence       INTEGER NOT NULL DEFAULT 0,
-    reconciled_at         DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_document_occurrences_hash
-    ON document_occurrences(canonical_blob_hash, message_id, occurrence_key);
-CREATE INDEX IF NOT EXISTS idx_document_occurrences_source
-    ON document_occurrences(source_id, message_id);
-
--- Monotonic search snapshot fence. Publication and occurrence reconciliation
--- increment it in their transaction; cursors bind to its observed value.
-CREATE TABLE IF NOT EXISTS document_index_state (
-    singleton             INTEGER PRIMARY KEY CHECK (singleton = 1),
-    revision              INTEGER NOT NULL DEFAULT 0,
-    target_profile_id     TEXT,
-    updated_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-INSERT OR IGNORE INTO document_index_state(singleton, revision) VALUES (1, 0);
-
--- Document vectors are a corpus separate from message embeddings. The main
--- archive database owns generation and publication authority; vector backends
--- only store the opaque token below.
-CREATE TABLE IF NOT EXISTS document_vector_generations (
-    id                           INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint                  TEXT NOT NULL,
-    target_extraction_profile_id TEXT NOT NULL REFERENCES document_extraction_profiles(id) ON DELETE RESTRICT,
-    embedding_profile            TEXT NOT NULL,
-    model                        TEXT NOT NULL,
-    dimension                    INTEGER NOT NULL CHECK (dimension > 0),
-    state                        TEXT NOT NULL CHECK (state IN ('building', 'active', 'retired')),
-    created_at                   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    activated_at                 DATETIME,
-    retired_at                   DATETIME
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_document_vector_generations_building
-    ON document_vector_generations(state) WHERE state = 'building';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_document_vector_generations_active
-    ON document_vector_generations(state) WHERE state = 'active';
-CREATE INDEX IF NOT EXISTS idx_document_vector_generations_live_fingerprint
-    ON document_vector_generations(fingerprint) WHERE state <> 'retired';
-
--- Hosted embedding consent is bound to both the reusable generation policy
--- and a separate canonical egress destination fingerprint. It deliberately
--- contains no credentials, raw endpoints, or provider payloads.
-CREATE TABLE IF NOT EXISTS document_vector_consents (
-    egress_fingerprint           TEXT PRIMARY KEY,
-    purpose                      TEXT NOT NULL CHECK (purpose IN ('document_embedding', 'query_embedding')),
-    generation_fingerprint       TEXT NOT NULL,
-    target_extraction_profile_id  TEXT NOT NULL REFERENCES document_extraction_profiles(id) ON DELETE RESTRICT,
-    embedding_profile            TEXT NOT NULL,
-    model                        TEXT NOT NULL,
-    dimension                    INTEGER NOT NULL CHECK (dimension > 0),
-    consented_at                 DATETIME NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS document_vector_provider_usage (
-    fingerprint          TEXT PRIMARY KEY,
-    provider_calls       INTEGER NOT NULL DEFAULT 0 CHECK (provider_calls >= 0),
-    provider_documents   INTEGER NOT NULL DEFAULT 0 CHECK (provider_documents >= 0),
-    provider_chunks      INTEGER NOT NULL DEFAULT 0 CHECK (provider_chunks >= 0),
-    provider_input_chars INTEGER NOT NULL DEFAULT 0 CHECK (provider_input_chars >= 0),
-    updated_at           DATETIME NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS document_vector_build_progress (
-    generation_id  INTEGER PRIMARY KEY REFERENCES document_vector_generations(id) ON DELETE CASCADE,
-    after_chunk_id INTEGER NOT NULL CHECK (after_chunk_id > 0),
-    updated_at     DATETIME NOT NULL
-);
-
--- Publication rows are deliberately complete before a vector backend exists:
--- the durable token is the only identifier a backend receives.
-CREATE TABLE IF NOT EXISTS document_vector_publications (
-    generation_id                INTEGER NOT NULL REFERENCES document_vector_generations(id) ON DELETE RESTRICT,
-    extraction_id                TEXT NOT NULL,
-    extraction_profile_id        TEXT NOT NULL,
-    canonical_blob_hash          TEXT NOT NULL CHECK (length(canonical_blob_hash) = 64),
-    extraction_input_key         TEXT NOT NULL,
-    chunk_id                     INTEGER NOT NULL,
-    chunk_key                    TEXT NOT NULL,
-    chunk_checksum               TEXT NOT NULL,
-    source_sequence              INTEGER NOT NULL,
-    token                        TEXT NOT NULL UNIQUE,
-    state                        TEXT NOT NULL CHECK (state IN ('pending', 'ready', 'failed')),
-    lease_owner                  TEXT,
-    lease_fence                  INTEGER NOT NULL DEFAULT 0,
-    lease_until                  DATETIME,
-    attempt_count                INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-    next_retry_at                DATETIME,
-    error_code                   TEXT,
-    backend_cleaned_at           DATETIME,
-    created_at                   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at                   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (generation_id, extraction_id, chunk_id)
-);
-CREATE INDEX IF NOT EXISTS idx_document_vector_publications_cleanup
-    ON document_vector_publications(generation_id, backend_cleaned_at, token);
-
--- Foreign-key cascades can remove occurrences before asynchronous attachment
--- reconciliation observes the deletion. Invalidate search cursors at the
--- authoritative row mutation so every deletion path is covered.
-CREATE TRIGGER IF NOT EXISTS trg_document_occurrence_delete_revision
-AFTER DELETE ON document_occurrences FOR EACH ROW
-BEGIN
-    UPDATE document_index_state
-    SET revision = revision + 1, updated_at = CURRENT_TIMESTAMP
-    WHERE singleton = 1;
-END;
-
--- Message type is a document-search filter. Invalidate cursors when an indexed
--- occurrence moves between filter scopes, regardless of which importer made
--- the authoritative message update.
-CREATE TRIGGER IF NOT EXISTS trg_document_message_type_revision
-AFTER UPDATE OF message_type ON messages FOR EACH ROW
-WHEN OLD.message_type IS NOT NEW.message_type
- AND EXISTS (
-     SELECT 1
-     FROM document_occurrences o
-     JOIN document_extraction_heads h
-       ON h.canonical_blob_hash = o.canonical_blob_hash
-     WHERE o.message_id = NEW.id
- )
-BEGIN
-    UPDATE document_index_state
-    SET revision = revision + 1, updated_at = CURRENT_TIMESTAMP
-    WHERE singleton = 1;
-END;
 CREATE INDEX IF NOT EXISTS idx_attachment_pack_index_pack
     ON attachment_pack_index(pack_id);
 
@@ -4457,6 +4109,13 @@ CREATE TABLE IF NOT EXISTS activity_projection_queue (
     queued_at           DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Membership writes mark one conversation; the activity drain expands its messages.
+-- No foreign key: a cascading conversation delete can leave a harmless marker.
+CREATE TABLE IF NOT EXISTS activity_projection_conversation_queue (
+    conversation_id INTEGER PRIMARY KEY,
+    after_message_id INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_activity_projection_queue_pending
     ON activity_projection_queue(message_id)
     WHERE revision > processed_revision;
@@ -4506,48 +4165,7 @@ BEGIN
         queued_at = CURRENT_TIMESTAMP;
 END;
 
-CREATE TRIGGER IF NOT EXISTS trg_activity_queue_conversation_people_insert
-AFTER INSERT ON conversation_participants FOR EACH ROW
-BEGIN
-    INSERT INTO activity_projection_queue (message_id, revision, queued_at)
-    SELECT id, 1, CURRENT_TIMESTAMP
-    FROM messages
-    WHERE conversation_id = NEW.conversation_id
-    ON CONFLICT(message_id) DO UPDATE SET
-        revision = activity_projection_queue.revision + 1,
-        queued_at = CURRENT_TIMESTAMP;
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_activity_queue_conversation_people_update
-AFTER UPDATE ON conversation_participants FOR EACH ROW
-BEGIN
-    INSERT INTO activity_projection_queue (message_id, revision, queued_at)
-    SELECT id, 1, CURRENT_TIMESTAMP
-    FROM messages
-    WHERE conversation_id = OLD.conversation_id
-    ON CONFLICT(message_id) DO UPDATE SET
-        revision = activity_projection_queue.revision + 1,
-        queued_at = CURRENT_TIMESTAMP;
-    INSERT INTO activity_projection_queue (message_id, revision, queued_at)
-    SELECT id, 1, CURRENT_TIMESTAMP
-    FROM messages
-    WHERE conversation_id = NEW.conversation_id
-    ON CONFLICT(message_id) DO UPDATE SET
-        revision = activity_projection_queue.revision + 1,
-        queued_at = CURRENT_TIMESTAMP;
-END;
-
-CREATE TRIGGER IF NOT EXISTS trg_activity_queue_conversation_people_delete
-AFTER DELETE ON conversation_participants FOR EACH ROW
-BEGIN
-    INSERT INTO activity_projection_queue (message_id, revision, queued_at)
-    SELECT id, 1, CURRENT_TIMESTAMP
-    FROM messages
-    WHERE conversation_id = OLD.conversation_id
-    ON CONFLICT(message_id) DO UPDATE SET
-        revision = activity_projection_queue.revision + 1,
-        queued_at = CURRENT_TIMESTAMP;
-END;
+-- Membership triggers are installed by SQLiteDialect.EnsureActivityProjectionTriggers.
 
 -- Conversation updates are classification input: changing email/chat/channel
 -- semantics must reproject every native message already in the conversation.
@@ -4742,3 +4360,101 @@ CREATE INDEX IF NOT EXISTS idx_docbank_attachments_ready
  ON docbank_attachment_deliveries(destination_key, state);
 CREATE INDEX IF NOT EXISTS idx_docbank_attachment_receipts
  ON docbank_attachment_deliveries(content_hash, state);
+
+-- Staged chat policy. Missing rows remain full for backwards compatibility.
+CREATE TABLE IF NOT EXISTS conversation_policy (
+ conversation_id INTEGER PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+ effective_tier TEXT NOT NULL DEFAULT 'full' CHECK (effective_tier IN ('full','cold','stub','skip')),
+ override_tier TEXT CHECK (override_tier IN ('full','cold','stub','skip')),
+ last_activity_at DATETIME
+);
+
+-- Typed calendar evidence rebuilt from raw provider snapshots.
+CREATE TABLE IF NOT EXISTS calendar_events (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    projection_version INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    provider_event_id TEXT NOT NULL DEFAULT '',
+    series_provider_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',
+    original_start_at DATETIME,
+    original_start_date TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT '',
+    all_day BOOLEAN NOT NULL DEFAULT FALSE,
+    start_at DATETIME,
+    end_at DATETIME,
+    start_date TEXT NOT NULL DEFAULT '',
+    end_date TEXT NOT NULL DEFAULT '',
+    event_time_zone TEXT NOT NULL DEFAULT '',
+    calendar_time_zone TEXT NOT NULL DEFAULT '',
+    recurrence_json TEXT NOT NULL DEFAULT '[]',
+    recurrence_end_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_calendar_events_start ON calendar_events(start_at);
+CREATE INDEX IF NOT EXISTS idx_calendar_events_recurrence_end ON calendar_events(recurrence_end_at);
+CREATE INDEX IF NOT EXISTS idx_calendar_events_provider_id ON calendar_events(provider_event_id);
+CREATE TABLE IF NOT EXISTS calendar_event_attendees (
+    message_id INTEGER NOT NULL REFERENCES calendar_events(message_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL,
+    rsvp TEXT NOT NULL,
+    is_copy_self BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (message_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS loop_decisions (
+ message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+ state TEXT NOT NULL CHECK (state IN ('done', 'snoozed')),
+ snoozed_until DATETIME,
+ CHECK ((state = 'snoozed') = (snoozed_until IS NOT NULL))
+);
+
+-- Retained message facts for bounded request-time loop detection.
+CREATE TABLE IF NOT EXISTS loop_message_evidence (
+ message_id INTEGER PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+ rule_version INTEGER NOT NULL,
+ token TEXT NOT NULL,
+ facts TEXT
+);
+CREATE TRIGGER IF NOT EXISTS trg_loop_evidence_message_raw_insert
+AFTER INSERT ON message_raw FOR EACH ROW BEGIN
+ DELETE FROM loop_message_evidence WHERE message_id = NEW.message_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_loop_evidence_message_raw_update
+AFTER UPDATE ON message_raw FOR EACH ROW
+WHEN OLD.message_id IS NOT NEW.message_id OR OLD.raw_data IS NOT NEW.raw_data OR OLD.raw_format IS NOT NEW.raw_format OR OLD.compression IS NOT NEW.compression OR OLD.encryption_version IS NOT NEW.encryption_version BEGIN
+ DELETE FROM loop_message_evidence WHERE message_id IN (OLD.message_id, NEW.message_id);
+END;
+CREATE TRIGGER IF NOT EXISTS trg_loop_evidence_message_raw_delete
+AFTER DELETE ON message_raw FOR EACH ROW BEGIN
+ DELETE FROM loop_message_evidence WHERE message_id = OLD.message_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_loop_evidence_message_bodies_insert
+AFTER INSERT ON message_bodies FOR EACH ROW BEGIN
+ DELETE FROM loop_message_evidence WHERE message_id = NEW.message_id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_loop_evidence_message_bodies_update
+AFTER UPDATE ON message_bodies FOR EACH ROW
+WHEN OLD.message_id IS NOT NEW.message_id OR OLD.body_text IS NOT NEW.body_text BEGIN
+ DELETE FROM loop_message_evidence WHERE message_id IN (OLD.message_id, NEW.message_id);
+END;
+CREATE TRIGGER IF NOT EXISTS trg_loop_evidence_message_bodies_delete
+AFTER DELETE ON message_bodies FOR EACH ROW BEGIN
+ DELETE FROM loop_message_evidence WHERE message_id = OLD.message_id;
+END;
+
+-- Processing requests belong to the mirrored file and Docbank profile fingerprint.
+CREATE TABLE IF NOT EXISTS docbank_attachment_processing (
+ destination_key TEXT NOT NULL,
+ content_hash TEXT NOT NULL,
+ fingerprint TEXT NOT NULL,
+ outcome TEXT NOT NULL,
+ job_id TEXT NOT NULL,
+ next_action_at DATETIME,
+ PRIMARY KEY (destination_key, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_docbank_processing_due
+ ON docbank_attachment_processing(destination_key, fingerprint, next_action_at, content_hash)
+ WHERE next_action_at IS NOT NULL;

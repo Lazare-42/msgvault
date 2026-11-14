@@ -600,10 +600,10 @@ func newPersonFactLedgerStore(t *testing.T) (*Store, int64) {
 	var st *Store
 	testDB := os.Getenv("MSGVAULT_TEST_DB")
 	if IsPostgresURL(testDB) {
-		st = newPGStoreInternal(t, testDB)
+		st = newPGStoreInternal(t)
 	} else {
 		var err error
-		st, err = OpenForTest(filepath.Join(t.TempDir(), "fact-ledger.db"))
+		st, err = OpenForTest(t.Context(), filepath.Join(t.TempDir(), "fact-ledger.db"))
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = st.Close() })
 		require.NoError(t, st.InitSchema())

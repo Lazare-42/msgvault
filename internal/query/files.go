@@ -91,6 +91,7 @@ type FileGroupRequest struct {
 }
 
 type FileRow struct {
+	SenderLabel        string                `json:"sender_label,omitempty"`
 	ID                 int64                 `json:"id"`
 	Key                string                `json:"key"`
 	EntryKey           string                `json:"entry_key"`
@@ -178,7 +179,7 @@ func (e *DuckDBEngine) SearchFiles(ctx context.Context, request FileSearchReques
 	var queryText string
 	if request.Person != nil {
 		personCTEs, personArgs := personFileMatchCTEs(*request.Person)
-		if !e.exploreFastPathDisabled && !exploreConditionsTouchParticipantLists(explore) {
+		if !e.exploreFastPathDisabled {
 			queryText = buildPersonFileSearchFastSQL(personCTEs, exploreConditions, fileConditions, order)
 		} else {
 			queryText = personFileSearchSQL(
@@ -187,7 +188,7 @@ func (e *DuckDBEngine) SearchFiles(ctx context.Context, request FileSearchReques
 		}
 		args = append(append(personArgs, exploreArgs...), fileArgs...)
 		args = append(args, limit, request.Page.Offset)
-	} else if !e.exploreFastPathDisabled && !exploreConditionsTouchParticipantLists(explore) {
+	} else if !e.exploreFastPathDisabled {
 		queryText = buildFileSearchFastSQL(exploreConditions, fileConditions, order)
 		args = append(args, exploreArgs...) // total-count scan
 		args = append(args, fileArgs...)
@@ -209,7 +210,7 @@ func (e *DuckDBEngine) SearchFiles(ctx context.Context, request FileSearchReques
 			&row.ID, &row.Key, &row.EntryKey, &row.MessageID, &row.ConversationID,
 			&row.OccurredAt, &row.SourceID, &row.SourceType, &row.SourceIdentifier,
 			&row.ContainingTitle, &rawSnippet, &row.Filename, &row.MimeType, &row.MIMEFamily, &row.Size,
-			&participantIDsJSON, &participantLabelsJSON, &participantDomainsJSON,
+			&participantIDsJSON, &participantLabelsJSON, &participantDomainsJSON, &row.SenderLabel,
 		}
 		if request.Person != nil {
 			scanTargets = append(scanTargets, &personParticipantIDsJSON,
@@ -284,7 +285,8 @@ func (e *DuckDBEngine) GroupFiles(ctx context.Context, request FileGroupRequest)
 		return nil, err
 	}
 	spec, err := fileGroupExpressions(request.Dimension,
-		e.parquetPath(identityindex.DatasetPeople), e.parquetPath(datasetParticipants))
+		e.parquetPath(identityindex.DatasetPeople), e.parquetPath(datasetParticipants),
+		e.parquetPath(datasetParticipantClusters), e.parquetPath(datasetPersonDisplayNames))
 	if err != nil {
 		return nil, err
 	}
@@ -320,9 +322,7 @@ func (e *DuckDBEngine) GroupFiles(ctx context.Context, request FileGroupRequest)
 	GROUP BY ` + spec.groupBy + `
 ), counted AS (
 	SELECT *, COUNT(*) OVER () AS total_count FROM grouped
-)
-SELECT group_key, group_label, group_count, estimated_bytes, latest_at, total_count
-FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+` + analyticalGroupPageSQL(spec.pageLabel, order, "")
 	args = append(args, limit, request.Page.Offset)
 	rows, err := e.db.QueryContext(ctx, queryText, args...)
 	if err != nil {
@@ -493,8 +493,8 @@ func personFileMatchCTEs(scope PersonFileScope) (string, []any) {
 `, args
 }
 
-// personFilePopulationSQL retains the legacy single-pass query for filters
-// that already require analytical participant lists and for equivalence tests.
+// personFilePopulationSQL retains the legacy single-pass query for
+// equivalence tests.
 func personFilePopulationSQL(personCTEs, exploreConditions, fileConditions string) string {
 	return "WITH " + personCTEs + `, selected AS (
 	SELECT analytical_entries.*, person_matches.person_participant_ids,
@@ -558,14 +558,10 @@ func buildFileConditions(filenameQuery string, mimeFamilies []FileMIMEFamily) (s
 // (file, canonical) row, so the file is never double-counted (attachment_id
 // carries per-file uniqueness).
 //
-// Participant labels resolve through hash joins rather than the correlated
-// relationship_people lookup entry grouping uses: file groups can key on
-// canonicals that dataset lacks — a person whose only activity is
-// conversation-roster membership on non-chat messages has no people-list
-// rows but still receives file attributions here — so a base-participants
-// lookup backstops the people-dataset label before the constant fallback.
+// Draft-only and non-chat roster-only participants have no sent-activity
+// directory row. Resolve their shared cluster label after pagination.
 func fileGroupExpressions(
-	dimension, peopleGlob, participantsGlob string,
+	dimension, peopleGlob, participantsGlob, clustersGlob, personDisplayNamesGlob string,
 ) (groupExpressions, error) {
 	simple := func(key string) groupExpressions {
 		return groupExpressions{key: key, label: key, groupBy: key, source: "file_population"}
@@ -578,7 +574,8 @@ func fileGroupExpressions(
 		}, nil
 	case "participant":
 		return groupExpressions{
-			key: "CAST(person_id AS VARCHAR)", label: "any_value(person_label)", groupBy: "person_id",
+			key: "CAST(person_id AS VARCHAR)", label: sqlIndexedPersonGroupLabelExpr(peopleGlob), groupBy: "person_id",
+			pageLabel: "COALESCE(group_label, " + sqlPersonGroupLabelExpr(participantsGlob, clustersGlob, personDisplayNamesGlob) + ", 'Unknown person #' || group_key)",
 			cte: `
 , participant_files AS (
 	SELECT DISTINCT f.attachment_id, a.canonical_id AS person_id, f.occurred_at, f.size
@@ -586,15 +583,8 @@ func fileGroupExpressions(
 	JOIN relationship_activity_expanded a ON a.message_id = f.message_id
 	WHERE a.canonical_id IS NOT NULL
 	  AND (a.is_direct OR a.is_conversation_member)
-), participant_file_labels AS (
-	SELECT pf.*, COALESCE(dp.display_label,
-		NULLIF(` + sqlAnalyticalEntriesParticipantLabel("pb") + `, ''),
-		'Unknown person #' || CAST(pf.person_id AS VARCHAR)) AS person_label
-	FROM participant_files pf
-	LEFT JOIN read_parquet('` + peopleGlob + `') dp ON dp.canonical_id = pf.person_id
-	LEFT JOIN read_parquet('` + participantsGlob + `') pb ON pb.id = pf.person_id
 )`,
-			source: "participant_file_labels",
+			source: "participant_files",
 		}, nil
 	case "domain":
 		return groupExpressions{
@@ -621,6 +611,8 @@ func fileGroupExpressions(
 		return simple("strftime(occurred_at, '%Y')"), nil
 	case timeGranularityMonth:
 		return simple("strftime(occurred_at, '%Y-%m')"), nil
+	case timeGranularityDay:
+		return simple("strftime(occurred_at, '%Y-%m-%d')"), nil
 	default:
 		return groupExpressions{}, fmt.Errorf("%w: unknown file group dimension %q", ErrInvalidExploreRequest, dimension)
 	}
@@ -707,6 +699,10 @@ func fileSearchSQL(population, order string) string {
 	return population + `
 , counted AS (
 	SELECT *, COUNT(*) OVER () AS total_count FROM file_population
+), page AS MATERIALIZED (
+    SELECT * FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?
+), page_senders AS (
+    ` + sqlPageSenderLabels("SELECT message_id FROM page") + `
 )
 SELECT
 	attachment_id,
@@ -719,14 +715,21 @@ SELECT
 	CAST(COALESCE(to_json(file_participant_ids), '[]') AS VARCHAR),
 	CAST(COALESCE(to_json(list_sort(list_distinct(list_concat(participant_labels, conversation_participant_labels)))), '[]') AS VARCHAR),
 	CAST(COALESCE(to_json(file_participant_domains), '[]') AS VARCHAR),
+	COALESCE(sender_label, ''),
 	total_count
-FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+FROM page
+LEFT JOIN page_senders senders ON senders.sender_message_id = page.message_id
+ORDER BY ` + order
 }
 
 func personFileSearchSQL(population, order string) string {
 	return population + `
 , counted AS (
 	SELECT *, COUNT(*) OVER () AS total_count FROM file_population
+), page AS MATERIALIZED (
+    SELECT * FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?
+), page_senders AS (
+    ` + sqlPageSenderLabels("SELECT message_id FROM page") + `
 )
 SELECT
 	attachment_id,
@@ -739,14 +742,17 @@ SELECT
 	CAST(COALESCE(to_json(file_participant_ids), '[]') AS VARCHAR),
 	CAST(COALESCE(to_json(list_sort(list_distinct(list_concat(participant_labels, conversation_participant_labels)))), '[]') AS VARCHAR),
 	CAST(COALESCE(to_json(file_participant_domains), '[]') AS VARCHAR),
+	COALESCE(sender_label, ''),
 	CAST(COALESCE(to_json(person_participant_ids), '[]') AS VARCHAR),
 	has_from, has_to, has_cc, has_bcc, has_group,
 	total_count
-FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?`
+FROM page
+LEFT JOIN page_senders senders ON senders.sender_message_id = page.message_id
+ORDER BY ` + order
 }
 
-// buildFileSearchFastSQL builds the two-phase file page query used when
-// exploreConditionsTouchParticipantLists is false. Phase one orders and
+// buildFileSearchFastSQL builds the two-phase file page query used unless
+// the fast path is disabled for equivalence tests. Phase one orders and
 // limits the filtered attachment population without referencing any
 // participant list column, so the whole-archive per-message list assembly
 // inside analytical_entries is pruned; phase two rebuilds the participant
@@ -774,6 +780,8 @@ func buildFileSearchFastSQL(exploreConditions, fileConditions, order string) str
 		FROM (SELECT message_id FROM entry_core AS analytical_entries WHERE ` + exploreConditions + `) s
 		JOIN attachments a ON a.message_id = s.message_id
 	) WHERE ` + fileConditions + `
+), page_senders AS (
+    ` + sqlPageSenderLabels("SELECT message_id FROM page") + `
 ), page_ids AS (
 	SELECT DISTINCT message_id, conversation_id FROM page
 ), page_links AS (
@@ -795,9 +803,10 @@ func buildFileSearchFastSQL(exploreConditions, fileConditions, order string) str
 	JOIN participants pt ON pt.id = links.participant_id
 	GROUP BY links.message_id
 ), enriched AS (
-	SELECT page.*, f.file_participant_ids, f.file_participant_labels, f.file_participant_domains,
+	SELECT page.*, f.file_participant_ids, f.file_participant_labels, f.file_participant_domains, senders.sender_label,
 		(SELECT total_count FROM total) AS total_count
 	FROM page LEFT JOIN page_facts f ON f.message_id = page.message_id
+	LEFT JOIN page_senders senders ON senders.sender_message_id = page.message_id
 )
 SELECT
 	attachment_id,
@@ -810,6 +819,7 @@ SELECT
 	CAST(COALESCE(to_json(file_participant_ids), '[]') AS VARCHAR),
 	CAST(COALESCE(to_json(file_participant_labels), '[]') AS VARCHAR),
 	CAST(COALESCE(to_json(file_participant_domains), '[]') AS VARCHAR),
+	COALESCE(sender_label, ''),
 	total_count
 FROM enriched ORDER BY ` + order
 }
@@ -841,6 +851,8 @@ selected AS (
 	ORDER BY ` + order + ` LIMIT ? OFFSET ?
 ), total AS (
 	SELECT COUNT(*) AS total_count FROM filtered
+), page_senders AS (
+    ` + sqlPageSenderLabels("SELECT message_id FROM page") + `
 ), page_ids AS (
 	SELECT DISTINCT message_id, conversation_id FROM page
 ), page_links AS (
@@ -862,9 +874,10 @@ selected AS (
 	JOIN participants pt ON pt.id = links.participant_id
 	GROUP BY links.message_id
 ), enriched AS (
-	SELECT page.*, f.file_participant_ids, f.file_participant_labels, f.file_participant_domains,
+	SELECT page.*, f.file_participant_ids, f.file_participant_labels, f.file_participant_domains, senders.sender_label,
 		(SELECT total_count FROM total) AS total_count
 	FROM page LEFT JOIN page_facts f ON f.message_id = page.message_id
+	LEFT JOIN page_senders senders ON senders.sender_message_id = page.message_id
 )
 SELECT
 	attachment_id,
@@ -877,6 +890,7 @@ SELECT
 	CAST(COALESCE(to_json(file_participant_ids), '[]') AS VARCHAR),
 	CAST(COALESCE(to_json(file_participant_labels), '[]') AS VARCHAR),
 	CAST(COALESCE(to_json(file_participant_domains), '[]') AS VARCHAR),
+	COALESCE(sender_label, ''),
 	CAST(COALESCE(to_json(person_participant_ids), '[]') AS VARCHAR),
 	has_from, has_to, has_cc, has_bcc, has_group,
 	total_count

@@ -22,10 +22,21 @@ type messageRow struct {
 
 // ImportSummary holds statistics from a completed import run.
 type ImportSummary struct {
+	MessagesAdded         int
+	MessagesUpdated       int
 	MessagesImported      int
 	ConversationsImported int
 	ParticipantsResolved  int
 	// DatesCleared counts existing archived dates removed for invalid source timestamps.
 	DatesCleared int
 	Skipped      int
+	// AttachmentFailures counts imported messages whose attachment capture failed.
+	AttachmentFailures int
+	// AttachmentsUnavailable counts attachments whose file could not be read locally.
+	AttachmentsUnavailable int
+	// AttachmentsSkipped counts attachments left out by the media policy.
+	AttachmentsSkipped int
+	// BodiesUndecoded counts messages whose attributedBody could not be
+	// decoded. Their archived text, if any, is kept.
+	BodiesUndecoded int
 }

@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/msgvault/internal/personagenda"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/taskclient"
+	"go.kenn.io/msgvault/internal/testutil/katatest"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -31,7 +32,16 @@ type fakeKataIssueOperations struct {
 	found     [2]int64
 	read      string
 	offset    int
+	query     string
 	err       error
+}
+
+func (f *fakeKataIssueOperations) Open(_ context.Context, query string) ([]taskclient.KataTask, bool, error) {
+	f.query = query
+	if f.err != nil {
+		return nil, false, f.err
+	}
+	return []taskclient.KataTask{{UID: "01ISSUE", Ref: "abcd", QualifiedRef: "example#abcd", Project: "example", Title: "Send the budget", Status: "open", Revision: "3"}}, true, f.err
 }
 
 func (f *fakeKataIssueOperations) Find(_ context.Context, messageID, attachmentID int64) ([]taskclient.KataTask, bool, error) {
@@ -59,8 +69,8 @@ func (f *fakeKataIssueOperations) Link(_ context.Context, ref string, _ []kataev
 	return taskclient.KataTask{UID: "01ISSUE", Ref: "abcd", QualifiedRef: "example#abcd", Project: "example", Status: "open", Revision: "2"}, f.err
 }
 
-func serveKataIssue(server *Server, path, body string, headers map[string]string) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+func serveKataIssue(ctx context.Context, server *Server, path, body string, headers map[string]string) *httptest.ResponseRecorder {
+	request := httptest.NewRequestWithContext(ctx, http.MethodPost, path, strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	for name, value := range headers {
 		request.Header.Set(name, value)
@@ -77,7 +87,7 @@ func TestKataIssueHTTP(t *testing.T) {
 	operations := &fakeKataIssueOperations{}
 	server := NewServerWithOptions(ServerOptions{Config: &config.Config{}, Store: &mockStore{}, Logger: testLogger(), KataIssueOperations: operations})
 
-	prepared := serveKataIssue(server, kataEvidencePreparePath, `{"selectors":[{"kind":"message","message_id":7,"start_rune":1000,"max_chars":1000}]}`, nil)
+	prepared := serveKataIssue(t.Context(), server, kataEvidencePreparePath, `{"selectors":[{"kind":"message","message_id":7,"start_rune":1000,"max_chars":1000}]}`, nil)
 	require.Equal(http.StatusOK, prepared.Code, prepared.Body.String())
 	var preparedBody KataEvidencePrepareResponse
 	require.NoError(json.Unmarshal(prepared.Body.Bytes(), &preparedBody))
@@ -86,11 +96,11 @@ func TestKataIssueHTTP(t *testing.T) {
 	assert.Equal(1000, *operations.selectors[0].StartRune)
 
 	createBody := `{"title":"Send the budget","list":"follow up","person_id":3,"evidence":[{"version":1,"kind":"message","archive_uid":"archive","message_id":7,"source_type":"email","source_identifier":"inbox@example.com","source_message_id":"m7","message":{"body_sha256":"` + strings.Repeat("ab", 32) + `","start_rune":0,"end_rune":5}}]}`
-	missingKey := serveKataIssue(server, "/api/v1/integrations/kata/issues", createBody, nil)
+	missingKey := serveKataIssue(t.Context(), server, "/api/v1/integrations/kata/issues", createBody, nil)
 	assert.Equal(http.StatusPreconditionRequired, missingKey.Code)
 	assert.Empty(operations.key, "a key the daemon rejects never reaches the service")
 
-	created := serveKataIssue(server, "/api/v1/integrations/kata/issues", createBody, map[string]string{"Idempotency-Key": "key-1"})
+	created := serveKataIssue(t.Context(), server, "/api/v1/integrations/kata/issues", createBody, map[string]string{"Idempotency-Key": "key-1"})
 	require.Equal(http.StatusCreated, created.Code, created.Body.String())
 	var createdBody KataIssueResponse
 	require.NoError(json.Unmarshal(created.Body.Bytes(), &createdBody))
@@ -101,12 +111,12 @@ func TestKataIssueHTTP(t *testing.T) {
 	require.NotNil(operations.created.PersonID)
 	assert.Equal(int64(3), *operations.created.PersonID)
 
-	linked := serveKataIssue(server, "/api/v1/integrations/kata/issues/example%23abcd/evidence", `{"evidence":[]}`, nil)
+	linked := serveKataIssue(t.Context(), server, "/api/v1/integrations/kata/issues/example%23abcd/evidence", `{"evidence":[]}`, nil)
 	require.Equal(http.StatusOK, linked.Code, linked.Body.String())
 	assert.Equal("example#abcd", operations.linkedRef)
 
 	lookup := httptest.NewRecorder()
-	server.router.ServeHTTP(lookup, httptest.NewRequest(http.MethodGet, "/api/v1/integrations/kata/issues?message_id=7&attachment_id=3", nil))
+	server.router.ServeHTTP(lookup, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/kata/issues?message_id=7&attachment_id=3", nil))
 	require.Equal(http.StatusOK, lookup.Code, lookup.Body.String())
 	var found KataIssueListResponse
 	require.NoError(json.Unmarshal(lookup.Body.Bytes(), &found))
@@ -115,11 +125,11 @@ func TestKataIssueHTTP(t *testing.T) {
 	assert.Equal("closed", found.Issues[0].Status)
 	assert.True(found.Truncated)
 	missing := httptest.NewRecorder()
-	server.router.ServeHTTP(missing, httptest.NewRequest(http.MethodGet, "/api/v1/integrations/kata/issues?attachment_id=3", nil))
+	server.router.ServeHTTP(missing, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/kata/issues?attachment_id=3", nil))
 	assert.Equal(http.StatusBadRequest, missing.Code)
 
 	read := httptest.NewRecorder()
-	server.router.ServeHTTP(read, httptest.NewRequest(http.MethodGet, "/api/v1/integrations/kata/issues/example%23abcd/context?offset=10", nil))
+	server.router.ServeHTTP(read, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/kata/issues/example%23abcd/context?offset=10", nil))
 	require.Equal(http.StatusOK, read.Code, read.Body.String())
 	assert.Equal("no-store", read.Header().Get("Cache-Control"))
 	var issueContext KataIssueContextResponse
@@ -130,7 +140,7 @@ func TestKataIssueHTTP(t *testing.T) {
 	assert.Equal("Send the budget", issueContext.Passages[0].SavedQuote)
 	assert.Equal(20, issueContext.NextOffset)
 	negative := httptest.NewRecorder()
-	server.router.ServeHTTP(negative, httptest.NewRequest(http.MethodGet, "/api/v1/integrations/kata/issues/example%23abcd/context?offset=-1", nil))
+	server.router.ServeHTTP(negative, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/kata/issues/example%23abcd/context?offset=-1", nil))
 	assert.Equal(http.StatusBadRequest, negative.Code)
 
 	for _, tc := range []struct {
@@ -153,7 +163,7 @@ func TestKataIssueHTTP(t *testing.T) {
 		{fmt.Errorf("%w: connection refused", kataevidence.ErrDocbankUnavailable), http.StatusServiceUnavailable, "archive_unavailable", "Docbank could not be reached; retry later"},
 	} {
 		operations.err = tc.err
-		failed := serveKataIssue(server, "/api/v1/integrations/kata/issues", createBody, map[string]string{"Idempotency-Key": "key-2"})
+		failed := serveKataIssue(t.Context(), server, "/api/v1/integrations/kata/issues", createBody, map[string]string{"Idempotency-Key": "key-2"})
 		assert.Equal(tc.status, failed.Code)
 		assert.Contains(failed.Body.String(), tc.code)
 		if tc.message != "" {
@@ -187,7 +197,7 @@ func TestKataIssueLookupArchiveErrors(t *testing.T) {
 	}{
 		{"archive identity missing", func(t *testing.T, f *storetest.Fixture) int64 {
 			t.Helper()
-			_, err := f.Store.DB().Exec("DELETE FROM archive_metadata WHERE key='archive_uid'")
+			_, err := f.Store.DB().ExecContext(t.Context(), "DELETE FROM archive_metadata WHERE key='archive_uid'")
 			require.NoError(t, err)
 			return 1
 		}, http.StatusServiceUnavailable, "archive_unavailable"},
@@ -203,7 +213,7 @@ func TestKataIssueLookupArchiveErrors(t *testing.T) {
 				KataIssueOperations: &kataIssueBackend{store: f.Store},
 			})
 			response := httptest.NewRecorder()
-			server.router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/integrations/kata/issues?message_id=%d", id), nil))
+			server.router.ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, fmt.Sprintf("/api/v1/integrations/kata/issues?message_id=%d", id), nil))
 			assert.Equal(t, tc.status, response.Code)
 			var body struct {
 				Error string `json:"error"`
@@ -223,4 +233,58 @@ func TestKataIssueBackendWarnsWithoutMediaRevisions(t *testing.T) {
 	assert.Contains(t, logs.String(), "Kata transcript citations disabled: the archive store cannot read media revisions")
 	_, err := backend.Prepare(t.Context(), []kataevidence.Selector{{Kind: "docbank_rendition", MessageID: 1, AttachmentID: 1, MaxChars: new(10)}})
 	require.ErrorIs(t, err, kataevidence.ErrUnsupported)
+}
+
+func TestListOpenKataIssues(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	fake := &fakeKataIssueOperations{}
+	server := NewServerWithOptions(ServerOptions{Config: &config.Config{}, Store: &mockStore{}, Logger: testLogger(), KataIssueOperations: fake})
+	recorder := httptest.NewRecorder()
+	server.router.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/kata/open-issues?q=+budget+", nil))
+	assert.Equal("budget", fake.query)
+	tooLong := httptest.NewRecorder()
+	server.router.ServeHTTP(tooLong, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/kata/open-issues?q="+strings.Repeat("a", 257), nil))
+	assert.Equal(http.StatusBadRequest, tooLong.Code)
+	require.Equal(http.StatusOK, recorder.Code, recorder.Body.String())
+	assert.Equal("no-store", recorder.Header().Get("Cache-Control"))
+	var body KataIssueListResponse
+	require.NoError(json.Unmarshal(recorder.Body.Bytes(), &body))
+	require.Len(body.Issues, 1)
+	assert.Equal("example#abcd", body.Issues[0].QualifiedRef)
+	assert.Equal("Send the budget", body.Issues[0].Title)
+	assert.Equal("open", body.Issues[0].Status)
+	assert.True(body.Truncated)
+	server.kataIssueOperations = nil
+	recorder = httptest.NewRecorder()
+	server.router.ServeHTTP(recorder, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/integrations/kata/open-issues", nil))
+	assert.Equal(http.StatusServiceUnavailable, recorder.Code)
+	assert.Contains(recorder.Body.String(), "kata_unavailable")
+}
+
+func TestKataIssueBackendOpenListsAndSearches(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	native := katatest.New(t)
+	server := httptest.NewServer(native.Service.Handler())
+	t.Cleanup(server.Close)
+	cfg := config.TaskIntegrationConfig{Enabled: true, Endpoint: server.URL, APIKey: katatest.Token, DefaultProject: katatest.Project}
+	client, err := connectKata(t.Context(), cfg)
+	require.NoError(err)
+	older, err := client.CreateTask(t.Context(), katatest.Project, "older", taskclient.KataCreate{Title: "Review winter budget"})
+	require.NoError(err)
+	_, err = client.CreateTask(t.Context(), katatest.Project, "newer", taskclient.KataCreate{Title: "Plan spring"})
+	require.NoError(err)
+	backend := &kataIssueBackend{config: cfg}
+	issues, truncated, err := backend.Open(t.Context(), "")
+	require.NoError(err)
+	assert.False(truncated)
+	require.Len(issues, 2)
+	issues, truncated, err = backend.Open(t.Context(), older.QualifiedRef)
+	require.NoError(err)
+	assert.False(truncated)
+	require.Len(issues, 1)
+	assert.Equal(older.UID, issues[0].UID)
 }

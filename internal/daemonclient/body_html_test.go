@@ -23,7 +23,8 @@ func TestGeneratedDetailKeepsBodyHTML(t *testing.T) {
 
 	// HTML-only: the daemon's body is the HTML fallback; it must not be
 	// reported as text.
-	msg = generatedDetailToAPIMessage(&generated.MessageDetail{Body: html, BodyHTML: &html})
+	empty := ""
+	msg = generatedDetailToAPIMessage(&generated.MessageDetail{Body: html, BodyHTML: &html, BodyText: &empty})
 	detail = queryDetailFromAPIMessage(msg)
 	assert.Empty(detail.BodyText)
 	assert.Equal(html, detail.BodyHTML)

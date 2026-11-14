@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -37,6 +38,18 @@ type Assembly struct {
 	EvidenceStatusChanges []personfacts.EvidenceStatusChange
 	Packet                EvidencePacket
 	Batches               []PacketBatch
+
+	// ContextPriority lists retained context evidence IDs, highest priority first.
+	ContextPriority []string
+}
+
+// AssemblyProgress is the archive-derived state needed before constructing a
+// provider packet. It lets workers apply evidence retractions first.
+type AssemblyProgress struct {
+	Windows               []PersonWindow
+	CursorEnvelope        []GenerationCursor
+	EvidenceStatusChanges []personfacts.EvidenceStatusChange
+	Seeds                 []EvidenceItem
 }
 
 type Assembler struct {
@@ -52,31 +65,30 @@ type Assembler struct {
 }
 
 func (a Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembly, error) {
-	if a.Source == nil || request.PersonID <= 0 || len(request.Cursors) == 0 {
-		return Assembly{}, errors.New("person sweep assembly requires source, person, and cursors")
+	progress, err := a.Discover(ctx, request)
+	if err != nil {
+		return Assembly{}, err
 	}
-	if a.MaxBytes <= 0 || a.MaxItems <= 0 || a.ContextPerTarget < 0 {
-		return Assembly{}, errors.New("person sweep assembly limits are invalid")
+	return a.BuildPacket(ctx, request, progress)
+}
+
+// Discover loads archive windows and determines cursor progress and evidence
+// status changes without reading projection state or validating packet limits.
+func (a Assembler) Discover(ctx context.Context, request AssemblyRequest) (AssemblyProgress, error) {
+	if a.Source == nil || request.PersonID <= 0 || len(request.Cursors) == 0 {
+		return AssemblyProgress{}, errors.New("person sweep assembly requires source, person, and cursors")
 	}
 	if request.Now.IsZero() || request.BackstopInterval <= 0 {
-		return Assembly{}, errors.New("person sweep backstop selection requires current time and positive interval")
+		return AssemblyProgress{}, errors.New("person sweep backstop selection requires current time and positive interval")
 	}
 	request.Now = request.Now.UTC()
 	windowLimit := a.WindowLimit
 	if windowLimit <= 0 {
-		windowLimit = a.MaxItems
+		windowLimit = max(a.MaxItems, 1)
 	}
 	after, before, err := contextDateBounds(request.Profile.SourceSince, request.Profile.SourceUntil)
 	if err != nil {
-		return Assembly{}, err
-	}
-
-	basePacket, err := packetForProfile(EvidencePacket{
-		PersonID: request.PersonID, ProgramID: ExtractionProgramID,
-		ProgramVersion: ExtractionProgramVersion, Catalog: request.Catalog,
-	}, request.Profile)
-	if err != nil {
-		return Assembly{}, err
+		return AssemblyProgress{}, err
 	}
 	cursors := append([]Cursor(nil), request.Cursors...)
 	sort.Slice(cursors, func(i, j int) bool {
@@ -89,7 +101,7 @@ func (a Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembly
 		return cursors[i].Key.CatalogFingerprint < cursors[j].Key.CatalogFingerprint
 	})
 
-	result := Assembly{}
+	result := AssemblyProgress{}
 	allChanges := make([]ArchiveChange, 0)
 	seedByID := make(map[string]EvidenceItem)
 	progressWindows := 0
@@ -97,8 +109,8 @@ func (a Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembly
 		backstop, loadErr := a.loadWindow(ctx, WindowRequest{
 			PersonID: request.PersonID, Lane: cursor.Key.SourceLane,
 			Mode: GenerationCursorBackstop, ReconcileAfter: cursor.BackstopAfterKey,
-			BackstopUpper: cursor.BackstopUpperKey, DocumentAfter: cursor.BackstopDocumentKey,
-			Limit: windowLimit,
+			BackstopUpper: cursor.BackstopUpperKey,
+			Limit:         windowLimit,
 		})
 		if loadErr != nil {
 			return loadErr
@@ -106,11 +118,9 @@ func (a Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembly
 		capturedUpper := backstop.CapturedUpperKey
 		if capturedUpper == "" ||
 			(cursor.BackstopUpperKey != "" && capturedUpper != cursor.BackstopUpperKey) ||
-			!sweepCursorCoordinateAdvanced(cursor.BackstopAfterKey, cursor.BackstopDocumentKey,
-				backstop.NextReconcileKey, backstop.NextDocumentKey) ||
+			backstop.NextReconcileKey <= cursor.BackstopAfterKey ||
 			backstop.NextReconcileKey > capturedUpper ||
-			backstop.ReconciliationDone != (backstop.NextReconcileKey == capturedUpper &&
-				backstop.NextDocumentKey == "") {
+			backstop.ReconciliationDone != (backstop.NextReconcileKey == capturedUpper) {
 			return errors.New("person sweep backstop returned invalid bounded progress")
 		}
 		result.Windows = append(result.Windows, backstop)
@@ -130,7 +140,6 @@ func (a Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembly
 			}
 		}
 		if !reconciliationAlreadyCovered && !cursor.ReconciliationComplete &&
-			cursor.ReconcileDocumentKey == "" && backstop.NextDocumentKey == "" &&
 			cursor.ReconcileAfterKey < cursor.ReconcileUpperKey &&
 			cursor.BackstopAfterKey <= cursor.ReconcileAfterKey &&
 			backstop.NextReconcileKey >= cursor.ReconcileUpperKey {
@@ -144,8 +153,6 @@ func (a Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembly
 			Key: cursor.Key, Mode: GenerationCursorBackstop,
 			ReconcileFromKey: cursor.BackstopAfterKey,
 			ReconcileToKey:   backstop.NextReconcileKey,
-			DocumentFromKey:  cursor.BackstopDocumentKey,
-			DocumentToKey:    backstop.NextDocumentKey,
 			BackstopUpperKey: capturedUpper,
 		})
 		return nil
@@ -153,11 +160,11 @@ func (a Assembler) Build(ctx context.Context, request AssemblyRequest) (Assembly
 cursorLoop:
 	for _, cursor := range cursors {
 		if err := validateAssemblyCursor(request, cursor); err != nil {
-			return Assembly{}, err
+			return AssemblyProgress{}, err
 		}
 		if request.ForceBackstop {
 			if err := appendBackstop(cursor); err != nil {
-				return Assembly{}, err
+				return AssemblyProgress{}, err
 			}
 			progressWindows++
 			if a.MaxProgressWindows > 0 && progressWindows >= a.MaxProgressWindows {
@@ -168,23 +175,20 @@ cursorLoop:
 		optimistic, err := a.loadWindow(ctx, WindowRequest{
 			PersonID: request.PersonID, Lane: cursor.Key.SourceLane,
 			Mode: GenerationCursorOptimistic, AfterSequence: cursor.OptimisticSequence,
-			DocumentAfter: cursor.OptimisticDocumentKey, Limit: windowLimit,
+			Limit: windowLimit,
 		})
 		if err != nil {
-			return Assembly{}, err
+			return AssemblyProgress{}, err
 		}
 		result.Windows = append(result.Windows, optimistic)
 		allChanges = append(allChanges, optimistic.Changes...)
 		if err := appendAssemblySeeds(seedByID, optimistic.Seeds, request.Profile, after, before); err != nil {
-			return Assembly{}, err
+			return AssemblyProgress{}, err
 		}
-		if sweepSequenceCoordinateAdvanced(cursor.OptimisticSequence, cursor.OptimisticDocumentKey,
-			optimistic.NextSequence, optimistic.NextDocumentKey) {
+		if optimistic.NextSequence > cursor.OptimisticSequence {
 			result.CursorEnvelope = append(result.CursorEnvelope, GenerationCursor{
 				Key: cursor.Key, Mode: GenerationCursorOptimistic,
 				CursorFrom: cursor.OptimisticSequence, CursorThrough: optimistic.NextSequence,
-				DocumentFromKey: cursor.OptimisticDocumentKey,
-				DocumentToKey:   optimistic.NextDocumentKey,
 			})
 			progressWindows++
 			if a.MaxProgressWindows > 0 && progressWindows >= a.MaxProgressWindows {
@@ -197,25 +201,21 @@ cursorLoop:
 				PersonID: request.PersonID, Lane: cursor.Key.SourceLane,
 				Mode:           GenerationCursorReconciliation,
 				ReconcileAfter: cursor.ReconcileAfterKey, ReconcileUpper: cursor.ReconcileUpperKey,
-				DocumentAfter: cursor.ReconcileDocumentKey, Limit: windowLimit,
+				Limit: windowLimit,
 			})
 			if loadErr != nil {
-				return Assembly{}, loadErr
+				return AssemblyProgress{}, loadErr
 			}
 			result.Windows = append(result.Windows, reconciliation)
 			allChanges = append(allChanges, reconciliation.Changes...)
 			if err := appendAssemblySeeds(seedByID, reconciliation.Seeds, request.Profile, after, before); err != nil {
-				return Assembly{}, err
+				return AssemblyProgress{}, err
 			}
-			if sweepCursorCoordinateAdvanced(
-				cursor.ReconcileAfterKey, cursor.ReconcileDocumentKey,
-				reconciliation.NextReconcileKey, reconciliation.NextDocumentKey) {
+			if reconciliation.NextReconcileKey > cursor.ReconcileAfterKey {
 				result.CursorEnvelope = append(result.CursorEnvelope, GenerationCursor{
 					Key: cursor.Key, Mode: GenerationCursorReconciliation,
 					ReconcileFromKey: cursor.ReconcileAfterKey,
 					ReconcileToKey:   reconciliation.NextReconcileKey,
-					DocumentFromKey:  cursor.ReconcileDocumentKey,
-					DocumentToKey:    reconciliation.NextDocumentKey,
 				})
 				progressWindows++
 				if a.MaxProgressWindows > 0 && progressWindows >= a.MaxProgressWindows {
@@ -227,7 +227,7 @@ cursorLoop:
 		if cursor.BackstopUpperKey != "" ||
 			assemblyBackstopDue(cursor.LastBackstopAt, request.Now, request.BackstopInterval) {
 			if err := appendBackstop(cursor); err != nil {
-				return Assembly{}, err
+				return AssemblyProgress{}, err
 			}
 			progressWindows++
 			if a.MaxProgressWindows > 0 && progressWindows >= a.MaxProgressWindows {
@@ -239,14 +239,42 @@ cursorLoop:
 	result.EvidenceStatusChanges, err = a.Source.BuildPersonSweepEvidenceStatusChanges(
 		ctx, request.PersonID, canonicalArchiveChanges(allChanges))
 	if err != nil {
-		return Assembly{}, fmt.Errorf("build person sweep evidence status changes: %w", err)
+		return AssemblyProgress{}, fmt.Errorf("build person sweep evidence status changes: %w", err)
 	}
 	result.EvidenceStatusChanges = canonicalStatusChanges(result.EvidenceStatusChanges)
 	result.CursorEnvelope = canonicalGenerationCursors(result.CursorEnvelope)
-	result.Packet = basePacket
-	result.Packet.Seeds = evidenceMapValues(seedByID)
+	result.Seeds = evidenceMapValues(seedByID)
+	return result, nil
+}
 
-	state, err := a.Source.LoadPersonFactState(ctx, request.PersonID, basePacket.Catalog)
+// BuildPacket reads the latest person projection, gathers context, and applies
+// evidence packet limits to previously discovered archive progress.
+func (a Assembler) BuildPacket(ctx context.Context, request AssemblyRequest, progress AssemblyProgress) (Assembly, error) {
+	if a.Source == nil || request.PersonID <= 0 || len(request.Cursors) == 0 {
+		return Assembly{}, errors.New("person sweep assembly requires source, person, and cursors")
+	}
+	if a.MaxBytes <= 0 || a.MaxItems <= 0 || a.ContextPerTarget < 0 {
+		return Assembly{}, errors.New("person sweep assembly limits are invalid")
+	}
+	if request.Now.IsZero() || request.BackstopInterval <= 0 {
+		return Assembly{}, errors.New("person sweep backstop selection requires current time and positive interval")
+	}
+	after, before, err := contextDateBounds(request.Profile.SourceSince, request.Profile.SourceUntil)
+	if err != nil {
+		return Assembly{}, err
+	}
+	packet, err := packetForProfile(EvidencePacket{
+		PersonID: request.PersonID, ProgramID: ExtractionProgramID,
+		ProgramVersion: ExtractionProgramVersion, Catalog: request.Catalog,
+	}, request.Profile)
+	if err != nil {
+		return Assembly{}, err
+	}
+	result := Assembly{Windows: progress.Windows, CursorEnvelope: progress.CursorEnvelope,
+		EvidenceStatusChanges: progress.EvidenceStatusChanges, Packet: packet}
+	result.Packet.Seeds = progress.Seeds
+
+	state, err := a.Source.LoadPersonFactState(ctx, request.PersonID, packet.Catalog)
 	if err != nil {
 		return Assembly{}, fmt.Errorf("load person fact state: %w", err)
 	}
@@ -268,6 +296,7 @@ cursorLoop:
 	}
 	if a.Context != nil && a.ContextPerTarget > 0 {
 		contextByID := make(map[string]EvidenceItem)
+		perTarget := make([][]EvidenceItem, 0, len(result.Packet.Catalog.Targets))
 		seedIDs := make(map[string]struct{}, len(result.Packet.Seeds))
 		for _, seed := range result.Packet.Seeds {
 			seedIDs[packetEvidenceID(seed)] = struct{}{}
@@ -282,6 +311,7 @@ cursorLoop:
 			if retrieveErr != nil {
 				return Assembly{}, fmt.Errorf("retrieve context for target %q: %w", target.Key, retrieveErr)
 			}
+			allowedItems := make([]EvidenceItem, 0, len(items))
 			for _, item := range items {
 				allowed, validateErr := assemblyEvidenceAllowed(item, request.Profile, after, before)
 				if validateErr != nil {
@@ -293,23 +323,59 @@ cursorLoop:
 				id := packetEvidenceID(item)
 				if _, isSeed := seedIDs[id]; !isSeed {
 					contextByID[id] = item
+					allowedItems = append(allowedItems, item)
 				}
 			}
+			perTarget = append(perTarget, allowedItems)
 		}
 		result.Packet.Context = evidenceMapValues(contextByID)
+		result.ContextPriority = mergeContextPriority(perTarget)
 	}
 	result.Batches, err = PartitionEvidencePacket(result.Packet, a.MaxBytes, a.MaxItems)
 	if err != nil {
 		return Assembly{}, err
 	}
-	for a.MaxBatches > 0 && len(result.Batches) > a.MaxBatches && len(result.Packet.Context) > 0 {
-		result.Packet.Context = result.Packet.Context[:len(result.Packet.Context)-1]
+	for a.MaxBatches > 0 && len(result.Batches) > a.MaxBatches &&
+		len(result.Packet.Context) > 0 && len(result.ContextPriority) > 0 {
+		drop := result.ContextPriority[len(result.ContextPriority)-1]
+		result.ContextPriority = result.ContextPriority[:len(result.ContextPriority)-1]
+		for index, item := range result.Packet.Context {
+			if packetEvidenceID(item) == drop {
+				result.Packet.Context = slices.Delete(result.Packet.Context, index, index+1)
+				break
+			}
+		}
 		result.Batches, err = PartitionEvidencePacket(result.Packet, a.MaxBytes, a.MaxItems)
 		if err != nil {
 			return Assembly{}, err
 		}
 	}
 	return result, nil
+}
+
+// mergeContextPriority interleaves target retrieval orders, retaining each
+// evidence ID at its first occurrence. Targets are supplied in catalog order.
+func mergeContextPriority(perTarget [][]EvidenceItem) []string {
+	maxItems := 0
+	for _, items := range perTarget {
+		maxItems = max(maxItems, len(items))
+	}
+	var priority []string
+	seen := make(map[string]struct{})
+	for rank := range maxItems {
+		for _, items := range perTarget {
+			if rank >= len(items) {
+				continue
+			}
+			id := packetEvidenceID(items[rank])
+			if _, exists := seen[id]; exists {
+				continue
+			}
+			seen[id] = struct{}{}
+			priority = append(priority, id)
+		}
+	}
+	return priority
 }
 
 func (a Assembler) loadWindow(ctx context.Context, request WindowRequest) (PersonWindow, error) {
@@ -438,17 +504,9 @@ func canonicalGenerationCursors(cursors []GenerationCursor) []GenerationCursor {
 		if left.ReconcileFromKey != right.ReconcileFromKey {
 			return left.ReconcileFromKey < right.ReconcileFromKey
 		}
-		return left.DocumentFromKey < right.DocumentFromKey
+		return false
 	})
 	return canonical
-}
-
-func sweepSequenceCoordinateAdvanced(from int64, fromDocument string, to int64, toDocument string) bool {
-	return to > from || (to == from && toDocument > fromDocument)
-}
-
-func sweepCursorCoordinateAdvanced(from, fromDocument, to, toDocument string) bool {
-	return to > from || (to == from && toDocument > fromDocument)
 }
 
 func cursorModeOrder(mode GenerationCursorMode) int {

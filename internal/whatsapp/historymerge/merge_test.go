@@ -1,7 +1,6 @@
 package historymerge_test
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -101,7 +100,7 @@ func buildFixture(t *testing.T) *fixture {
 	// msg5: soft-deleted — must never be scanned or copied.
 	deletedID := seedWhatsAppMessage(t, fromSt, fromSource.ID, directConvID, contactJID, waMsgDeleted,
 		contactJID, "Contact", "should not be copied", false, time.Unix(1700000700, 0).UTC())
-	_, err = fromSt.DB().Exec(fromSt.Rebind(`UPDATE messages SET deleted_at = ? WHERE id = ?`),
+	_, err = fromSt.DB().ExecContext(t.Context(), fromSt.Rebind(`UPDATE messages SET deleted_at = ? WHERE id = ?`),
 		time.Now().UTC(), deletedID)
 	require.NoError(t, err)
 
@@ -152,7 +151,7 @@ func newFileStore(t *testing.T, dir string) (*store.Store, string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(dir, 0o700))
 	dbPath := filepath.Join(dir, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
+	st, err := store.OpenForTest(t.Context(), dbPath)
 	require.NoError(t, err)
 	require.NoError(t, st.InitSchema())
 	return st, dbPath
@@ -229,7 +228,7 @@ func seedWhatsAppAttachmentMarker(t *testing.T, st *store.Store, msgID int64, ch
 func messageCount(t *testing.T, st *store.Store, sourceID int64) int {
 	t.Helper()
 	var n int
-	require.NoError(t, st.DB().QueryRow(
+	require.NoError(t, st.DB().QueryRowContext(t.Context(),
 		st.Rebind(`SELECT COUNT(*) FROM messages WHERE source_id = ?`), sourceID,
 	).Scan(&n))
 	return n
@@ -258,7 +257,7 @@ func TestMergeSource(t *testing.T) {
 		FromAttachmentsDir: f.fromAttDir, IntoAttachmentsDir: f.intoAttDir,
 		Apply: false,
 	}
-	dryReport, err := historymerge.MergeSource(context.Background(), dryOpts, f.fromSourceID, f.intoSourceID)
+	dryReport, err := historymerge.MergeSource(t.Context(), dryOpts, f.fromSourceID, f.intoSourceID)
 	requirements.NoError(err)
 	requirements.Empty(dryReport.Errors)
 	assertions.Equal(4, dryReport.MessagesScanned, "wa-hello, wa-reply, wa-shared, wa-group — wa-deleted must be excluded")
@@ -285,7 +284,7 @@ func TestMergeSource(t *testing.T) {
 		FromAttachmentsDir: f.fromAttDir, IntoAttachmentsDir: f.intoAttDir,
 		Apply: true,
 	}
-	applyReport, err := historymerge.MergeSource(context.Background(), applyOpts, f.fromSourceID, f.intoSourceID)
+	applyReport, err := historymerge.MergeSource(t.Context(), applyOpts, f.fromSourceID, f.intoSourceID)
 	requirements.NoError(err)
 	requirements.Empty(applyReport.Errors)
 	assertions.Equal(4, applyReport.MessagesScanned)
@@ -332,17 +331,17 @@ func TestMergeSource(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			assertions := assert.New(t)
 			requirements := require.New(t)
-			msgID, err := f.intoStore.GetWhatsAppMessageIDBySource(context.Background(), f.intoSourceID, tc.sourceMessageID)
+			msgID, err := f.intoStore.GetWhatsAppMessageIDBySource(t.Context(), f.intoSourceID, tc.sourceMessageID)
 			requirements.NoError(err)
 			requirements.NotZero(msgID, "message must exist in target")
 
 			var convID int64
-			requirements.NoError(f.intoStore.DB().QueryRow(
+			requirements.NoError(f.intoStore.DB().QueryRowContext(t.Context(),
 				f.intoStore.Rebind(`SELECT conversation_id FROM messages WHERE id = ?`), msgID,
 			).Scan(&convID))
 
 			var gotConvJID, gotConvType string
-			requirements.NoError(f.intoStore.DB().QueryRow(
+			requirements.NoError(f.intoStore.DB().QueryRowContext(t.Context(),
 				f.intoStore.Rebind(`SELECT source_conversation_id, conversation_type FROM conversations WHERE id = ? AND source_id = ?`),
 				convID, f.intoSourceID,
 			).Scan(&gotConvJID, &gotConvType), "conversation_id must point at a real conversation row in the target")
@@ -386,12 +385,12 @@ func TestMergeSource(t *testing.T) {
 
 	// wa-shared must still resolve to the ORIGINAL into-side row — the
 	// merge must not have created a second copy under a new id.
-	sharedID, err := f.intoStore.GetWhatsAppMessageIDBySource(context.Background(), f.intoSourceID, store.WhatsAppSourceMessageID(contactJID, waMsgShared))
+	sharedID, err := f.intoStore.GetWhatsAppMessageIDBySource(t.Context(), f.intoSourceID, store.WhatsAppSourceMessageID(contactJID, waMsgShared))
 	requirements.NoError(err)
 	requirements.NotZero(sharedID)
 
 	// wa-deleted must never have been created in the target.
-	deletedTargetID, err := f.intoStore.GetWhatsAppMessageIDBySource(context.Background(), f.intoSourceID, store.WhatsAppSourceMessageID(contactJID, waMsgDeleted))
+	deletedTargetID, err := f.intoStore.GetWhatsAppMessageIDBySource(t.Context(), f.intoSourceID, store.WhatsAppSourceMessageID(contactJID, waMsgDeleted))
 	requirements.NoError(err)
 	assertions.Zero(deletedTargetID, "soft-deleted source message must not be copied")
 
@@ -406,7 +405,7 @@ func TestMergeSource(t *testing.T) {
 		FromAttachmentsDir: f.fromAttDir, IntoAttachmentsDir: f.intoAttDir,
 		Apply: true,
 	}
-	rerunReport, err := historymerge.MergeSource(context.Background(), rerunOpts, f.fromSourceID, f.intoSourceID)
+	rerunReport, err := historymerge.MergeSource(t.Context(), rerunOpts, f.fromSourceID, f.intoSourceID)
 	requirements.NoError(err)
 	requirements.Empty(rerunReport.Errors)
 	assertions.Equal(4, rerunReport.MessagesScanned)

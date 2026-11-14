@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"fmt"
 	"testing"
 
@@ -10,6 +9,7 @@ import (
 )
 
 func TestResolveExploreMeetingsSelectsOnlyExactMeetingEntries(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	b := NewTestDataBuilder(t)
 	source := b.AddSource("archive@example.test")
@@ -35,6 +35,7 @@ func TestResolveExploreMeetingsSelectsOnlyExactMeetingEntries(t *testing.T) {
 }
 
 func TestResolveExploreMeetingsPreservesNilAndEmptySelectionSemantics(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	b := NewTestDataBuilder(t)
@@ -67,6 +68,7 @@ func TestResolveExploreMeetingsPreservesNilAndEmptySelectionSemantics(t *testing
 }
 
 func TestResolveExploreMeetingsDoesNotApplyExplorePageSize(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	b := NewTestDataBuilder(t)
 	source := b.AddSource("archive@example.test")
@@ -90,6 +92,7 @@ func TestResolveExploreMeetingsDoesNotApplyExplorePageSize(t *testing.T) {
 }
 
 func TestResolveExploreMeetingsHonorsRepeatedParticipantAndDomainGroups(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	source := b.AddSource("archive@example.test")
 	alice := b.AddParticipant("alice@alpha.example", "alpha.example", "Alice")
@@ -118,6 +121,7 @@ func TestResolveExploreMeetingsHonorsRepeatedParticipantAndDomainGroups(t *testi
 }
 
 func TestResolveExploreMeetingsUsesResolvedSearchCandidateAuthority(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	b := NewTestDataBuilder(t)
 	source := b.AddSource("archive@example.test")
@@ -126,7 +130,7 @@ func TestResolveExploreMeetingsUsesResolvedSearchCandidateAuthority(t *testing.T
 	generation := int64(17)
 	engine := b.BuildEngine()
 
-	result, err := engine.ResolveExploreMeetings(context.Background(), ExploreSelectionRequest{
+	result, err := engine.ResolveExploreMeetings(t.Context(), ExploreSelectionRequest{
 		Explore: ExploreRequest{Search: SearchSpec{
 			Mode: SearchSemantic, Query: "launch", CandidateMessageIDs: []int64{second},
 			VectorGeneration: &generation,

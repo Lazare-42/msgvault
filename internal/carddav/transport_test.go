@@ -767,10 +767,7 @@ func TestClientEnforcesResponseAndOperationByteBudgets(t *testing.T) {
 
 func TestClientHonorsRequestAndOperationTimeouts(t *testing.T) {
 	t.Parallel()
-	for name, configure := range map[string]func(*Client){
-		"request":   func(client *Client) { client.requestTimeout = 5 * time.Millisecond },
-		"operation": func(client *Client) { client.operationTimeout = 5 * time.Millisecond },
-	} {
+	for _, name := range []string{"request", "operation"} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			synctest.Test(t, func(t *testing.T) {
@@ -782,7 +779,11 @@ func TestClientHonorsRequestAndOperationTimeouts(t *testing.T) {
 				require.True(t, ok)
 				client := newFixtureClient(t, "http://127.0.0.1", "", "")
 				client.dialContext = transport.DialContext
-				configure(client)
+				if name == "request" {
+					client.requestTimeout = 5 * time.Millisecond
+				} else {
+					client.operationTimeout = 5 * time.Millisecond
+				}
 				_, err := client.Do(t.Context(), Request{Method: "PROPFIND", URL: "http://127.0.0.1"})
 				require.Error(t, err)
 			})
@@ -792,7 +793,7 @@ func TestClientHonorsRequestAndOperationTimeouts(t *testing.T) {
 
 func newFixtureResolver(t *testing.T, addresses ...netip.Addr) (*net.Resolver, *atomic.Int32) {
 	t.Helper()
-	listener, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).ListenPacket(t.Context(), "udp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = listener.Close() })
 	queries := new(atomic.Int32)

@@ -121,11 +121,7 @@ func (e *DuckDBEngine) buildTextFilterConditions(
 				(SELECT mr_fb.participant_id FROM mr mr_fb
 				 WHERE mr_fb.message_id = msg.id AND mr_fb.recipient_type = 'from'
 				 LIMIT 1))
-			  AND COALESCE(
-				NULLIF(TRIM(p_filter.display_name), ''),
-				NULLIF(p_filter.phone_number, ''),
-				p_filter.email_address
-			  ) = ?
+			  AND `+participantNameExpr("p_filter")+` = ?
 		)`)
 		args = append(args, filter.ContactName)
 	}
@@ -189,6 +185,9 @@ func (e *DuckDBEngine) ListConversationsSnapshot(
 ) ([]ConversationRow, string, error) {
 	release, err := e.acquireQuerySlot(ctx)
 	if err != nil {
+		if e.useLiveSQL(err) {
+			return e.sqliteEngine.ListConversationsSnapshot(ctx, filter)
+		}
 		return nil, "", err
 	}
 	defer release()
@@ -347,6 +346,9 @@ func (e *DuckDBEngine) TextAggregate(
 	// SubAggregate already hold a slot when they reach it.
 	release, err := e.acquireQuerySlot(ctx)
 	if err != nil {
+		if e.useLiveSQL(err) {
+			return e.sqliteEngine.TextAggregate(ctx, viewType, opts)
+		}
 		return nil, err
 	}
 	defer release()
@@ -481,7 +483,7 @@ func (e *DuckDBEngine) listConversationMessages(
 		msg_sender AS (
 			SELECT mr.message_id,
 				FIRST(p.email_address) AS from_email,
-				FIRST(COALESCE(NULLIF(TRIM(mr.display_name), ''), NULLIF(TRIM(p.display_name), ''), NULLIF(p.phone_number, ''), p.email_address, '')) AS from_name,
+				FIRST(`+recipientNameExpr("mr", "p")+`) AS from_name,
 				FIRST(COALESCE(p.phone_number, '')) AS from_phone
 			FROM mr
 			JOIN p ON p.id = mr.participant_id
@@ -492,7 +494,7 @@ func (e *DuckDBEngine) listConversationMessages(
 		direct_sender AS (
 			SELECT msg.id AS message_id,
 				COALESCE(p.email_address, '') AS from_email,
-				COALESCE(p.display_name, '') AS from_name,
+				`+directSenderNameExpr("p", "")+` AS from_name,
 				COALESCE(p.phone_number, '') AS from_phone
 			FROM msg
 			JOIN filtered_msgs fm ON fm.id = msg.id
@@ -513,6 +515,7 @@ func (e *DuckDBEngine) listConversationMessages(
 			msg.sent_at,
 			COALESCE(msg.size_estimate, 0) AS size_estimate,
 			COALESCE(msg.has_attachments, false) AS has_attachments,
+			msg.hidden_text_present,
 			COALESCE(msg.attachment_count, 0) AS attachment_count,
 			msg.deleted_from_source_at,
 			COALESCE(msg.message_type, '') AS message_type,
@@ -561,6 +564,9 @@ func (e *DuckDBEngine) GetTextStats(
 ) (*TotalStats, error) {
 	release, err := e.acquireQuerySlot(ctx)
 	if err != nil {
+		if e.useLiveSQL(err) {
+			return e.sqliteEngine.GetTextStats(ctx, opts)
+		}
 		return nil, err
 	}
 	defer release()
@@ -655,6 +661,7 @@ func scanMessageSummaries(rows *sql.Rows) ([]MessageSummary, error) {
 			&sentAt,
 			&msg.SizeEstimate,
 			&msg.HasAttachments,
+			&msg.HiddenTextPresent,
 			&msg.AttachmentCount,
 			&deletedAt,
 			&msg.MessageType,

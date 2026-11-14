@@ -16,11 +16,14 @@ export interface HybridSearchItem {
   from_name?: string;
   from_phone?: string;
   has_attachments: boolean;
+  hidden_text_present: boolean;
   id: number;
   labels: string[];
   matches?: HybridSearchMatch[];
   matches_truncated?: boolean;
   message_type?: string;
+  /** Original Message-ID header for reply threading. */
+  rfc822_message_id?: string;
   score?: ScoreBreakdown;
   sent_at: string;
   size_bytes: number;

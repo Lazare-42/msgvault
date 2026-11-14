@@ -1,8 +1,6 @@
 package query
 
 import (
-	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -12,6 +10,7 @@ import (
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/duckdbutil"
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/search"
 )
@@ -34,7 +33,9 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 
 	tmpDir := tb.TempDir()
 
-	db, err := sql.Open("duckdb", "")
+	// Derive the fixture under the production cache-builder policy so the
+	// identity index build runs with the limits a real build-cache uses.
+	db, err := duckdbutil.Open(tb.Context(), duckdbutil.BuilderPolicy(tb.TempDir()))
 	requirements.NoError(err, "open duckdb")
 	defer func() { _ = db.Close() }()
 
@@ -150,7 +151,8 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 			m.id AS message_id,
 			((m.id %% 500) + 1)::BIGINT AS participant_id,
 			'from' AS recipient_type,
-			'User ' || ((m.id %% 500) + 1) AS display_name
+			'User ' || ((m.id %% 500) + 1) AS display_name,
+			'user' || ((m.id %% 500) + 1) || '@example.test' AS email_address
 		FROM bench_messages m
 		UNION ALL
 		-- primary recipient
@@ -158,7 +160,8 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 			m.id AS message_id,
 			(((m.id + 1) %% 500) + 1)::BIGINT AS participant_id,
 			'to' AS recipient_type,
-			'User ' || (((m.id + 1) %% 500) + 1) AS display_name
+			'User ' || (((m.id + 1) %% 500) + 1) AS display_name,
+			'user' || (((m.id + 1) %% 500) + 1) || '@example.test' AS email_address
 		FROM bench_messages m
 		UNION ALL
 		-- cc on 33%% of messages
@@ -166,7 +169,8 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 			m.id AS message_id,
 			(((m.id + 2) %% 500) + 1)::BIGINT AS participant_id,
 			'cc' AS recipient_type,
-			'User ' || (((m.id + 2) %% 500) + 1) AS display_name
+			'User ' || (((m.id + 2) %% 500) + 1) AS display_name,
+			'user' || (((m.id + 2) %% 500) + 1) || '@example.test' AS email_address
 		FROM bench_messages m
 		WHERE m.id %% 3 = 0;
 
@@ -206,7 +210,7 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 		WHERE id BETWEEN 200 AND 299;
 	`, benchChatMessageCount, benchChatMessageCount, benchChatMessageCount, benchMessageCount)
 
-	_, err = db.Exec(seedSQL)
+	_, err = db.ExecContext(tb.Context(), seedSQL)
 	requirements.NoError(err, "seed bench data")
 
 	// Write Parquet files in the layout the engine expects.
@@ -223,7 +227,7 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 			"participants", "participants.parquet"},
 		{"SELECT participant_id, identifier_type, identifier_value, display_value, is_primary FROM bench_participant_identifiers",
 			"participant_identifiers", "participant_identifiers.parquet"},
-		{"SELECT message_id, participant_id, recipient_type, display_name FROM bench_recipients",
+		{"SELECT message_id, participant_id, recipient_type, display_name, email_address, FALSE AS is_relayed FROM bench_recipients",
 			"message_recipients", "message_recipients.parquet"},
 		{"SELECT id, name FROM bench_labels",
 			"labels", "labels.parquet"},
@@ -251,7 +255,7 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 		requirements.NoError(os.MkdirAll(dir, 0o755), "mkdir %s", dir)
 		path := escapePath(filepath.Join(dir, t.file))
 		q := fmt.Sprintf("COPY (%s) TO '%s' (FORMAT PARQUET)", t.query, path)
-		_, err = db.Exec(q)
+		_, err = db.ExecContext(tb.Context(), q)
 		requirements.NoError(err, "write parquet %s", t.file)
 	}
 
@@ -269,9 +273,9 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 			FROM bench_messages
 		) TO '%s' (FORMAT PARQUET, PARTITION_BY (year), OVERWRITE_OR_IGNORE)
 	`, msgPath)
-	_, err = db.Exec(msgCopy)
+	_, err = db.ExecContext(tb.Context(), msgCopy)
 	requirements.NoError(err, "write messages parquet")
-	derived, err := identityindex.Build(context.Background(), db, identityindex.BuildOptions{
+	derived, err := identityindex.Build(tb.Context(), db, identityindex.BuildOptions{
 		Mode:           identityindex.ModeFull,
 		StagedBaseRoot: tmpDir,
 		OutputRoot:     tmpDir,
@@ -291,7 +295,7 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 	requirements.NoError(err, "marshal benchmark cache state")
 	requirements.NoError(os.WriteFile(CacheStatePath(tmpDir), state, 0o600), "write benchmark cache state")
 
-	engine, err := NewDuckDBEngine(tmpDir, "", nil)
+	engine, err := NewDuckDBEngine(tb.Context(), tmpDir, "", nil)
 	requirements.NoError(err, "NewDuckDBEngine")
 	tb.Cleanup(func() { requirements.NoError(engine.Close()) })
 	return engine
@@ -299,7 +303,7 @@ func buildBenchData(tb testing.TB) *DuckDBEngine {
 
 func BenchmarkSearchFast(b *testing.B) {
 	engine := buildBenchData(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.Run("single_term", func(b *testing.B) {
 		q := search.Parse("budget")
@@ -357,7 +361,7 @@ func BenchmarkSearchFast(b *testing.B) {
 
 func BenchmarkSearchFastWithStats(b *testing.B) {
 	engine := buildBenchData(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.Run("single_term", func(b *testing.B) {
 		q := search.Parse("budget")
@@ -384,7 +388,7 @@ func BenchmarkSearchFastWithStats(b *testing.B) {
 
 func BenchmarkAggregate(b *testing.B) {
 	engine := buildBenchData(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	opts := AggregateOptions{SortField: SortByCount}
 
 	b.Run("senders", func(b *testing.B) {
@@ -434,7 +438,7 @@ func BenchmarkAggregate(b *testing.B) {
 
 func BenchmarkGetTotalStats(b *testing.B) {
 	engine := buildBenchData(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.Run("no_filter", func(b *testing.B) {
 		b.ResetTimer()
@@ -456,7 +460,7 @@ func BenchmarkGetTotalStats(b *testing.B) {
 
 func BenchmarkListMessages(b *testing.B) {
 	engine := buildBenchData(b)
-	ctx := context.Background()
+	ctx := b.Context()
 
 	b.Run("no_filter", func(b *testing.B) {
 		b.ResetTimer()
@@ -496,7 +500,7 @@ func BenchmarkListMessages(b *testing.B) {
 
 func BenchmarkSubAggregate(b *testing.B) {
 	engine := buildBenchData(b)
-	ctx := context.Background()
+	ctx := b.Context()
 	opts := AggregateOptions{SortField: SortByCount}
 
 	b.Run("sender_to_labels", func(b *testing.B) {

@@ -56,14 +56,14 @@ func TestPersonFactSourceCursorsEncodeReconciliationRange(t *testing.T) {
 }
 
 func TestPersonFactSourceCursorsEncodeBackstopRange(t *testing.T) {
-	key := CursorKey{PersonID: 7, SourceLane: SourceDocumentText,
+	key := CursorKey{PersonID: 7, SourceLane: SourceConversationText,
 		ProgramFingerprint: "program", CatalogFingerprint: "catalog"}
 	got, _, err := PersonFactSourceCursors([]GenerationCursor{{
 		Key: key, Mode: GenerationCursorBackstop, ReconcileToKey: "0009", BackstopUpperKey: "0009",
 	}})
 	require.NoError(t, err)
 	require.Len(t, got, 1)
-	assert.Equal(t, "person-sweep/v1/document_text/backstop", got[0].Lane)
+	assert.Equal(t, "person-sweep/v1/conversation_text/backstop", got[0].Lane)
 }
 
 func TestPersonFactSourceCursorsRejectInvalidRanges(t *testing.T) {
@@ -161,6 +161,13 @@ func (s *workerFailureStore) StartPersonSweepAttempt(_ context.Context, input St
 	s.started = append(s.started, input)
 	return nil
 }
+
+func (*workerFailureStore) RebindPersonSweepAttempt(
+	context.Context, Lease, string, []GenerationCursor,
+) error {
+	return nil
+}
+
 func (s *workerFailureStore) ReconcilePersonSweepWorkContext(_ context.Context, request GapRequest) (GapResult, error) {
 	index := len(s.gaps)
 	s.gaps = append(s.gaps, request)
@@ -225,6 +232,10 @@ func (s *workerFailureStore) FinalizePersonSweepFailure(ctx context.Context, fin
 	return nil
 }
 
+func (*workerFailureStore) DeferPersonSweepAttempt(context.Context, Lease, string, time.Time) error {
+	return nil
+}
+
 type workerFailureSource struct{}
 
 func (workerFailureSource) LoadPersonSweepWindow(_ context.Context, request WindowRequest) (PersonWindow, error) {
@@ -246,9 +257,6 @@ func (workerFailureSource) SearchPersonSweepMessages(context.Context, ContextReq
 	return nil, nil
 }
 func (workerFailureSource) HydratePersonSweepMessages(context.Context, int64, []int64, int64) ([]EvidenceItem, error) {
-	return nil, nil
-}
-func (workerFailureSource) SearchPersonSweepDocuments(context.Context, DocumentContextRequest) ([]EvidenceItem, error) {
 	return nil, nil
 }
 
@@ -280,6 +288,16 @@ type workerFailureSink struct{ err error }
 
 func (s workerFailureSink) ApplyPersonSweep(context.Context, ApplyRequest) (ApplyResult, error) {
 	return ApplyResult{}, s.err
+}
+
+func (s workerFailureSink) ApplyPersonSweepStatusOnly(context.Context, StatusOnlyApplyRequest) (Lease, error) {
+	return Lease{}, s.err
+}
+
+func (workerFailureSink) PersonSweepEvidenceStatusesApplied(
+	context.Context, int64, []personfacts.EvidenceStatusChange,
+) (bool, error) {
+	return false, nil
 }
 
 func testConfigWithProvider(provider ProviderConfig) Config {
@@ -384,9 +402,6 @@ func (s *workerProductionSource) SearchPersonSweepMessages(_ context.Context, re
 	return append([]EvidenceItem(nil), s.context...), nil
 }
 func (*workerProductionSource) HydratePersonSweepMessages(context.Context, int64, []int64, int64) ([]EvidenceItem, error) {
-	return nil, nil
-}
-func (*workerProductionSource) SearchPersonSweepDocuments(context.Context, DocumentContextRequest) ([]EvidenceItem, error) {
 	return nil, nil
 }
 
@@ -871,6 +886,16 @@ type workerProductionSink struct {
 	err          error
 }
 
+func (s *workerProductionSink) ApplyPersonSweepStatusOnly(_ context.Context, request StatusOnlyApplyRequest) (Lease, error) {
+	return request.Lease, s.err
+}
+
+func (*workerProductionSink) PersonSweepEvidenceStatusesApplied(
+	context.Context, int64, []personfacts.EvidenceStatusChange,
+) (bool, error) {
+	return false, nil
+}
+
 func (s *workerProductionSink) ApplyPersonSweep(ctx context.Context, request ApplyRequest) (ApplyResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ApplyResult{}, err
@@ -880,7 +905,7 @@ func (s *workerProductionSink) ApplyPersonSweep(ctx context.Context, request App
 	if request.Brief != nil {
 		mutations.BriefVersion = s.briefVersion
 	}
-	return ApplyResult{Mutations: mutations}, s.err
+	return ApplyResult{Mutations: mutations, AttemptProjectedWrites: mutations.ProjectionRowsWritten}, s.err
 }
 
 func TestPersonSweepWorkerHeartbeatsLeaseDuringProviderIO(t *testing.T) {

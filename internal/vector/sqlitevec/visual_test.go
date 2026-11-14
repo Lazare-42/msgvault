@@ -19,10 +19,11 @@ import (
 )
 
 func TestVisualBackendPublishesOnlyCurrentLiveTokens(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	st := testutil.NewSQLiteTestStore(t)
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
 	require.NoError(t, err)
-	conversationID, err := st.EnsureConversation(source.ID, "visual-backend", "Visual backend")
+	conversationID, err := st.EnsureConversation(t.Context(), source.ID, "visual-backend", "Visual backend")
 	require.NoError(t, err)
 	f := &storetest.Fixture{T: t, Store: st, Source: source, ConvID: conversationID}
 	generation, owner, token := publishVisualVectorOwner(t, f)
@@ -51,7 +52,7 @@ func TestVisualBackendPublishesOnlyCurrentLiveTokens(t *testing.T) {
 	assert.Equal(t, 1, hits[0].Rank)
 	matchingParticipant := f.EnsureParticipant("matching-visual@example.test", "Matching", "example.test")
 	otherParticipant := f.EnsureParticipant("other-visual@example.test", "Other", "example.test")
-	_, err = f.Store.DB().Exec(f.Store.Rebind(`UPDATE messages SET sender_id = ? WHERE id = ?`), matchingParticipant, owner.MessageID)
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`UPDATE messages SET sender_id = ? WHERE id = ?`), matchingParticipant, owner.MessageID)
 	require.NoError(t, err)
 	personRequest := visual.SearchRequest{
 		GenerationID: visual.GenerationID(generation.ID), Vector: query, Limit: 10,
@@ -74,7 +75,7 @@ func TestVisualBackendPublishesOnlyCurrentLiveTokens(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, query, loaded)
 
-	_, err = f.Store.DB().Exec(f.Store.Rebind(`UPDATE messages SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`), owner.MessageID)
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`UPDATE messages SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?`), owner.MessageID)
 	require.NoError(t, err)
 	hits, err = visualBackend.Search(t.Context(), visual.SearchRequest{
 		GenerationID: visual.GenerationID(generation.ID), Vector: query, Limit: 10,
@@ -84,6 +85,7 @@ func TestVisualBackendPublishesOnlyCurrentLiveTokens(t *testing.T) {
 }
 
 func TestVisualBackendRejectsWrongDimension(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	backend, err := Open(t.Context(), Options{Path: filepath.Join(t.TempDir(), "vectors.db"), Dimension: 768})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = backend.Close() })
@@ -103,7 +105,7 @@ func publishVisualVectorOwner(t *testing.T, f *storetest.Fixture) (store.VisualG
 		Role: store.AttachmentRoleStandalone, RoleSource: store.AttachmentRoleSourceImporterSemantics,
 	}))
 	var attachmentID int64
-	require.NoError(t, f.Store.DB().QueryRow(f.Store.Rebind(`SELECT id FROM attachments WHERE message_id = ?`), messageID).Scan(&attachmentID))
+	require.NoError(t, f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`SELECT id FROM attachments WHERE message_id = ?`), messageID).Scan(&attachmentID))
 	highWater, err := f.Store.AttachmentChangeHighWater(t.Context())
 	require.NoError(t, err)
 	generation, err := f.Store.EnsureVisualGeneration(t.Context(), store.VisualGenerationSpec{
@@ -127,10 +129,11 @@ func publishVisualVectorOwner(t *testing.T, f *storetest.Fixture) (store.VisualG
 }
 
 func TestOpenWithoutTextDimensionSupportsMultimodalOnly(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	st := testutil.NewSQLiteTestStore(t)
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
 	require.NoError(t, err)
-	conversationID, err := st.EnsureConversation(source.ID, "visual-only", "Visual only")
+	conversationID, err := st.EnsureConversation(t.Context(), source.ID, "visual-only", "Visual only")
 	require.NoError(t, err)
 	f := &storetest.Fixture{T: t, Store: st, Source: source, ConvID: conversationID}
 	generation, _, token := publishVisualVectorOwner(t, f)
@@ -162,10 +165,11 @@ func TestOpenWithoutTextDimensionSupportsMultimodalOnly(t *testing.T) {
 }
 
 func TestVisualSearchWidensPastDeadVectorClusters(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	st := testutil.NewSQLiteTestStore(t)
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
 	require.NoError(t, err)
-	conversationID, err := st.EnsureConversation(source.ID, "visual-widen", "Visual widen")
+	conversationID, err := st.EnsureConversation(t.Context(), source.ID, "visual-widen", "Visual widen")
 	require.NoError(t, err)
 	f := &storetest.Fixture{T: t, Store: st, Source: source, ConvID: conversationID}
 	generation, _, token := publishVisualVectorOwner(t, f)
@@ -207,10 +211,11 @@ func TestVisualSearchWidensPastDeadVectorClusters(t *testing.T) {
 }
 
 func TestVisualPersonFilterCoversLegacyFromRecipientSenders(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	st := testutil.NewSQLiteTestStore(t)
 	source, err := st.GetOrCreateSource("gmail", "test@example.com")
 	require.NoError(t, err)
-	conversationID, err := st.EnsureConversation(source.ID, "visual-legacy-sender", "Legacy sender")
+	conversationID, err := st.EnsureConversation(t.Context(), source.ID, "visual-legacy-sender", "Legacy sender")
 	require.NoError(t, err)
 	f := &storetest.Fixture{T: t, Store: st, Source: source, ConvID: conversationID}
 	generation, owner, token := publishVisualVectorOwner(t, f)
@@ -221,9 +226,9 @@ func TestVisualPersonFilterCoversLegacyFromRecipientSenders(t *testing.T) {
 	require.NoError(t, err)
 	person, _, err := st.CreatePersonFromParticipant(participantID)
 	require.NoError(t, err)
-	_, err = st.DB().Exec(st.Rebind(`UPDATE messages SET sender_id = NULL WHERE id = ?`), owner.MessageID)
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE messages SET sender_id = NULL WHERE id = ?`), owner.MessageID)
 	require.NoError(t, err)
-	_, err = st.DB().Exec(st.Rebind(`
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`
 		INSERT INTO message_recipients (message_id, participant_id, recipient_type)
 		VALUES (?, ?, 'from')`), owner.MessageID, participantID)
 	require.NoError(t, err)

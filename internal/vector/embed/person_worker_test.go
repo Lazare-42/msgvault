@@ -5,14 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
+	"net/http/httptest"
 	"slices"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
@@ -535,9 +539,11 @@ func TestPersonWorkerTerminatesLonePoisonRevisionAfterHealthyProbe(t *testing.T)
 	client := &poisonPersonWorkerClient{}
 	worker := newTestPersonWorker(source, backend, client, 1)
 
-	result, err := worker.RunOnce(t.Context(), 8, testEmbeddingPassScope())
+	passCtx := jobctx.WithProgress(t.Context())
+	result, err := worker.RunOnce(passCtx, 8, testEmbeddingPassScope())
 	must.NoError(err)
 	check.Equal(RunResult{Claimed: 1, Failed: 1}, result)
+	check.True(jobctx.HasProgress(passCtx), "a durable rejection marker lets a timed-out pass continue")
 	revisions, listErr := backend.ListPersonRevisions(t.Context(), 8)
 	must.NoError(listErr)
 	check.Equal(map[int64]string{1: "rev-reject"}, revisions)
@@ -653,7 +659,7 @@ func TestPersonWorkerPreservesVectorWhenSourceProjectionCannotRender(t *testing.
 	must := require.New(t)
 	f := storetest.New(t)
 	var personID int64
-	err := f.Store.DB().QueryRow(f.Store.Rebind(`
+	err := f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
 		INSERT INTO persons (vcard_uid, display_name) VALUES (?, ?)
 		RETURNING id`),
 		"urn:uuid:00000000-0000-4000-8000-000000000099", "Broken Projection").Scan(&personID)
@@ -665,7 +671,7 @@ func TestPersonWorkerPreservesVectorWhenSourceProjectionCannotRender(t *testing.
 		Source: store.ProvenanceUser,
 	})
 	must.NoError(err)
-	_, err = f.Store.DB().Exec(f.Store.Rebind(`
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`
 		UPDATE attribute_definitions
 		SET value_type = 'record_reference', field_type = 'person', record_target = 'person'
 		WHERE universal_id = ?
@@ -844,6 +850,58 @@ func TestPersonWorkerPersistsPartialPrefixAndRetriesOnlyRemainder(t *testing.T) 
 	check.Equal(map[int64]string{1: "rev-1", 2: "rev-2", 3: "rev-3"}, revisions)
 }
 
+func TestPersonWorkerKeepsCompletedPeopleAfterLearnedLimitAndYield(t *testing.T) {
+	check, must := assert.New(t), require.New(t)
+	requests := make(chan []string, 10)
+	var yield atomic.Bool
+	ctx, requestYield := jobctx.WithPreemption(t.Context())
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request := decodeRequest(t, r)
+		requests <- request.Input
+		if len(request.Input) > 4 {
+			<-r.Context().Done()
+			return
+		}
+		if yield.Swap(false) {
+			requestYield()
+		}
+		vectors := make([][]float32, len(request.Input))
+		for i := range vectors {
+			vectors[i] = []float32{1}
+		}
+		writeEmbeddings(t, w, vectors)
+	}))
+	t.Cleanup(server.Close)
+	client := NewClient(Config{Endpoint: server.URL, Model: "m", Dimension: 1, Timeout: 100 * time.Millisecond, MaxRetries: 1, Builtin: true}) //nolint:kennlint // deadlinetest: learn a smaller limit from a timed-out request
+	inputs := []string{"one", "two", "three", "four", "five", "six", "seven", "eight"}
+	_, err := client.Embed(t.Context(), inputs)
+	must.NoError(err)
+	for range 3 {
+		<-requests
+	}
+
+	source := newPersonWorkerSource()
+	for i, input := range inputs {
+		source.put(personDocument(int64(i+1), "rev", input))
+	}
+	backend := newPersonWorkerBackend()
+	worker := newTestPersonWorker(source, backend, client, 8)
+	yield.Store(true)
+	_, err = worker.RunOnce(ctx, 11, testEmbeddingPassScope())
+	must.NoError(err)
+	revisions, err := backend.ListPersonRevisions(t.Context(), 11)
+	must.NoError(err)
+	check.Equal(map[int64]string{1: "rev", 2: "rev", 3: "rev", 4: "rev"}, revisions)
+	check.Equal(inputs[:4], <-requests)
+
+	_, err = worker.RunOnce(t.Context(), 11, testEmbeddingPassScope())
+	must.NoError(err)
+	check.Equal(inputs[4:], <-requests)
+	revisions, err = backend.ListPersonRevisions(t.Context(), 11)
+	must.NoError(err)
+	check.Len(revisions, 8)
+}
+
 // TestPersonWorkerPartialErrorCountsReturnedFencedDocuments catches result
 // accounting that drops provider responses rejected by the source fence.
 func TestPersonWorkerPartialErrorCountsReturnedFencedDocuments(t *testing.T) {
@@ -942,17 +1000,23 @@ func TestPersonWorkerEarlyBatchErrorContinuesLaterBatches(t *testing.T) {
 }
 
 type personWorkerMessageRunner struct {
-	runOnce        []vector.GenerationID
-	runBackstop    []vector.GenerationID
-	runOnceResult  *RunResult
-	runOnceErr     error
-	runBackstopErr error
+	runOnce           []vector.GenerationID
+	runBackstop       []vector.GenerationID
+	runOnceResult     *RunResult
+	runOnceErr        error
+	runBackstopResult *RunResult
+	runBackstopErr    error
+	onRunOnce         func(context.Context)
+	onRunBackstop     func(context.Context)
 }
 
 func (r *personWorkerMessageRunner) RunOnce(
-	_ context.Context, gen vector.GenerationID, _ operations.PassScope,
+	ctx context.Context, gen vector.GenerationID, _ operations.PassScope,
 ) (RunResult, error) {
 	r.runOnce = append(r.runOnce, gen)
+	if r.onRunOnce != nil {
+		r.onRunOnce(ctx)
+	}
 	if r.runOnceResult != nil {
 		return *r.runOnceResult, r.runOnceErr
 	}
@@ -960,9 +1024,15 @@ func (r *personWorkerMessageRunner) RunOnce(
 }
 
 func (r *personWorkerMessageRunner) RunBackstop(
-	_ context.Context, gen vector.GenerationID, _ operations.PassScope,
+	ctx context.Context, gen vector.GenerationID, _ operations.PassScope,
 ) (RunResult, error) {
 	r.runBackstop = append(r.runBackstop, gen)
+	if r.onRunBackstop != nil {
+		r.onRunBackstop(ctx)
+	}
+	if r.runBackstopResult != nil {
+		return *r.runBackstopResult, r.runBackstopErr
+	}
 	return RunResult{}, r.runBackstopErr
 }
 
@@ -1106,4 +1176,30 @@ func TestGenerationWorkerBackstopMaintainsPeople(t *testing.T) {
 	must.NoError(err)
 	check.Equal([]vector.GenerationID{45}, messages.runBackstop)
 	check.Equal(RunResult{Claimed: 1, Succeeded: 1}, result)
+}
+
+func TestGenerationWorkerMarksSkippedPeoplePendingOnStop(t *testing.T) {
+	for _, backstop := range []bool{false, true} {
+		t.Run(fmt.Sprintf("backstop=%t", backstop), func(t *testing.T) {
+			ctx, requestYield := jobctx.WithPreemption(t.Context())
+			source := newPersonWorkerSource(personDocument(9, "rev-pending", "Synthetic Pending"))
+			client := &personWorkerClient{}
+			stopped := &RunResult{ScanComplete: true}
+			messages := &personWorkerMessageRunner{
+				runOnceResult: stopped, runBackstopResult: stopped,
+				onRunOnce: func(context.Context) { requestYield() }, onRunBackstop: func(context.Context) { requestYield() },
+			}
+			worker := NewGenerationWorker(messages, newTestPersonWorker(source, newPersonWorkerBackend(), client, 8))
+
+			run := worker.RunOnce
+			if backstop {
+				run = worker.RunBackstop
+			}
+			result, err := run(ctx, 46, testEmbeddingPassScope())
+
+			require.NoError(t, err)
+			assert.True(t, result.PersonsPending)
+			assert.Empty(t, client.calls, "a stopped message pass must skip person provider work")
+		})
+	}
 }

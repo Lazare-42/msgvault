@@ -1,22 +1,26 @@
 package query
 
 import (
-	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/identityindex"
+	"go.kenn.io/msgvault/internal/testutil/dbtest"
 )
 
 // ---------------------------------------------------------------------------
@@ -34,6 +38,7 @@ type MessageFixture struct {
 	SentAt              time.Time
 	SizeEstimate        int64
 	HasAttachments      bool
+	HiddenTextPresent   bool
 	AttachmentCount     int
 	DeletedAt           *time.Time // nil = NULL
 	InternalDeletedAt   *time.Time // nil = omitted from legacy fixtures / NULL in opted-in fixtures
@@ -98,6 +103,7 @@ type RecipientFixture struct {
 	// participant's current address in email_address, matching what the
 	// exporter writes for cache schema v26.
 	EmailAddress string
+	IsRelayed    bool
 }
 
 // LabelFixture defines a label row for Parquet test data.
@@ -177,6 +183,7 @@ type TestDataBuilder struct {
 	conversationParticipants []ConversationParticipantFixture
 	ownerParticipants        []OwnerParticipantFixture
 	participantClusters      []ParticipantClusterFixture
+	unsentMessages           string
 
 	emptyAttachments bool // if true, write empty attachments file
 	// legacyRecipientSchema writes message_recipients without the
@@ -250,6 +257,7 @@ type MessageOpt struct {
 	SentAt              time.Time
 	SizeEstimate        int64
 	HasAttachments      bool
+	HiddenTextPresent   bool
 	DeletedAt           *time.Time
 	InternalDeletedAt   *time.Time
 	DeletedFromSourceAt *time.Time
@@ -301,6 +309,7 @@ func (b *TestDataBuilder) AddMessage(opt MessageOpt) int64 {
 		SentAt:                 sentAt,
 		SizeEstimate:           opt.SizeEstimate,
 		HasAttachments:         opt.HasAttachments,
+		HiddenTextPresent:      opt.HiddenTextPresent,
 		DeletedAt:              opt.DeletedAt,
 		InternalDeletedAt:      opt.InternalDeletedAt,
 		DeletedFromSourceAt:    opt.DeletedFromSourceAt,
@@ -499,9 +508,10 @@ func (m MessageFixture) sqlValues() []string {
 		fmt.Sprintf("%d::BIGINT", m.ConversationID),
 		sqlStr(m.Subject),
 		sqlStr(m.Snippet),
-		fmt.Sprintf("TIMESTAMP '%s'", m.SentAt.Format("2006-01-02 15:04:05")),
+		fmt.Sprintf("TIMESTAMP '%s'", m.SentAt.Format("2006-01-02 15:04:05.999999")),
 		fmt.Sprintf("%d::BIGINT", m.SizeEstimate),
 		strconv.FormatBool(m.HasAttachments),
+		strconv.FormatBool(m.HiddenTextPresent),
 		strconv.Itoa(m.AttachmentCount),
 		deletedFromSourceAt,
 		senderID,
@@ -547,9 +557,10 @@ func (m MessageFixture) sqlValuesWithInternalDeletion() []string {
 		fmt.Sprintf("%d::BIGINT", m.ConversationID),
 		sqlStr(m.Subject),
 		sqlStr(m.Snippet),
-		fmt.Sprintf("TIMESTAMP '%s'", m.SentAt.Format("2006-01-02 15:04:05")),
+		fmt.Sprintf("TIMESTAMP '%s'", m.SentAt.Format("2006-01-02 15:04:05.999999")),
 		fmt.Sprintf("%d::BIGINT", m.SizeEstimate),
 		strconv.FormatBool(m.HasAttachments),
+		strconv.FormatBool(m.HiddenTextPresent),
 		strconv.Itoa(m.AttachmentCount),
 		internalDeletedAt,
 		deletedFromSourceAt,
@@ -607,9 +618,9 @@ func (b *TestDataBuilder) recipientsSQL() string {
 		} else if email := b.participantEmail(r.ParticipantID); email != "" {
 			resolved = sqlStr(email)
 		}
-		return fmt.Sprintf("(%d::BIGINT, %d::BIGINT, %s, %s, %s, %s)",
+		return fmt.Sprintf("(%d::BIGINT, %d::BIGINT, %s, %s, %s, %s, %t)",
 			r.MessageID, r.ParticipantID, sqlStr(r.Type), sqlStr(r.DisplayName),
-			resolved, envelope)
+			resolved, envelope, r.IsRelayed)
 	})
 }
 
@@ -674,8 +685,8 @@ func (b *TestDataBuilder) participantClustersSQL() string {
 
 // column definitions (coupled to SQL generation methods above).
 const (
-	messagesCols               = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, sender_id, owner_participant_id, message_type, list_id, is_from_me, year, month"
-	messagesColsWithDeletedAt  = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_at, deleted_from_source_at, sender_id, owner_participant_id, message_type, list_id, is_from_me, year, month"
+	messagesCols               = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, hidden_text_present, attachment_count, deleted_from_source_at, sender_id, owner_participant_id, message_type, list_id, is_from_me, year, month"
+	messagesColsWithDeletedAt  = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, hidden_text_present, attachment_count, deleted_at, deleted_from_source_at, sender_id, owner_participant_id, message_type, list_id, is_from_me, year, month"
 	sourcesCols                = "id, account_email, source_type"
 	participantsCols           = "id, email_address, domain, display_name, phone_number"
 	participantIdentifiersCols = "participant_id, identifier_type, identifier_value, display_value, is_primary"
@@ -683,7 +694,7 @@ const (
 	// messageRecipientsColsWithEnvelope adds the resolved recipient address
 	// and the raw header address (cache schema v26). messageRecipientsCols
 	// stays for fixtures that model pre-v17 caches without either column.
-	messageRecipientsColsWithEnvelope = "message_id, participant_id, recipient_type, display_name, email_address, envelope_address"
+	messageRecipientsColsWithEnvelope = "message_id, participant_id, recipient_type, display_name, email_address, envelope_address, is_relayed"
 	labelsCols                        = "id, name"
 	messageLabelsCols                 = "message_id, label_id"
 	attachmentsCols                   = "attachment_id, message_id, size, filename, mime_type"
@@ -712,6 +723,8 @@ func (b *TestDataBuilder) Build() (string, func()) {
 	b.t.Helper()
 
 	pb := newParquetBuilder(b.t)
+	pb.unsentMessages = b.unsentMessages
+	pb.legacyRecipientSchema = b.legacyRecipientSchema
 	b.addMessageTables(pb)
 	b.addAuxiliaryTables(pb)
 	b.addAttachmentsTable(pb)
@@ -764,7 +777,7 @@ func (b *TestDataBuilder) recipientDummyRow() string {
 	if b.legacyRecipientSchema {
 		return "(0::BIGINT, 0::BIGINT, '', '')"
 	}
-	return "(0::BIGINT, 0::BIGINT, '', '', '', '')"
+	return "(0::BIGINT, 0::BIGINT, '', '', '', '', false)"
 }
 
 // addAuxiliaryTables adds sources, participants, recipients, labels, message_labels, and conversations.
@@ -810,7 +823,7 @@ func (b *TestDataBuilder) BuildEngine() *DuckDBEngine {
 	b.t.Helper()
 	analyticsDir, cleanup := b.Build()
 	b.t.Cleanup(cleanup)
-	engine, err := NewDuckDBEngine(analyticsDir, "", nil)
+	engine, err := NewDuckDBEngine(b.t.Context(), analyticsDir, "", nil)
 	require.NoError(b.t, err, "NewDuckDBEngine")
 	b.t.Cleanup(func() { _ = engine.Close() })
 	return engine
@@ -832,13 +845,42 @@ type parquetTable struct {
 
 // parquetBuilder creates a temp directory with Parquet test data files.
 type parquetBuilder struct {
-	t      testing.TB
-	tables []parquetTable
+	t                     testing.TB
+	tables                []parquetTable
+	unsentMessages        string
+	legacyRecipientSchema bool
+}
+
+// Like dbtest.schemaTemplates and testutil.sqliteTemplate, retain templates in
+// memory and give each test a copy. A mutex lets a later test retry if require
+// calls Goexit during a build; sync.Once would leave the entry empty forever.
+var parquetTemplates sync.Map
+
+type parquetTemplate struct {
+	mu      sync.Mutex
+	files   fstest.MapFS
+	derived identityindex.BuildResult
+}
+
+func (b *parquetBuilder) contentKey() [sha256.Size]byte {
+	tables := slices.Clone(b.tables)
+	slices.SortStableFunc(tables, func(a, b parquetTable) int {
+		return strings.Compare(a.subdir+"/"+a.file, b.subdir+"/"+b.file)
+	})
+	h := sha256.New()
+	for _, table := range tables {
+		for _, field := range []string{table.name, table.subdir, table.file, table.columns, table.values, strconv.FormatBool(table.empty)} {
+			_, _ = fmt.Fprintf(h, "%d:%s", len(field), field)
+		}
+	}
+	_, _ = fmt.Fprintf(h, "%d:%s:%t", len(b.unsentMessages), b.unsentMessages, b.legacyRecipientSchema)
+	return [sha256.Size]byte(h.Sum(nil))
 }
 
 // newParquetBuilder creates a new builder for Parquet test fixtures.
 func newParquetBuilder(tb testing.TB) *parquetBuilder {
 	tb.Helper()
+	dbtest.SkipIfPostgres(tb, "Parquet fixtures run on DuckDB only")
 	return &parquetBuilder{t: tb}
 }
 
@@ -877,22 +919,22 @@ func (b *parquetBuilder) build() (string, func()) {
 	b.ensureParticipantClustersTable()
 	b.ensurePersonDisplayNamesTable()
 
-	tmpDir := b.createTempDirs()
+	value, _ := parquetTemplates.LoadOrStore(b.contentKey(), &parquetTemplate{})
+	template, ok := value.(*parquetTemplate)
+	require.True(b.t, ok, "parquet template cache entry type")
+	func() {
+		template.mu.Lock()
+		defer template.mu.Unlock()
+		if template.files == nil {
+			template.files, template.derived = b.buildTemplate()
+		}
+	}()
 
-	db, err := sql.Open("duckdb", "")
-	if err != nil {
-		_ = os.RemoveAll(tmpDir)
-		require.NoError(b.t, err, "open duckdb")
-	}
-	defer func() { _ = db.Close() }()
-
-	b.writeParquetFiles(db, tmpDir)
-	derived, err := identityindex.Build(context.Background(), db, identityindex.BuildOptions{
-		Mode:           identityindex.ModeFull,
-		StagedBaseRoot: tmpDir,
-		OutputRoot:     tmpDir,
-	})
-	require.NoError(b.t, err, "derive identity fixture datasets")
+	tmpDir, err := os.MkdirTemp("", "msgvault-test-parquet-*")
+	require.NoError(b.t, err, "create fixture copy directory")
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+	require.NoError(b.t, os.CopyFS(tmpDir, template.files), "copy parquet template")
+	derived := template.derived
 	fingerprint, err := CacheDatasetFingerprint(tmpDir)
 	require.NoError(b.t, err, "fingerprint cache fixture")
 	stateData, err := json.Marshal(CacheSyncState{
@@ -907,7 +949,60 @@ func (b *parquetBuilder) build() (string, func()) {
 	require.NoError(b.t, os.WriteFile(CacheStatePath(tmpDir), stateData, 0o600),
 		"write cache state")
 
-	return tmpDir, func() { _ = os.RemoveAll(tmpDir) }
+	return tmpDir, cleanup
+}
+
+func (b *parquetBuilder) buildTemplate() (fstest.MapFS, identityindex.BuildResult) {
+	b.t.Helper()
+	tmpDir := b.createTempDirs()
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	db, err := sql.Open("duckdb", "")
+	require.NoError(b.t, err, "open duckdb")
+	defer func() { _ = db.Close() }()
+	b.writeParquetFiles(db, tmpDir)
+	var legacyRecipients []byte
+	var recipientPath string
+	if b.legacyRecipientSchema {
+		recipientPath = filepath.Join(tmpDir, "message_recipients", "message_recipients.parquet")
+		legacyRecipients, err = os.ReadFile(recipientPath)
+		require.NoError(b.t, err)
+		currentPath := recipientPath + ".current"
+		_, err = db.ExecContext(b.t.Context(), "COPY (SELECT *, NULL::VARCHAR AS email_address, NULL::VARCHAR AS envelope_address FROM read_parquet('"+escapePath(recipientPath)+"')) TO '"+escapePath(currentPath)+"' (FORMAT PARQUET)")
+		require.NoError(b.t, err)
+		require.NoError(b.t, os.Rename(currentPath, recipientPath))
+	}
+	derived, err := identityindex.Build(b.t.Context(), db, identityindex.BuildOptions{
+		Mode:           identityindex.ModeFull,
+		StagedBaseRoot: tmpDir,
+		OutputRoot:     tmpDir,
+		UnsentMessages: b.unsentMessages,
+	})
+	require.NoError(b.t, err, "derive identity fixture datasets")
+	if b.legacyRecipientSchema {
+		require.NoError(b.t, os.WriteFile(recipientPath, legacyRecipients, 0o600))
+	}
+	files := fstest.MapFS{}
+	err = fs.WalkDir(os.DirFS(tmpDir), ".", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == "." {
+			return nil
+		}
+		if entry.IsDir() {
+			files[path] = &fstest.MapFile{Mode: fs.ModeDir | 0o755}
+			return nil
+		}
+		data, err := os.ReadFile(filepath.Join(tmpDir, filepath.FromSlash(path)))
+		if err != nil {
+			return err
+		}
+		files[path] = &fstest.MapFile{Data: data, Mode: 0o600}
+		return nil
+	})
+	require.NoError(b.t, err, "read parquet template")
+	return files, derived
 }
 
 func (b *parquetBuilder) ensureParticipantIdentifiersTable() {
@@ -991,6 +1086,17 @@ func (b *parquetBuilder) writeParquetFiles(db *sql.DB, tmpDir string) {
 	for _, tbl := range b.tables {
 		path := escapePath(filepath.Join(tmpDir, tbl.subdir, tbl.file))
 		writeTableParquet(b.t, db, path, tbl.columns, tbl.values, tbl.empty)
+		if tbl.name == "message_recipients" && tbl.columns == messageRecipientsCols {
+			// Every cache v36 shard has is_relayed. Only legacy TestDataBuilder
+			// fixtures omit the envelope columns.
+			current := "SELECT *, false AS is_relayed"
+			if !b.legacyRecipientSchema {
+				current = "SELECT *, NULL::VARCHAR AS email_address, NULL::VARCHAR AS envelope_address, false AS is_relayed"
+			}
+			_, err := db.ExecContext(b.t.Context(), "COPY ("+current+" FROM read_parquet('"+path+"')) TO '"+path+".v36' (FORMAT PARQUET)")
+			require.NoError(b.t, err)
+			require.NoError(b.t, os.Rename(filepath.FromSlash(path+".v36"), filepath.FromSlash(path)))
+		}
 	}
 }
 
@@ -1002,8 +1108,10 @@ func escapePath(p string) string {
 // writeTableParquet writes a single table's data to a Parquet file using DuckDB.
 func writeTableParquet(tb testing.TB, db *sql.DB, path, columns, values string, empty bool) {
 	tb.Helper()
-	valueRows, err := db.Query("SELECT * FROM (VALUES " + values + ") LIMIT 0")
+	_, err := db.ExecContext(tb.Context(), "CREATE TABLE fixture_values AS SELECT * FROM (VALUES "+values+")")
 	require.NoError(tb, err, "parse fixture values for %s", path)
+	valueRows, err := db.QueryContext(tb.Context(), "SELECT * FROM fixture_values LIMIT 0")
+	require.NoError(tb, err, "read fixture values for %s", path)
 	defer func() { _ = valueRows.Close() }()
 	valueColumns, err := valueRows.Columns()
 	require.NoError(tb, err, "read fixture value arity for %s", path)
@@ -1024,12 +1132,14 @@ func writeTableParquet(tb testing.TB, db *sql.DB, path, columns, values string, 
 	}
 	query := fmt.Sprintf(`
 			COPY (
-				SELECT %s FROM (VALUES %s) AS t(%s)%s
+				SELECT %s FROM fixture_values AS t(%s)%s
 			) TO '%s' (FORMAT PARQUET)
-		`, projection, values, columns, whereClause, path)
+		`, projection, columns, whereClause, path)
 
-	_, err = db.Exec(query)
+	_, err = db.ExecContext(tb.Context(), query)
 	require.NoError(tb, err, "create parquet %s", path)
+	_, err = db.ExecContext(tb.Context(), "DROP TABLE fixture_values")
+	require.NoError(tb, err, "drop fixture values for %s", path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,7 +1152,7 @@ func createEngineFromBuilder(tb testing.TB, pb *parquetBuilder) *DuckDBEngine {
 	tb.Helper()
 	analyticsDir, cleanup := pb.build()
 	tb.Cleanup(cleanup)
-	engine, err := NewDuckDBEngine(analyticsDir, "", nil)
+	engine, err := NewDuckDBEngine(tb.Context(), analyticsDir, "", nil)
 	require.NoError(tb, err, "NewDuckDBEngine")
 	tb.Cleanup(func() { _ = engine.Close() })
 	return engine

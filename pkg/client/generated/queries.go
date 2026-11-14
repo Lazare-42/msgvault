@@ -138,6 +138,15 @@ type ListAttributeDefinitionsQuery struct {
 	IncludeHidden *bool `json:"include_hidden,omitempty"`
 }
 
+type ListCalendarEventsQuery struct {
+	From time.Time `json:"from" validate:"required"`
+	To   time.Time `json:"to" validate:"required"`
+}
+
+func (l ListCalendarEventsQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
 type ListCardDAVBooksQuery struct {
 	// Connection Saved connection name; omit for all connections
 	Connection *string `json:"connection,omitempty"`
@@ -480,83 +489,6 @@ type ListDeletionsQuery struct {
 	Status *string `json:"status,omitempty"`
 }
 
-type SearchDocumentsQuery struct {
-	// Q Extracted document content or filename query
-	Q string `json:"q" validate:"required"`
-
-	// SourceID Source IDs to include; repeat or comma-separate values
-	SourceID []int64 `json:"source_id,omitempty"`
-
-	// MessageType Message types to include; repeat or comma-separate values
-	MessageType []string `json:"message_type,omitempty"`
-
-	// AttachmentID Exact attachment occurrence ID
-	AttachmentID *int64 `json:"attachment_id,omitempty"`
-
-	// MessageID Exact containing message ID
-	MessageID *int64 `json:"message_id,omitempty"`
-
-	// PersonID Durable person ID
-	PersonID *int64 `json:"person_id,omitempty"`
-
-	// ParticipantID Observed participant ID; translated through its durable person when bound
-	ParticipantID *int64 `json:"participant_id,omitempty"`
-
-	// Direction Person relation; repeat or comma-separate from_person, to_person, or group
-	Direction []string `json:"direction,omitempty"`
-
-	// After Only messages on or after an RFC3339 or YYYY-MM-DD date
-	After *string `json:"after,omitempty"`
-
-	// Before Only messages before an RFC3339 or YYYY-MM-DD date
-	Before *string `json:"before,omitempty"`
-
-	// Limit Maximum results to return (default 20, max 100)
-	Limit *int64 `json:"limit,omitempty"`
-
-	// Cursor Opaque cursor from the previous document search page
-	Cursor *string `json:"cursor,omitempty"`
-
-	// Mode Search mode: lexical (default and auto); semantic/hybrid send the query to the embedding provider
-	Mode *string `json:"mode,omitempty"`
-
-	// CandidateLimit Maximum candidates (default/max: lexical 10000; semantic/hybrid 100/1000)
-	CandidateLimit *int64 `json:"candidate_limit,omitempty"`
-}
-
-func (s SearchDocumentsQuery) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(s))
-}
-
-type GetDocumentIndexStatusQuery struct {
-	// ProfileID Exact document extraction profile ID
-	ProfileID string `json:"profile_id" validate:"required"`
-
-	// InputKey Exact extraction input key
-	InputKey string `json:"input_key" validate:"required"`
-
-	// MediaType Allowed document media types
-	MediaType []string `json:"media_type" validate:"required"`
-
-	// MessageType Allowed message types
-	MessageType []string `json:"message_type,omitempty"`
-}
-
-func (g GetDocumentIndexStatusQuery) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(g))
-}
-
-type GetDocumentVectorStatusQuery struct {
-	// GenerationID Generation whose bounded failures to inspect
-	GenerationID *int64 `json:"generation_id,omitempty"`
-
-	// AfterToken Stable failure cursor token
-	AfterToken *string `json:"after_token,omitempty"`
-
-	// Limit Maximum failure diagnostics (default 20, max 1000)
-	Limit *int64 `json:"limit,omitempty"`
-}
-
 type GetEmbeddingStatusQuery struct {
 	// SourceID Filter eligible/current/pending by source ID; diagnostics, throughput, job, and failures remain run-wide; ETA is null
 	SourceID *int64 `json:"source_id,omitempty" validate:"omitempty,gte=1"`
@@ -614,20 +546,43 @@ type GetKataIssueContextQuery struct {
 	Offset *int64 `json:"offset,omitempty"`
 }
 
-type SearchIntegrationTasksQuery struct {
-	// Q Task title search within the configured project
-	Q string `json:"q" validate:"required"`
+type ListOpenKataIssuesQuery struct {
+	// Q Search open issue text by whole word or enter an exact qualified ref, including closed issues, up to 256 bytes
+	Q *string `json:"q,omitempty"`
 }
 
-func (s SearchIntegrationTasksQuery) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+type SearchIntegrationTasksQuery struct {
+	// Q Task title search within the configured project; omit to list tasks
+	Q *string `json:"q,omitempty"`
+}
+
+type ListLoopsQuery struct {
+	// PersonID Only loops with this person
+	PersonID *int64 `json:"person_id,omitempty"`
+
+	// Limit Maximum loops to return
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=200"`
+}
+
+func (l ListLoopsQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
+type MarkLoopDoneQuery struct {
+	// QuestionMessageIds The list item's question_message_ids; only these are marked. Omit to cover every question visible now.
+	QuestionMessageIds []int64 `json:"question_message_ids,omitempty"`
+}
+
+type SnoozeLoopQuery struct {
+	// QuestionMessageIds The list item's question_message_ids; only these are marked. Omit to cover every question visible now.
+	QuestionMessageIds []int64 `json:"question_message_ids,omitempty"`
 }
 
 type SearchMediaQuery struct {
-	// Q Spoken words to find in transcripts
+	// Q Words to find in recordings and attachments
 	Q string `json:"q" validate:"required"`
 
-	// Mode Lexical mode; semantic and hybrid are unavailable
+	// Mode Attachment mode: lexical (default), semantic, or hybrid; recordings support lexical only
 	Mode *string `json:"mode,omitempty"`
 
 	// PersonID Durable person ID
@@ -810,6 +765,9 @@ type GetGmailIDsByFilterQuery struct {
 	// SearchMode Search mode: fast, deep, or aggregate; required with q
 	SearchMode *string `json:"search_mode,omitempty"`
 
+	// MaxResults Maximum results for bounded search-aware deletion resolution (max 100001)
+	MaxResults *int64 `json:"max_results,omitempty"`
+
 	// ViewType Aggregate view type; required for aggregate search
 	ViewType *string `json:"view_type,omitempty"`
 
@@ -955,6 +913,9 @@ func (f FindContactCandidatesQuery) Validate() error {
 type ListDirectoryPeopleQuery struct {
 	// Q Lexical query over person names, contact points, and organizations
 	Q *string `json:"q,omitempty"`
+
+	// Address Literal case-insensitive substring of current bound participant identities or curated contact points
+	Address *string `json:"address,omitempty"`
 
 	// Cursor Opaque cursor returned by the previous Directory page
 	Cursor *string `json:"cursor,omitempty"`

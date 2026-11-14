@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -179,95 +181,79 @@ func TestPerformUpdateWithDaemonLifecycleRestartsAfterPartialStopFailure(t *test
 }
 
 func TestStopLocalDaemonsForUpdateStopsLiveRuntimeRecords(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	dataDir := t.TempDir()
-	server := httptestPingDaemon(t)
-	portText := strconv.Itoa(server.Port)
-	_, err := daemonRuntimeStore(dataDir).Write(daemon.RuntimeRecord{
-		PID:     os.Getpid(),
-		Network: daemon.NetworkTCP,
-		Address: net.JoinHostPort(server.Host, portText),
-		Service: daemonService,
-		Version: Version,
-		Metadata: map[string]string{
-			runtimeHost:             server.Host,
-			runtimePort:             portText,
-			runtimeAPIVersion:       strconv.Itoa(daemonAPIVersion),
-			runtimeAPISchemaVersion: api.APISchemaVersion,
-			runtimeCreateTime:       matchingProcessCreateTime(t),
-		},
-	})
-	require.NoError(err, "write runtime")
+	for _, tc := range []struct{ background, persistent string }{{}, {background: "true", persistent: "false"}, {background: "true", persistent: "true"}, {background: "true"}} {
+		background := tc.background
+		t.Run("background="+background+"/persistent="+tc.persistent, func(t *testing.T) {
+			persistent := tc.persistent == "true"
+			require := require.New(t)
+			assert := assert.New(t)
+			dataDir := t.TempDir()
+			server := httptestPingDaemon(t)
+			portText := strconv.Itoa(server.Port)
+			record := daemon.RuntimeRecord{
+				PID:     os.Getpid(),
+				Network: daemon.NetworkTCP,
+				Address: net.JoinHostPort(server.Host, portText),
+				Service: daemonService,
+				Version: Version,
+				Metadata: map[string]string{
+					runtimeHost:             server.Host,
+					runtimePort:             portText,
+					runtimeAPIVersion:       strconv.Itoa(daemonAPIVersion),
+					runtimeAPISchemaVersion: api.APISchemaVersion,
+					runtimeCreateTime:       matchingProcessCreateTime(t),
+				},
+			}
+			if tc.persistent != "" {
+				record.Metadata[runtimePersistent] = tc.persistent
+			}
+			if background != "" {
+				record.Metadata[runtimeBackground] = background
+			}
+			_, err := daemonRuntimeStore(dataDir).Write(record)
+			require.NoError(err, "write runtime")
 
-	var stoppedPID int
-	stubStopDaemonRuntimeForUpgrade(t, func(_ config.Config, rt *DaemonRuntime, _ *slog.Logger) error {
-		stoppedPID = rt.Record.PID
-		return nil
-	})
+			var stoppedPID int
+			stubStopDaemonRuntimeForUpgrade(t, func(_ config.Config, rt *DaemonRuntime, _ *slog.Logger) error {
+				stoppedPID = rt.Record.PID
+				return nil
+			})
 
-	result, err := stopLocalDaemonsForUpdate(lifecycleTestConfig(dataDir), testDiscardLogger())
+			result, err := stopLocalDaemonsForUpdate(lifecycleTestConfig(dataDir), testDiscardLogger())
 
-	require.NoError(err, "stop local daemons")
-	assert.True(result.Stopped, "stopped")
-	assert.Equal(os.Getpid(), stoppedPID, "stopped pid")
+			require.NoError(err, "stop local daemons")
+			assert.True(result.Stopped, "stopped")
+			assert.Equal(persistent, result.Persistent)
+			assert.Equal(background == "true", result.Background, "background")
+			assert.Equal(os.Getpid(), stoppedPID, "stopped pid")
+		})
+	}
 }
 
 func TestRestartDaemonAfterUpdateUsesInstalledExecutablePath(t *testing.T) {
+	for _, persistent := range []bool{false, true} {
+		t.Run(strconv.FormatBool(persistent), func(t *testing.T) { testRestartDaemonAfterUpdateLifetime(t, persistent) })
+	}
+}
+
+func testRestartDaemonAfterUpdateLifetime(t *testing.T, persistent bool) {
+	t.Helper()
 	require := require.New(t)
 	assert := assert.New(t)
 	cfg := lifecycleTestConfig(t.TempDir())
 	installedExe := filepath.Join(t.TempDir(), "bin", updateExecutableName())
 	waitCh := make(chan error)
 	var gotExecutable string
+	var gotCtx context.Context
 
 	stubStartServeBackgroundProcess(t, func(
 		_ *config.Config,
 		opts backgroundServeStartOptions,
 	) (*backgroundServeProcess, error) {
+		assert.Equal(persistent, opts.Persistent)
 		gotExecutable = opts.ExecutablePath
 		return &backgroundServeProcess{
 			PID:     990,
-			LogPath: "/tmp/msgvault-serve.log",
-			Wait:    waitCh,
-		}, nil
-	})
-	stubWaitForBackgroundServeReady(t, func(
-		context.Context,
-		string,
-		<-chan error,
-		time.Duration,
-	) (*DaemonRuntime, bool, error) {
-		return &DaemonRuntime{
-			Record: daemon.RuntimeRecord{PID: 990},
-			Host:   net.IPv4(127, 0, 0, 1).String(),
-			Port:   9090,
-		}, true, nil
-	})
-
-	err := restartDaemonAfterUpdate(cfg, updateDaemonStopResult{Stopped: true}, installedExe, testInvocationWithConfig(cfg))
-
-	require.NoError(err, "restart daemon")
-	assert.Equal(installedExe, gotExecutable, "restart executable")
-}
-
-// The restart builds its own command, and a cobra command only gets a context
-// from ExecuteC. Without one, cmd.Context() is nil and the first context call
-// in the readiness wait panics.
-func TestRestartDaemonAfterUpdatePassesUsableContext(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	cfg := lifecycleTestConfig(t.TempDir())
-	installedExe := filepath.Join(t.TempDir(), "bin", updateExecutableName())
-	waitCh := make(chan error)
-	var gotCtx context.Context
-
-	stubStartServeBackgroundProcess(t, func(
-		_ *config.Config,
-		_ backgroundServeStartOptions,
-	) (*backgroundServeProcess, error) {
-		return &backgroundServeProcess{
-			PID:     991,
 			LogPath: "/tmp/msgvault-serve.log",
 			Wait:    waitCh,
 		}, nil
@@ -278,17 +264,124 @@ func TestRestartDaemonAfterUpdatePassesUsableContext(t *testing.T) {
 		_ <-chan error,
 		_ time.Duration,
 	) (*DaemonRuntime, bool, error) {
-		gotCtx = ctx
+		gotCtx = ctx //nolint:fatcontext // The test captures the lookup context to inspect it.
 		return &DaemonRuntime{
-			Record: daemon.RuntimeRecord{PID: 991},
+			Record: daemon.RuntimeRecord{PID: 990},
 			Host:   net.IPv4(127, 0, 0, 1).String(),
-			Port:   9091,
+			Port:   9090,
 		}, true, nil
 	})
 
-	err := restartDaemonAfterUpdate(cfg, updateDaemonStopResult{Stopped: true}, installedExe, testInvocationWithConfig(cfg))
+	err := restartDaemonAfterUpdate(cfg, updateDaemonStopResult{Stopped: true, Background: true, Persistent: persistent}, installedExe, testInvocationWithConfig(cfg), false, io.Discard)
 
 	require.NoError(err, "restart daemon")
+	assert.Equal(installedExe, gotExecutable, "restart executable")
 	require.NotNil(gotCtx, "readiness wait received a nil context")
 	assert.NoError(gotCtx.Err(), "context usable")
+}
+
+func TestRestartDaemonAfterUpdateLeavesUnmarkedDaemonStopped(t *testing.T) {
+	assert := assert.New(t)
+	cfg := lifecycleTestConfig(t.TempDir())
+	stubStartServeBackgroundProcess(t, func(*config.Config, backgroundServeStartOptions) (*backgroundServeProcess, error) {
+		assert.Fail("unmarked daemon must be left to whoever started it")
+		return nil, errors.New("unexpected daemon start")
+	})
+	for _, noRestart := range []bool{false, true} {
+		state := testInvocationWithConfig(cfg)
+		var out bytes.Buffer
+		err := restartDaemonAfterUpdate(cfg, updateDaemonStopResult{Stopped: true}, "", state, noRestart, &out)
+		require.NoError(t, err)
+		assert.Equal("Update couldn't confirm msgvault started the daemon for "+cfg.Data.DataDir+" in the background, so it left it stopped. Restart it the way you started it, such as `systemctl restart msgvault`.\n", out.String())
+		assert.NotContains(out.String(), "daemon start")
+	}
+}
+
+func TestRestartDaemonAfterUpdateNoRestart(t *testing.T) {
+	assert := assert.New(t)
+	cfg := lifecycleTestConfig(t.TempDir())
+	stubStartServeBackgroundProcess(t, func(*config.Config, backgroundServeStartOptions) (*backgroundServeProcess, error) {
+		assert.Fail("--no-restart must leave the daemon stopped")
+		return nil, errors.New("unexpected daemon start")
+	})
+	for _, tt := range []struct {
+		options invocationOptions
+		command string
+	}{
+		{command: "    msgvault daemon start\n"},
+		{
+			options: invocationOptions{homeDir: "/tmp/example archive", cfgFile: "/tmp/example config.toml"},
+			command: "    msgvault --config '/tmp/example config.toml' --home '/tmp/example archive' daemon start\n",
+		},
+	} {
+		state := testInvocationWithConfig(cfg)
+		state.options = tt.options
+		var out bytes.Buffer
+		err := restartDaemonAfterUpdate(cfg, updateDaemonStopResult{Stopped: true, Background: true}, "", state, true, &out)
+		require.NoError(t, err)
+		assert.Contains(out.String(), cfg.Data.DataDir)
+		assert.Contains(out.String(), tt.command)
+	}
+}
+
+// fakeUpdateRelease stands in for GitHub: checks report a newer release, and
+// installs are recorded instead of replacing the test binary.
+func fakeUpdateRelease(t *testing.T) (checks, installs *int) {
+	t.Helper()
+	checks, installs = new(int), new(int)
+	savedCheck, savedPerform := checkForUpdate, performUpdate
+	t.Cleanup(func() { checkForUpdate, performUpdate = savedCheck, savedPerform })
+	checkForUpdate = func(current string, _ bool) (*update.UpdateInfo, error) {
+		*checks++
+		return &update.UpdateInfo{CurrentVersion: current, LatestVersion: "v9.9.9", Checksum: "abc"}, nil
+	}
+	performUpdate = func(info *update.UpdateInfo, _ func(int64, int64)) error {
+		*installs++
+		assert.Equal(t, "v9.9.9", info.LatestVersion, "installed version")
+		return nil
+	}
+	return checks, installs
+}
+
+func runUpdateWithDistribution(t *testing.T, distribution string, args ...string) error {
+	t.Helper()
+	saved := Distribution
+	Distribution = distribution
+	t.Cleanup(func() { Distribution = saved })
+	// Keep the command away from the user's archive and update cache.
+	home := t.TempDir()
+	t.Setenv("MSGVAULT_HOME", home)
+	root := newRootCommand()
+	root.AddCommand(newUpdateCmd())
+	_, _, err := runRoot(t, root, append([]string{"--home", home, "update"}, args...)...)
+	return err
+}
+
+func TestUpdateRefusesToInstallOverHomebrewBuild(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	for _, args := range [][]string{nil, {"--yes"}, {"--yes", "--force"}} {
+		checks, installs := fakeUpdateRelease(t)
+
+		err := runUpdateWithDistribution(t, "homebrew", args...)
+
+		require.ErrorContains(err, "managed by Homebrew", "msgvault update %v", args)
+		require.ErrorContains(err, "`brew upgrade msgvault`", "msgvault update %v", args)
+		assert.Zero(*checks, "msgvault update %v checked GitHub", args)
+		assert.Zero(*installs, "msgvault update %v installed", args)
+	}
+}
+
+func TestUpdateInstallsOverSelfUpdatingBuilds(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	for _, distribution := range []string{"", "kenn"} {
+		checks, installs := fakeUpdateRelease(t)
+
+		err := runUpdateWithDistribution(t, distribution, "--yes")
+
+		require.NoError(err, "distribution %q", distribution)
+		assert.Equal(1, *checks, "distribution %q checks", distribution)
+		assert.Equal(1, *installs, "distribution %q installs", distribution)
+	}
 }

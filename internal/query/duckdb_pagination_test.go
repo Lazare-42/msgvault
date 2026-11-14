@@ -1,7 +1,6 @@
 package query
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 // duplicate the same id across adjacent pages. Paging one row at a time and
 // asserting the union is disjoint-and-complete pins the deterministic order.
 func TestDuckDBPaginationStability_IdenticalSortKey(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	src := b.AddSource("me@gmail.com")
 	alice := b.AddParticipant("alice@example.com", "example.com", "Alice")
@@ -49,7 +49,7 @@ func TestDuckDBPaginationStability_IdenticalSortKey(t *testing.T) {
 	}
 
 	engine := b.BuildEngine()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("ListMessages", func(t *testing.T) {
 		seen := pageDuckOneByOne(t, n, func(offset int) (int64, bool) {

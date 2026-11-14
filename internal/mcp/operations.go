@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	"go.kenn.io/msgvault/internal/daemonclient"
 )
 
 // OperationBackend executes only the registered operation name. Each owning
@@ -38,6 +39,7 @@ type OperationFamily string
 const (
 	OperationFamilySources OperationFamily = "sources"
 	OperationFamilyRecords OperationFamily = "records"
+	OperationFamilyLoops   OperationFamily = "loops"
 )
 
 type operationalDefinition struct {
@@ -48,7 +50,9 @@ type operationalDefinition struct {
 
 // Roots are built once, independent of capability combinations. Selecting any
 // subset retains pointer identity for the official SDK's shared schema cache.
-var fixedOperationalDefinitions = sync.OnceValue(sourceOperationalDefinitions)
+var fixedOperationalDefinitions = sync.OnceValue(func() []operationalDefinition {
+	return append(append(sourceOperationalDefinitions(), loopOperationalDefinitions()...), deletionReviewOperationalDefinitions()...)
+})
 
 func operationalCatalog(opts ServeOptions, allowWrites bool) []operationalDefinition {
 	if opts.Operations == nil || opts.DelegatedOnly {
@@ -56,7 +60,7 @@ func operationalCatalog(opts ServeOptions, allowWrites bool) []operationalDefini
 	}
 	definitions := make([]operationalDefinition, 0)
 	for _, definition := range fixedOperationalDefinitions() {
-		if !slices.Contains(opts.OperationCapabilities, definition.definition.name) {
+		if !opts.Families.allows(definition.definition.name) || !slices.Contains(opts.OperationCapabilities, definition.definition.name) {
 			continue
 		}
 		if definition.writes && (!allowWrites || !slices.Contains(opts.OperationWriteFamilies, definition.family)) {
@@ -69,7 +73,7 @@ func operationalCatalog(opts ServeOptions, allowWrites bool) []operationalDefini
 
 func newOperationalDefinition(name, description string, family OperationFamily, input, output *jsonschema.Schema, writes bool) operationalDefinition {
 	definition := toolDefinition{name: name, description: description, inputSchema: input, outputSchema: operationalOutputSchema(output), annotations: toolAnnotations(!writes)}
-	openWorld := writes && family != OperationFamilyRecords
+	openWorld := writes && family == OperationFamilySources
 	definition.annotations.OpenWorldHint = &openWorld
 	return operationalDefinition{definition: definition, family: family, writes: writes}
 }
@@ -132,10 +136,13 @@ func operationalToolResponse(name string, result *OperationResult, err error) (*
 	if result == nil || result.Output == nil {
 		return nil, newInternalError(name, errors.New("missing operation result"))
 	}
-	response, err := jsonResult(result.Output)
-	if err != nil {
-		return nil, err
+	response, jsonErr := jsonResult(result.Output)
+	if jsonErr != nil {
+		return nil, jsonErr
 	}
 	response.isError = result.IsError
+	if local, ok := errors.AsType[*daemonclient.LocalDaemonUnavailableError](err); ok {
+		response.text = local.Error()
+	}
 	return response, nil
 }

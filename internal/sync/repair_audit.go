@@ -35,8 +35,8 @@ const (
 	auditPageSize = 100
 )
 
-// RepairAuditResult identifies a corruption candidate or a row whose raw MIME
-// could not be audited. Coherent rows are omitted from the stream.
+// RepairAuditResult identifies a mismatch or an inconclusive field comparison.
+// Rows whose fields all match are omitted from the stream.
 type RepairAuditResult struct {
 	InternalID      int64                 `json:"internal_id"`
 	SourceID        int64                 `json:"source_id"`
@@ -47,8 +47,8 @@ type RepairAuditResult struct {
 }
 
 // AuditGmailMessages strictly parses stored Gmail raw MIME and emits only
-// mismatches plus wholly inconclusive rows. sourceID zero audits every Gmail
-// source. The store reader and this comparison path perform no writes.
+// mismatches and rows with any inconclusive comparison. sourceID zero audits
+// every Gmail source. The store reader and this comparison path perform no writes.
 func (s *Syncer) AuditGmailMessages(
 	ctx context.Context, sourceID int64, emit func(RepairAuditResult) error,
 ) error {
@@ -126,6 +126,12 @@ func auditGmailEvidence(evidence store.GmailAuditEvidence) (RepairAuditResult, b
 		result.Error = textutil.FirstLine(evidence.RawMIMEError)
 		return result, true
 	}
+	if len(evidence.RawMIME) == 0 {
+		result.Status = AuditInconclusive
+		result.Fields[AuditFieldRawMIME] = AuditInconclusive
+		result.Error = "stored raw MIME is empty"
+		return result, true
+	}
 	parsed, err := mime.Parse(evidence.RawMIME)
 	if err != nil {
 		result.Status = AuditInconclusive
@@ -133,6 +139,7 @@ func auditGmailEvidence(evidence store.GmailAuditEvidence) (RepairAuditResult, b
 		result.Error = textutil.FirstLine(err.Error())
 		return result, true
 	}
+	parsed.OmitNULIdentities()
 	result.Fields[AuditFieldRawMIME] = AuditMatch
 	result.Fields[AuditFieldRFC822MessageID] = compareOptionalString(
 		evidence.RFC822MessageID.Valid, evidence.RFC822MessageID.String, parsed.MessageID,
@@ -224,15 +231,15 @@ func auditGmailEvidence(evidence store.GmailAuditEvidence) (RepairAuditResult, b
 		result.Fields[AuditFieldAttachmentPartKeys] = AuditInconclusive
 	}
 
-	matched := false
+	inconclusive := false
 	for _, state := range result.Fields {
 		if state == AuditMismatch {
 			result.Status = AuditMismatch
 			return result, true
 		}
-		matched = matched || state == AuditMatch
+		inconclusive = inconclusive || state == AuditInconclusive
 	}
-	if !matched {
+	if inconclusive {
 		result.Status = AuditInconclusive
 		return result, true
 	}
@@ -241,6 +248,11 @@ func auditGmailEvidence(evidence store.GmailAuditEvidence) (RepairAuditResult, b
 
 func compareOptionalString(storedValid bool, stored, parsed string) AuditState {
 	if !storedValid {
+		// Ingest stores empty optional projections as NULL. Only a nonempty
+		// parsed value establishes that there is something to compare.
+		if parsed == "" {
+			return AuditMatch
+		}
 		return AuditInconclusive
 	}
 	if stored == parsed {

@@ -178,6 +178,8 @@ type CLISearchRequest struct {
 }
 
 type CLISearch struct {
+	HasMore          bool                   `json:"has_more,omitzero"`
+	Hints            []query.SearchHint     `json:"hints,omitempty"`
 	HybridAvailable  bool                   `json:"hybrid_available,omitzero"`
 	Results          []query.MessageSummary `json:"results"`
 	ScopeLabel       string                 `json:"scope_label,omitempty"`
@@ -205,16 +207,18 @@ type CLIHybridSearchRequest struct {
 }
 
 type CLIHybridSearch struct {
-	Results          []CLIHybridSearchResult
-	Generation       CLIHybridGeneration
-	TookMS           int64
-	Timings          CLIHybridSearchTimings
-	PoolSaturated    bool
-	Accelerator      string
-	ReturnedCount    int
-	ScopeLabel       string
-	ScopeSourceCount int
-	HasMore          bool
+	Results               []CLIHybridSearchResult
+	Generation            CLIHybridGeneration
+	TookMS                int64
+	Timings               CLIHybridSearchTimings
+	PoolSaturated         bool
+	Accelerator           string
+	ReturnedCount         int
+	ScopeLabel            string
+	ScopeSourceCount      int
+	HasMore               bool
+	RankingLimitReached   int
+	CandidateLimitReached int
 }
 
 type CLIHybridSearchTimings struct {
@@ -284,8 +288,11 @@ type CLIAccount struct {
 	Type               string     `json:"type"`
 	DisplayName        string     `json:"display_name"`
 	OAuthApp           string     `json:"oauth_app,omitempty"`
+	AuthMethod         string     `json:"auth_method,omitempty"`
 	MessageCount       int64      `json:"message_count"`
 	SourceDeletedCount int64      `json:"source_deleted_count"`
+	Stale              bool       `json:"stale,omitempty"`
+	AsOf               *time.Time `json:"as_of,omitempty"`
 	LastSync           *time.Time `json:"last_sync"`
 	// SyncConfig is the source's sync_config JSON; the daemon only
 	// populates it for IMAP sources (connection parameters, no secrets).
@@ -989,7 +996,7 @@ func (c *Client) GetCLISearch(ctx context.Context, req CLISearchRequest) (*CLISe
 	}
 	result := cliSearchFromGenerated(resp.JSON200)
 	for i := range result.Results {
-		result.Results[i].WebURL = c.messageWebURL(result.Results[i].ID)
+		result.Results[i].WebURL = c.messageWebURL(ctx, result.Results[i].ID)
 	}
 	return result, nil
 }
@@ -1046,7 +1053,7 @@ func (c *Client) GetCLIHybridSearch(
 		return nil, err
 	}
 	for i := range result.Results {
-		result.Results[i].Message.WebURL = c.messageWebURL(result.Results[i].Message.ID)
+		result.Results[i].Message.WebURL = c.messageWebURL(ctx, result.Results[i].Message.ID)
 	}
 	return result, nil
 }
@@ -1091,7 +1098,7 @@ func (c *Client) FindSimilarMessages(
 			Fingerprint: resp.JSON200.Generation.Fingerprint,
 			State:       resp.JSON200.Generation.State,
 		},
-		Messages: c.messageSummariesWithURLs(resp.JSON200.Messages),
+		Messages: c.messageSummariesWithURLs(ctx, resp.JSON200.Messages),
 	}, nil
 }
 
@@ -1450,7 +1457,7 @@ func (c *Client) GetCLIMessage(ctx context.Context, id string) (*query.MessageDe
 	}
 	message := cliMessageDetailFromGenerated(resp.JSON200)
 	if message != nil {
-		message.WebURL = c.messageWebURL(message.ID)
+		message.WebURL = c.messageWebURL(ctx, message.ID)
 	}
 	return message, nil
 }
@@ -1684,17 +1691,17 @@ func cliAccountUpdateResultFromGenerated(result *generated.UpdateResult) *CLIAcc
 
 // messageWebURL opens the selected daemon's direct message route.
 // Message IDs are local to that daemon.
-func (c *Client) messageWebURL(id int64) string {
+func (c *Client) messageWebURL(ctx context.Context, id int64) string {
 	if id <= 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s/messages/%d", c.baseURL, id)
+	return fmt.Sprintf("%s/messages/%d", apiprotocol.BrowserOrigin(ctx, c.currentDaemonURL()), id)
 }
 
-func (c *Client) messageSummariesWithURLs(messages []generated.MessageSummary) []query.MessageSummary {
+func (c *Client) messageSummariesWithURLs(ctx context.Context, messages []generated.MessageSummary) []query.MessageSummary {
 	result := messageSummariesFromGenerated(messages)
 	for i := range result {
-		result[i].WebURL = c.messageWebURL(result[i].ID)
+		result[i].WebURL = c.messageWebURL(ctx, result[i].ID)
 	}
 	return result
 }

@@ -19,6 +19,7 @@ import (
 // canonical_id = min(A, A2); B is gated out by default; ShowAll lifts the
 // gate; and the result is deterministic given an injected Now.
 func TestRelationshipsRanksByReciprocityAndGatesNewsletters(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	srcID := b.AddSource("owner@example.com")
 	ownerID := b.AddParticipant("owner@example.com", "example.com", "Owner")
@@ -57,7 +58,7 @@ func TestRelationshipsRanksByReciprocityAndGatesNewsletters(t *testing.T) {
 	}
 
 	engine := b.BuildEngine()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("default gate excludes the newsletter", func(t *testing.T) {
 		assert := assert.New(t)
@@ -119,6 +120,7 @@ func TestRelationshipsRanksByReciprocityAndGatesNewsletters(t *testing.T) {
 }
 
 func TestRelationshipsRepeatedRequestsAreIndependentAndRevisioned(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -140,7 +142,7 @@ func TestRelationshipsRepeatedRequestsAreIndependentAndRevisioned(t *testing.T) 
 	}
 
 	engine := b.BuildEngine()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	first, err := engine.Relationships(ctx, RelationshipsRequest{Now: now, Limit: 10})
 	require.NoError(err)
@@ -171,6 +173,7 @@ func TestRelationshipsRepeatedRequestsAreIndependentAndRevisioned(t *testing.T) 
 }
 
 func TestRelationshipsCanceledWaiterUsesItsOwnContext(t *testing.T) {
+	t.Parallel()
 	requirementsForTest := require.New(t)
 	b := NewTestDataBuilder(t)
 	sourceID := b.AddSource("owner@example.com")
@@ -185,8 +188,8 @@ func TestRelationshipsCanceledWaiterUsesItsOwnContext(t *testing.T) {
 	b.AddFrom(messageID, ownerID, "Owner")
 	b.AddTo(messageID, personID, "Person")
 	engine := b.BuildEngine()
-	requirementsForTest.NoError(engine.querySem.Acquire(context.Background(), 1))
-	ctx, cancel := context.WithCancel(context.Background())
+	requirementsForTest.NoError(engine.querySem.Acquire(t.Context(), 1))
+	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	_, err := engine.Relationships(ctx, RelationshipsRequest{
 		Now:   time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
@@ -195,7 +198,7 @@ func TestRelationshipsCanceledWaiterUsesItsOwnContext(t *testing.T) {
 	requirementsForTest.ErrorIs(err, context.Canceled)
 	engine.querySem.Release(1)
 
-	result, err := engine.Relationships(context.Background(), RelationshipsRequest{
+	result, err := engine.Relationships(t.Context(), RelationshipsRequest{
 		Now:   time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
 		Limit: 10,
 	})
@@ -204,6 +207,7 @@ func TestRelationshipsCanceledWaiterUsesItsOwnContext(t *testing.T) {
 }
 
 func TestDateWindowRelationshipsUseExactActivityReduction(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	builder := NewTestDataBuilder(t)
@@ -234,7 +238,7 @@ func TestDateWindowRelationshipsUseExactActivityReduction(t *testing.T) {
 		Limit:   10,
 		Now:     time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC),
 	}
-	result, err := engine.Relationships(context.Background(), request)
+	result, err := engine.Relationships(t.Context(), request)
 	requirements.NoError(err)
 
 	requirements.Len(result.Rows, 1)
@@ -248,6 +252,7 @@ func TestDateWindowRelationshipsUseExactActivityReduction(t *testing.T) {
 // participant, the whole cluster is excluded from ranking (you never rank
 // yourself, even under an alias).
 func TestRelationshipsExcludesClusteredOwners(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -266,7 +271,7 @@ func TestRelationshipsExcludesClusteredOwners(t *testing.T) {
 	b.AddTo(msgID, otherID, "Bob")
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
+	result, err := engine.Relationships(t.Context(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
 	require.NoError(err)
 	require.Len(result.Rows, 1)
 	assert.Equal(otherID, result.Rows[0].CanonicalID)
@@ -281,6 +286,7 @@ func TestRelationshipsExcludesClusteredOwners(t *testing.T) {
 // the same instant: the two must produce identical decayed sums, whatever
 // the DuckDB session's date-diff decay for that instant happens to be.
 func TestRelationshipsDoesNotDoubleCountClusteredRecipientsInOneEntry(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -297,7 +303,7 @@ func TestRelationshipsDoesNotDoubleCountClusteredRecipientsInOneEntry(t *testing
 	control.AddTo(controlMsgID, controlAID, "Alice Work")
 
 	controlEngine := control.BuildEngine()
-	controlResult, err := controlEngine.Relationships(context.Background(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
+	controlResult, err := controlEngine.Relationships(t.Context(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
 	require.NoError(err)
 	require.Len(controlResult.Rows, 1)
 	require.Equal(int64(1), controlResult.Rows[0].Signals.SentCount)
@@ -317,7 +323,7 @@ func TestRelationshipsDoesNotDoubleCountClusteredRecipientsInOneEntry(t *testing
 	b.AddCc(msgID, a2ID, "Alice Home")
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
+	result, err := engine.Relationships(t.Context(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
 	require.NoError(err)
 	require.Len(result.Rows, 1)
 
@@ -334,6 +340,7 @@ func TestRelationshipsDoesNotDoubleCountClusteredRecipientsInOneEntry(t *testing
 // attendee, consistent with how owner-cluster exclusion already resolves
 // aliases through canon.
 func TestRelationshipsWithOwnerResolvesAlias(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -352,7 +359,7 @@ func TestRelationshipsWithOwnerResolvesAlias(t *testing.T) {
 	b.AddTo(meetingID, otherID, "X")
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
+	result, err := engine.Relationships(t.Context(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
 	require.NoError(err)
 	require.Len(result.Rows, 1)
 	assert.Equal(otherID, result.Rows[0].CanonicalID)
@@ -371,6 +378,7 @@ func TestRelationshipsWithOwnerResolvesAlias(t *testing.T) {
 // message's own source's account identities (the personal address is not an
 // identity on source B).
 func TestRelationshipsOwnerIdentitiesAreGlobalAcrossSources(t *testing.T) {
+	t.Parallel()
 	b := NewTestDataBuilder(t)
 	srcA := b.AddSource("owner@personal.example")
 	srcB := b.AddSource("owner@work.example")
@@ -407,7 +415,7 @@ func TestRelationshipsOwnerIdentitiesAreGlobalAcrossSources(t *testing.T) {
 	b.AddTo(recvB, workID, "Owner Work")
 
 	engine := b.BuildEngine()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	rowsByCanonicalID := func(t *testing.T, sourceIDs []int64) map[int64]RelationshipRow {
 		t.Helper()
@@ -467,6 +475,7 @@ func TestRelationshipsOwnerIdentitiesAreGlobalAcrossSources(t *testing.T) {
 // unlinked participants are unaffected, and a cluster with several named
 // members deterministically renders the smallest-ID member's name.
 func TestRelationshipsClusterLabelPrefersNamedMember(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -501,7 +510,7 @@ func TestRelationshipsClusterLabelPrefersNamedMember(t *testing.T) {
 	}
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(), RelationshipsRequest{Now: now, Limit: 10})
+	result, err := engine.Relationships(t.Context(), RelationshipsRequest{Now: now, Limit: 10})
 	require.NoError(err)
 	require.Len(result.Rows, 4)
 
@@ -527,6 +536,7 @@ func TestRelationshipsClusterLabelPrefersNamedMember(t *testing.T) {
 // the same instant and shares one display name, so score, timestamp, and
 // label all collide and only CanonicalID can break the tie.
 func TestRelationshipsPaginationStableAcrossFullyTiedRows(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -548,7 +558,7 @@ func TestRelationshipsPaginationStableAcrossFullyTiedRows(t *testing.T) {
 	}
 
 	engine := b.BuildEngine()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	const pageSize = 5
 	fetchAllPages := func() []RelationshipRow {
@@ -602,6 +612,7 @@ func TestRelationshipsPaginationStableAcrossFullyTiedRows(t *testing.T) {
 // meeting, so Y must not appear in the results at all — a meeting the owner
 // never attended is not evidence of any relationship with the owner.
 func TestRelationshipsOwnerAbsentMeetingContributesNoModality(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -623,7 +634,7 @@ func TestRelationshipsOwnerAbsentMeetingContributesNoModality(t *testing.T) {
 	b.AddTo(meetingID, yID, "Y")
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
+	result, err := engine.Relationships(t.Context(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
 	require.NoError(err)
 	require.Len(result.Rows, 1, "Y has no signal at all and must not appear")
 
@@ -637,6 +648,7 @@ func TestRelationshipsOwnerAbsentMeetingContributesNoModality(t *testing.T) {
 }
 
 func TestRelationshipsClampsFutureEntryDecayAtOne(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -655,7 +667,7 @@ func TestRelationshipsClampsFutureEntryDecayAtOne(t *testing.T) {
 	b.AddTo(meetingID, xID, "X")
 
 	engine := b.BuildEngine()
-	result, err := engine.Relationships(context.Background(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
+	result, err := engine.Relationships(t.Context(), RelationshipsRequest{Now: now, Limit: 10, ShowAll: true})
 	require.NoError(err)
 	require.Len(result.Rows, 1)
 	assert.InDelta(1.0, result.Rows[0].Signals.MeetingsTogether, 1e-9,
@@ -663,6 +675,7 @@ func TestRelationshipsClampsFutureEntryDecayAtOne(t *testing.T) {
 }
 
 func TestRelationshipsFutureRowsPreserveGateModalitiesAndLastTimestamp(t *testing.T) {
+	t.Parallel()
 	requirementsForTest := require.New(t)
 	assertionsForTest := assert.New(t)
 	b := NewTestDataBuilder(t)
@@ -703,7 +716,7 @@ func TestRelationshipsFutureRowsPreserveGateModalitiesAndLastTimestamp(t *testin
 
 	engine := b.BuildEngine()
 	result, err := engine.Relationships(
-		context.Background(),
+		t.Context(),
 		RelationshipsRequest{
 			Now:   time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
 			Limit: 10,
@@ -723,7 +736,7 @@ func TestRelationshipsFutureRowsPreserveGateModalitiesAndLastTimestamp(t *testin
 		"future rollups must preserve the full timestamp, not day granularity")
 
 	showAll, err := engine.Relationships(
-		context.Background(),
+		t.Context(),
 		RelationshipsRequest{
 			Now:     time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC),
 			Limit:   10,
@@ -743,6 +756,7 @@ func TestRelationshipsFutureRowsPreserveGateModalitiesAndLastTimestamp(t *testin
 // canonical ID or the alias ID, so the two filters agree and both include the
 // alias-owned activity — matching Explore/Files.
 func TestRelationshipsParticipantFilterExpandsClusters(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 
@@ -765,7 +779,7 @@ func TestRelationshipsParticipantFilterExpandsClusters(t *testing.T) {
 	}
 
 	engine := b.BuildEngine()
-	ctx := context.Background()
+	ctx := t.Context()
 
 	byCanonical, err := engine.Relationships(ctx, RelationshipsRequest{
 		Context: Context{ParticipantIDs: []int64{canonical}}, Now: now, Limit: 10,

@@ -10,6 +10,20 @@ import (
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
+func TestInitSchemaRemovesLegacyFTSIndex(t *testing.T) {
+	require := require.New(t)
+	if !strings.HasPrefix(os.Getenv("MSGVAULT_TEST_DB"), "postgres") {
+		t.Skip("PostgreSQL required")
+	}
+	st := testutil.NewTestStore(t)
+	_, err := st.DB().ExecContext(t.Context(), `CREATE INDEX idx_messages_search_fts_stale_v2 ON messages (id) WHERE search_fts IS NULL OR indexing_version IS DISTINCT FROM 2`)
+	require.NoError(err)
+	require.NoError(st.InitSchema())
+	var count int
+	require.NoError(st.DB().QueryRowContext(t.Context(), `SELECT count(*) FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_messages_search_fts_stale_v2'`).Scan(&count))
+	require.Zero(count)
+}
+
 // TestInitSchema_PGLegacyMessagesGetsFTSColumn pins cr2-10: a PostgreSQL
 // database whose `messages` table predates FTS support (no search_fts column)
 // must come up with a working FTS column + GIN index after InitSchema.
@@ -37,11 +51,11 @@ func TestInitSchema_PGLegacyMessagesGetsFTSColumn(t *testing.T) {
 
 	// Simulate a legacy DB created before FTS: drop the column (and its GIN
 	// index via CASCADE). This is the exact pre-upgrade shape.
-	_, err := db.Exec(`ALTER TABLE messages DROP COLUMN search_fts CASCADE`)
+	_, err := db.ExecContext(t.Context(), `ALTER TABLE messages DROP COLUMN search_fts CASCADE`)
 	require.NoError(err, "drop search_fts to simulate legacy schema")
 
 	var preCol int
-	require.NoError(db.QueryRow(`
+	require.NoError(db.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM information_schema.columns
 		WHERE table_schema = current_schema()
 		  AND table_name = 'messages' AND column_name = 'search_fts'`).Scan(&preCol),
@@ -53,7 +67,7 @@ func TestInitSchema_PGLegacyMessagesGetsFTSColumn(t *testing.T) {
 
 	// The search_fts column was re-added by the migration.
 	var colCount int
-	require.NoError(db.QueryRow(`
+	require.NoError(db.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM information_schema.columns
 		WHERE table_schema = current_schema()
 		  AND table_name = 'messages' AND column_name = 'search_fts'`).Scan(&colCount),
@@ -62,7 +76,7 @@ func TestInitSchema_PGLegacyMessagesGetsFTSColumn(t *testing.T) {
 
 	// The GIN index was created by EnsureFTSIndex (post-migration).
 	var idxCount int
-	require.NoError(db.QueryRow(`
+	require.NoError(db.QueryRowContext(t.Context(), `
 		SELECT COUNT(*) FROM pg_indexes
 		WHERE schemaname = current_schema()
 		  AND tablename = 'messages' AND indexname = 'messages_search_fts_idx'`).Scan(&idxCount),

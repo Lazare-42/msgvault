@@ -1,7 +1,6 @@
 package store_test
 
 import (
-	"context"
 	"database/sql"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -14,7 +13,7 @@ import (
 func TestWhatsAppOutboxLifecycle(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
 	require.NoError(err)
@@ -87,21 +86,21 @@ func TestSetReactionReplaceAndClear(t *testing.T) {
 	require.NoError(st.SetReaction(msgID, participantID, "emoji", "❤️", time.Unix(30, 0)))
 
 	var activeValue string
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT reaction_value FROM reactions
 		WHERE message_id = ? AND participant_id = ? AND removed_at IS NULL
 	`), msgID, participantID).Scan(&activeValue))
 	assert.Equal("❤️", activeValue)
 
 	var removedCount int
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT COUNT(*) FROM reactions
 		WHERE message_id = ? AND participant_id = ? AND reaction_value = ? AND removed_at IS NOT NULL
 	`), msgID, participantID, "👍").Scan(&removedCount))
 	assert.Equal(1, removedCount)
 	require.NoError(st.SetReaction(msgID, participantID, "emoji", "", time.Unix(40, 0)))
 	var activeCount int
-	require.NoError(st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT COUNT(*) FROM reactions
 		WHERE message_id = ? AND participant_id = ? AND removed_at IS NULL
 	`), msgID, participantID).Scan(&activeCount))
@@ -111,7 +110,7 @@ func TestSetReactionReplaceAndClear(t *testing.T) {
 func TestGetOldestWhatsAppMessage(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
 	require.NoError(err)
@@ -160,7 +159,7 @@ func TestGetOldestWhatsAppMessage(t *testing.T) {
 func TestGetWhatsAppMessageRef(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
 	require.NoError(err)

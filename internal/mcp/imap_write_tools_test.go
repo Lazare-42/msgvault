@@ -40,7 +40,7 @@ func startIMAPTestServer(t *testing.T) int {
 	require.NoError(t, user.Create("Sent Items", nil))
 	memServer.AddUser(user)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
 	server := imapserver.New(&imapserver.Options{
@@ -249,11 +249,11 @@ func TestCreateDraftWithNewAttachmentOverIMAP(t *testing.T) {
 	// way the production sync path would, and parse it with the production
 	// MIME parser to confirm the attachment actually made it into the
 	// message on the wire.
-	client, err := imapFactory(t, port)(context.Background(), testIMAPAccount)
+	client, err := imapFactory(t, port)(t.Context(), testIMAPAccount)
 	require.NoError(err)
 	defer func() { _ = client.Close() }()
 
-	raw, err := client.GetMessageRaw(context.Background(), created.DraftID)
+	raw, err := client.GetMessageRaw(t.Context(), created.DraftID)
 	require.NoError(err)
 
 	parsed, err := msgmime.Parse(raw.Raw)
@@ -311,11 +311,11 @@ func TestCreateDraftWithArchivedAndNewAttachmentOverIMAP(t *testing.T) {
 	require.NotEmpty(created.DraftID)
 	assert.Equal(2, created.Attachments)
 
-	client, err := imapFactory(t, port)(context.Background(), testIMAPAccount)
+	client, err := imapFactory(t, port)(t.Context(), testIMAPAccount)
 	require.NoError(err)
 	defer func() { _ = client.Close() }()
 
-	raw, err := client.GetMessageRaw(context.Background(), created.DraftID)
+	raw, err := client.GetMessageRaw(t.Context(), created.DraftID)
 	require.NoError(err)
 
 	parsed, err := msgmime.Parse(raw.Raw)

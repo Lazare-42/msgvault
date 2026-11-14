@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -808,6 +809,30 @@ func TestLayoutFitsTerminalHeight(t *testing.T) {
 	}
 }
 
+func TestBuildDetailLinesBodyAlternatives(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		html string
+		want string
+	}{
+		{"HTML without stored plain text", "", "<p>Delivery &amp; pickup</p>", "Delivery & pickup"},
+		{"empty", "", "", "(No text content)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			model := NewBuilder().WithSize(80, 24).Build()
+			model.messageDetail = &query.MessageDetail{BodyText: tt.text, BodyHTML: tt.html}
+
+			lines := model.buildDetailLines()
+			require.NotEmpty(lines)
+			assert.Equal(tt.want, lines[len(lines)-1])
+		})
+	}
+}
+
 func TestBuildDetailLinesSanitizesMultilineBody(t *testing.T) {
 	assert := assert.New(t)
 	model := NewBuilder().WithSize(80, 24).Build()
@@ -1050,6 +1075,31 @@ func TestHeaderUpdateNoticeNarrowTerminal(t *testing.T) {
 	assert.LessOrEqual(t, lineWidth, 40, "header line 1 width exceeds narrow terminal width")
 }
 
+// TestHeaderUpdateNoticeNamesUpgradeCommand verifies the notice names the
+// command that upgrades this build: brew for Homebrew, msgvault otherwise.
+func TestHeaderUpdateNoticeNamesUpgradeCommand(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		distribution string
+		want         string
+		notWant      string
+	}{
+		{name: "self-updating build", want: "update: v2.0.0 — msgvault update", notWant: "brew"},
+		{name: "official download", distribution: "kenn", want: "update: v2.0.0 — msgvault update", notWant: "brew"},
+		{name: "homebrew build", distribution: "homebrew", want: "update: v2.0.0 — brew upgrade msgvault", notWant: "msgvault update"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := NewBuilder().WithSize(140, 24).WithDistribution(tc.distribution).Build()
+			updated, _ := model.Update(updateCheckMsg{version: "v2.0.0"})
+
+			title := stripANSI(asModel(t, updated).buildTitleBar())
+
+			assert.Contains(t, title, tc.want)
+			assert.NotContains(t, title, tc.notWant)
+		})
+	}
+}
+
 // TestAnalyticsNoticeShownWhileLoading verifies the info line explains slow
 // first loads when the daemon reported no analytics cache, and disappears
 // once data arrives.
@@ -1064,4 +1114,26 @@ func TestAnalyticsNoticeShownWhileLoading(t *testing.T) {
 	model.loading = false
 	assert.NotContains(t, model.View().Content, "Analytics cache not built",
 		"notice should disappear once loading completes")
+}
+
+func TestEmptyArchiveSourceSetup(t *testing.T) {
+	tests := []struct {
+		name    string
+		message accountsLoadedMsg
+		want    string
+	}{
+		{name: "no sources", want: "No mail yet. Run `msgvault setup` to see how to add a source."},
+		{name: "existing source", message: accountsLoadedMsg{accounts: []query.AccountInfo{{ID: 1, SourceType: "gmail", Identifier: "archive@example.com"}}}, want: "No data"},
+		{name: "failed source read", message: accountsLoadedMsg{err: errors.New("source read failed")}, want: "No data"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model := NewBuilder().WithSize(100, 30).Build()
+			model.loading = false
+			assert.Contains(t, stripANSI(model.aggregateTableView()), "No data")
+			updated, _ := model.Update(tt.message)
+			model = asModel(t, updated)
+			assert.Contains(t, stripANSI(model.aggregateTableView()), tt.want)
+		})
+	}
 }

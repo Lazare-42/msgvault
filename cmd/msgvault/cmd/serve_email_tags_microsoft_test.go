@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json/v2"
 	"log/slog"
 	"net/http"
@@ -26,13 +27,13 @@ func TestDaemonMessageTagsMicrosoftSharedPath(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource(sourceTypeMSMail, "owner@example.test")
 	require.NoError(err)
-	conv, err := st.EnsureConversation(source.ID, "thread-1", "Tags")
+	conv, err := st.EnsureConversation(t.Context(), source.ID, "thread-1", "Tags")
 	require.NoError(err)
 	mid, err := st.UpsertMessage(&store.Message{SourceID: source.ID, ConversationID: conv, SourceMessageID: "immutable-1", MessageType: "email"})
 	require.NoError(err)
-	folder, err := st.EnsureLabel(source.ID, "folder-1", "Inbox", "system")
+	folder, err := st.EnsureLabel(t.Context(), source.ID, "folder-1", "Inbox", "system")
 	require.NoError(err)
-	_, err = st.ReconcileMessageLabels(mid, []int64{folder}, true)
+	_, err = st.ReconcileMessageLabels(t.Context(), mid, []int64{folder}, true)
 	require.NoError(err)
 	cfg := lifecycleTestConfig(t.TempDir())
 	tokenPath := microsoft.NewGraphMailManager("", "", "", cfg.TokensDir(), nil).TokenPath(source.Identifier)
@@ -81,5 +82,10 @@ func TestDaemonMessageTagsMicrosoftSharedPath(t *testing.T) {
 	msg, err := st.GetMessage(mid)
 	require.NoError(err)
 	assert.ElementsMatch([]string{"Inbox", "Category: Other", "Category: Next"}, msg.Labels)
+	assert.Equal(int32(1), writes.Load())
+	require.NoError(st.UpdateSourceOAuthApp(t.Context(), source.ID, sql.NullString{String: "missing", Valid: true}))
+	_, err = a.MessageTags(t.Context(), mid, &emailtags.MessageTagChange{Add: []string{"Another"}}, "", nil)
+	require.ErrorAs(err, &failure)
+	assert.Equal("provider_unavailable", failure.Code)
 	assert.Equal(int32(1), writes.Load())
 }

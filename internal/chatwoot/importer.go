@@ -26,6 +26,7 @@ type ImportOptions struct {
 	Policy            attachmentpolicy.Policy
 	NoMedia           bool
 	AttachmentsDir    string
+	RecordingMaxBytes int64
 }
 
 type ImportSummary struct {
@@ -50,6 +51,9 @@ type Importer struct {
 
 // now is replaceable so tests can hold fixtures inside the refresh window.
 var now = time.Now
+
+// DefaultRecordingMaxBytes permits long call audio without buffering the file.
+const DefaultRecordingMaxBytes int64 = 4 << 30
 
 const (
 	maxSyncRequests = 10000
@@ -103,9 +107,9 @@ func (imp *Importer) Register(ctx context.Context, inboxes []Inbox) ([]*store.So
 	return sources, nil
 }
 
-func (imp *Importer) resumeState(sourceID int64) (*syncState, error) {
+func (imp *Importer) resumeState(ctx context.Context, sourceID int64) (*syncState, error) {
 	state := newSyncState()
-	prior, err := imp.store.GetLastSuccessfulSyncByType(sourceID, SourceType)
+	prior, err := imp.store.GetLastSuccessfulSyncByType(ctx, sourceID, SourceType)
 	if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 		return nil, err
 	}
@@ -115,7 +119,7 @@ func (imp *Importer) resumeState(sourceID int64) (*syncState, error) {
 			return nil, err
 		}
 	}
-	checkpoint, err := imp.store.GetLatestCheckpointedSyncByType(sourceID, SourceType)
+	checkpoint, err := imp.store.GetLatestCheckpointedSyncByType(ctx, sourceID, SourceType)
 	if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
 		return nil, err
 	}
@@ -150,7 +154,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (sum *Impor
 	if imp == nil || imp.store == nil || imp.client == nil {
 		return nil, errors.New("chatwoot importer unavailable")
 	}
-	if opts.InboxID <= 0 || opts.Limit < 0 || opts.Policy.Validate() != nil {
+	if opts.InboxID <= 0 || opts.Limit < 0 || opts.Policy.Validate() != nil || opts.RecordingMaxBytes < 0 || opts.RecordingMaxBytes == math.MaxInt64 {
 		return nil, errors.New("invalid Chatwoot import options")
 	}
 	for _, id := range opts.SelfAgentIDs {
@@ -159,7 +163,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (sum *Impor
 		}
 	}
 	scope := SourceIdentifier(imp.client.baseURL, imp.client.accountID, opts.InboxID)
-	source, err := imp.store.GetSourceByTypeAndIdentifier(SourceType, scope)
+	source, err := imp.store.GetSourceByTypeAndIdentifier(ctx, SourceType, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -172,7 +176,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (sum *Impor
 			return nil, errors.New("chatwoot include_private cannot be turned off after private notes are archived; set include_private = true")
 		}
 	}
-	state, err := imp.resumeState(source.ID)
+	state, err := imp.resumeState(ctx, source.ID)
 	if err != nil {
 		return nil, err
 	}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -17,12 +18,13 @@ import (
 // creates person storage for fresh databases, or a migration that fails when
 // startup applies it a second time.
 func TestPersonMigration_UpgradesAndIsIdempotent(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require.NoError(t, RegisterExtension())
 	db, err := sql.Open(DriverName(), filepath.Join(t.TempDir(), "vectors.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
 
-	_, err = db.Exec(`CREATE TABLE index_generations (
+	_, err = db.ExecContext(t.Context(), `CREATE TABLE index_generations (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		model TEXT NOT NULL,
 		dimension INTEGER NOT NULL,
@@ -35,7 +37,7 @@ func TestPersonMigration_UpgradesAndIsIdempotent(t *testing.T) {
 	)`)
 	require.NoError(t, err)
 
-	ctx := context.Background()
+	ctx := t.Context()
 	require.NoError(t, Migrate(ctx, db, 4))
 	require.NoError(t, Migrate(ctx, db, 4))
 
@@ -47,6 +49,7 @@ func TestPersonMigration_UpgradesAndIsIdempotent(t *testing.T) {
 }
 
 func TestPersonMigration_RebuildsLegacyL2TableForCosine(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite fixtures require SQLite")
 	require.NoError(t, RegisterExtension())
 	db, err := sql.Open(DriverName(), filepath.Join(t.TempDir(), "vectors.db"))
 	require.NoError(t, err)
@@ -351,7 +354,7 @@ func TestPersonBackend_MessageIDCollisionIsIsolated(t *testing.T) {
 
 func newPersonBackendForTest(t *testing.T) (*Backend, context.Context) {
 	t.Helper()
-	ctx := context.Background()
+	ctx := t.Context()
 	mainDB := openMainDBWithOneMessage(t)
 	b, err := Open(ctx, Options{
 		Path:      filepath.Join(t.TempDir(), "vectors.db"),
