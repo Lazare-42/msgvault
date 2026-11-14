@@ -361,6 +361,7 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	registerAPIV1RawHumaJSONRouteWithErrors[MediaSearchStatusResponse](apiV1, "getMediaSearchStatus", http.MethodGet, "/media/search/status", "Get recording transcript search configuration status", s.handleMediaSearchStatus)
 	registerAPIV1RawHumaJSONRouteWithErrors[MediaSearchResponse](apiV1, "searchMedia", http.MethodGet, "/media/search", "Search recording transcripts and mirrored attachment text as visible messages", s.mediaSearchGuard("media search", s.handleMediaSearch), http.StatusBadRequest, http.StatusForbidden, http.StatusNotFound, http.StatusConflict, http.StatusUnprocessableEntity, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable)
 	s.registerTelemetryRoutes(apiV1)
+	s.registerOCRRoutes(apiV1)
 	s.registerPersonProfileRoutes(apiV1)
 	s.registerPersonIdentityRoutes(apiV1)
 	s.registerContactRouteRoutes(apiV1)
@@ -1008,7 +1009,7 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		return []*huma.Param{pathIntegerParam("Any member participant ID of the counterpart's identity cluster")}
 	case "getDomain", "getDomainTimeline", "getDomainContextSummary", "searchDomainFiles":
 		return []*huma.Param{pathStringParam("domain", "Exact normalized domain fact")}
-	case "getAttachmentContent":
+	case "getAttachmentContent", "getAttachmentText", "requestAttachmentText":
 		return []*huma.Param{pathStringParam("hash", "Attachment SHA-256 content hash")}
 	case "getMessageInlinePart":
 		return []*huma.Param{

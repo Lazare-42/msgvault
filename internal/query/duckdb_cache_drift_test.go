@@ -41,7 +41,7 @@ func TestDuckDBEngine_CacheRebuiltUnderneath(t *testing.T) {
 
 	pb := newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", newMessagesCols, `
-			(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello SOFRA', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello QUASAR', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `(1::BIGINT, 'test@gmail.com', 'gmail')`).
 		addTable("participants", "participants", "participants.parquet", participantsCols, `(1::BIGINT, 'alice@test.com', 'test.com', 'Alice', '')`).
@@ -63,7 +63,7 @@ func TestDuckDBEngine_CacheRebuiltUnderneath(t *testing.T) {
 	// Startup probe sees the new schema.
 	require.True(engine.hasCol("messages", "message_type"),
 		"message_type should be detected as present in the initial schema")
-	res, err := engine.SearchFast(ctx, search.Parse("SOFRA"), MessageFilter{}, 10, 0)
+	res, err := engine.SearchFast(ctx, search.Parse("QUASAR"), MessageFilter{}, 10, 0)
 	require.NoError(err, "SearchFast before rebuild")
 	require.Len(res, 1)
 
@@ -71,10 +71,10 @@ func TestDuckDBEngine_CacheRebuiltUnderneath(t *testing.T) {
 	// the running engine — message_type/sender_id/attachment_count disappear.
 	msgPath := filepath.Join(analyticsDir, "messages", "year=2024", "data.parquet")
 	rewriteParquetForTest(t, msgPath, oldMessagesCols, `
-		(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello SOFRA', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, NULL::TIMESTAMP, 2024, 1)
+		(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello QUASAR', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, NULL::TIMESTAMP, 2024, 1)
 	`)
 
-	_, err = engine.SearchFast(ctx, search.Parse("SOFRA"), MessageFilter{}, 10, 0)
+	_, err = engine.SearchFast(ctx, search.Parse("QUASAR"), MessageFilter{}, 10, 0)
 	require.ErrorIs(err, ErrCacheUnavailable)
 	var unavailable *CacheUnavailableError
 	require.ErrorAs(err, &unavailable)
@@ -311,7 +311,7 @@ func TestDuckDBEngine_SearchFastWithStatsRejectsMessageParquetDrift(t *testing.T
 
 	pb := newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello SOFRA', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello QUASAR', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `(1::BIGINT, 'test@gmail.com', 'gmail')`).
 		addTable("participants", "participants", "participants.parquet", participantsCols, `(1::BIGINT, 'alice@test.com', 'test.com', 'Alice', '')`).
@@ -329,9 +329,9 @@ func TestDuckDBEngine_SearchFastWithStatsRejectsMessageParquetDrift(t *testing.T
 	t.Cleanup(func() { _ = engine.Close() })
 
 	ctx := t.Context()
-	q := search.Parse("SOFRA")
+	q := search.Parse("QUASAR")
 
-	first, err := engine.SearchFastWithStats(ctx, q, "SOFRA", MessageFilter{}, ViewSenders, 10, 0)
+	first, err := engine.SearchFastWithStats(ctx, q, "QUASAR", MessageFilter{}, ViewSenders, 10, 0)
 	require.NoError(err, "SearchFastWithStats before rebuild")
 	require.Len(first.Messages, 1)
 	require.Equal(int64(1), first.TotalCount)
@@ -340,11 +340,11 @@ func TestDuckDBEngine_SearchFastWithStatsRejectsMessageParquetDrift(t *testing.T
 
 	msgPath := filepath.Join(analyticsDir, "messages", "year=2024", "data.parquet")
 	rewriteParquetForTest(t, msgPath, messagesCols, `
-		(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello SOFRA', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1),
-		(2::BIGINT, 1::BIGINT, 'm2', 101::BIGINT, 'Another SOFRA', 'snip', TIMESTAMP '2024-01-16 10:00:00', 2000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
+		(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello QUASAR', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1),
+		(2::BIGINT, 1::BIGINT, 'm2', 101::BIGINT, 'Another QUASAR', 'snip', TIMESTAMP '2024-01-16 10:00:00', 2000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
 	`)
 
-	_, err = engine.SearchFastWithStats(ctx, q, "SOFRA", MessageFilter{}, ViewSenders, 10, 0)
+	_, err = engine.SearchFastWithStats(ctx, q, "QUASAR", MessageFilter{}, ViewSenders, 10, 0)
 	require.ErrorIs(err, ErrCacheUnavailable)
 	var unavailable *CacheUnavailableError
 	require.ErrorAs(err, &unavailable)
@@ -358,7 +358,7 @@ func TestDuckDBEngine_SearchFastWithStatsRejectsAttachmentParquetDrift(t *testin
 
 	pb := newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello SOFRA', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'm1', 100::BIGINT, 'Hello QUASAR', 'snip', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `(1::BIGINT, 'test@gmail.com', 'gmail')`).
 		addTable("participants", "participants", "participants.parquet", participantsCols, `(1::BIGINT, 'alice@test.com', 'test.com', 'Alice', '')`).
@@ -376,9 +376,9 @@ func TestDuckDBEngine_SearchFastWithStatsRejectsAttachmentParquetDrift(t *testin
 	t.Cleanup(func() { _ = engine.Close() })
 
 	ctx := t.Context()
-	q := search.Parse("SOFRA")
+	q := search.Parse("QUASAR")
 
-	first, err := engine.SearchFastWithStats(ctx, q, "SOFRA", MessageFilter{}, ViewSenders, 10, 0)
+	first, err := engine.SearchFastWithStats(ctx, q, "QUASAR", MessageFilter{}, ViewSenders, 10, 0)
 	require.NoError(err, "SearchFastWithStats before attachments rebuild")
 	require.NotNil(first.Stats)
 	require.Len(first.Messages, 1)
@@ -388,7 +388,7 @@ func TestDuckDBEngine_SearchFastWithStatsRejectsAttachmentParquetDrift(t *testin
 	attPath := filepath.Join(analyticsDir, "attachments", "attachments.parquet")
 	rewriteParquetForTest(t, attPath, attachmentsCols, `(1::BIGINT, 1::BIGINT, 123::BIGINT, 'file.pdf', 'application/pdf')`)
 
-	_, err = engine.SearchFastWithStats(ctx, q, "SOFRA", MessageFilter{}, ViewSenders, 10, 0)
+	_, err = engine.SearchFastWithStats(ctx, q, "QUASAR", MessageFilter{}, ViewSenders, 10, 0)
 	require.ErrorIs(err, ErrCacheUnavailable)
 	var unavailable *CacheUnavailableError
 	require.ErrorAs(err, &unavailable)

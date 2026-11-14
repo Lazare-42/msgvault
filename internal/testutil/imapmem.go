@@ -3,9 +3,11 @@ package testutil
 import (
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -405,6 +407,26 @@ func AppendIMAPMessageAt(
 	require.NoError(t, err)
 }
 
+// AppendIMAPMessageWithFlags appends one synthetic RFC822 message with the
+// supplied IMAP flags to a mailbox of an in-memory IMAP test user.
+func AppendIMAPMessageWithFlags(
+	t *testing.T,
+	user *imapmemserver.User,
+	mailbox string,
+	flags []imap.Flag,
+) {
+	t.Helper()
+	body := []byte(
+		"From: alice@example.com\r\nTo: bob@example.com\r\n\r\nbody\r\n",
+	)
+	_, err := user.Append(
+		mailbox,
+		imapLiteral{bytes.NewReader(body)},
+		&imap.AppendOptions{Flags: flags},
+	)
+	require.NoError(t, err)
+}
+
 // AppendIMAPMessageWithMessageID appends one synthetic RFC822 message with
 // the supplied Message-ID to a mailbox of an in-memory IMAP test user.
 func AppendIMAPMessageWithMessageID(
@@ -580,6 +602,7 @@ func serveIMAPMemServerWithCaps(
 	appendLimit *uint32,
 	statusAppendLimit *uint32,
 	statusAppendMailbox string,
+	wrappers ...func(imapserver.Session) imapserver.Session,
 ) *imapmemserver.User {
 	t.Helper()
 	user := imapmemserver.NewUser(IMAPTestUsername, IMAPTestPassword)
@@ -631,6 +654,9 @@ func serveIMAPMemServerWithCaps(
 			}
 			if appendLimit != nil {
 				session = &appendLimitSession{Session: session, limit: *appendLimit}
+			}
+			for _, wrap := range wrappers {
+				session = wrap(session)
 			}
 			return session, nil, nil
 		},
@@ -688,4 +714,166 @@ func SetIMAPFlags(t *testing.T, addr, mailbox string, uid imap.UID, flags ...ima
 		Silent: true,
 		Flags:  flags,
 	}, nil).Close())
+}
+
+type createErrorSession struct {
+	imapserver.Session
+
+	mailboxes []string
+	mailbox   string
+	createErr error
+	listed    *atomic.Bool
+}
+
+type phantomUIDSession struct {
+	imapserver.Session
+
+	uid     imap.UID
+	claimed *atomic.Bool
+}
+
+func (s *phantomUIDSession) Search(
+	kind imapserver.NumKind,
+	criteria *imap.SearchCriteria,
+	options *imap.SearchOptions,
+) (*imap.SearchData, error) {
+	if kind == imapserver.NumKindUID && s.claimed.CompareAndSwap(false, true) {
+		var uids imap.UIDSet
+		uids.AddNum(s.uid)
+		return &imap.SearchData{
+			All:   uids,
+			Min:   uint32(s.uid),
+			Max:   uint32(s.uid),
+			Count: 1,
+		}, nil
+	}
+	data, err := s.Session.Search(kind, criteria, options)
+	if err != nil {
+		return nil, fmt.Errorf("search session: %w", err)
+	}
+	return data, nil
+}
+
+func (s *phantomUIDSession) Move(
+	w *imapserver.MoveWriter,
+	numSet imap.NumSet,
+	dest string,
+) error {
+	mover, ok := s.Session.(imapserver.SessionMove)
+	if !ok {
+		return errors.New("wrapped session does not support MOVE")
+	}
+	if err := mover.Move(w, numSet, dest); err != nil {
+		return fmt.Errorf("move session: %w", err)
+	}
+	return nil
+}
+
+func (s *createErrorSession) Create(mailbox string, options *imap.CreateOptions) error {
+	if strings.EqualFold(mailbox, s.mailbox) {
+		return s.createErr
+	}
+	if err := s.Session.Create(mailbox, options); err != nil {
+		return fmt.Errorf("create mailbox %q: %w", mailbox, err)
+	}
+	return nil
+}
+
+func (s *createErrorSession) List(
+	w *imapserver.ListWriter,
+	ref string,
+	patterns []string,
+	_ *imap.ListOptions,
+) error {
+	hideTarget := s.listed.CompareAndSwap(false, true)
+	for _, mailbox := range s.mailboxes {
+		if hideTarget && strings.EqualFold(mailbox, s.mailbox) {
+			continue
+		}
+		matches := false
+		for _, pattern := range patterns {
+			if imapserver.MatchList(mailbox, '/', ref, pattern) {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		if err := w.WriteList(&imap.ListData{Mailbox: mailbox, Delim: '/'}); err != nil {
+			return fmt.Errorf("write LIST response for %q: %w", mailbox, err)
+		}
+	}
+	return nil
+}
+
+func StartIMAPMemServerWithCreateError(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	createErrorMailbox string,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServerWithFaults(t, messagesPerMailbox, &createErrorConfig{
+		mailbox: createErrorMailbox,
+		err: &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Mailbox already exists.",
+		},
+	}, 0)
+}
+
+// StartIMAPMemServerWithCreateFailure hides an existing mailbox from the first
+// LIST and returns a genuine CREATE failure. Clients must not swallow the error
+// merely because a later LIST reveals a same-named mailbox.
+func StartIMAPMemServerWithCreateFailure(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	createErrorMailbox string,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServerWithFaults(t, messagesPerMailbox, &createErrorConfig{
+		mailbox: createErrorMailbox,
+		err: &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeOverQuota,
+			Text: "Mailbox quota exceeded.",
+		},
+	}, 0)
+}
+
+func StartIMAPMemServerWithPhantomUID(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	phantomUID imap.UID,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServerWithFaults(t, messagesPerMailbox, nil, phantomUID)
+}
+
+type createErrorConfig struct {
+	mailbox string
+	err     error
+}
+
+func startIMAPMemServerWithFaults(t *testing.T, messages map[string]int, createError *createErrorConfig, phantom imap.UID) (string, *imapmemserver.User) {
+	t.Helper()
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var listed, claimed atomic.Bool
+	var names []string
+	for name := range messages {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	wrap := func(s imapserver.Session) imapserver.Session {
+		if createError != nil {
+			s = &createErrorSession{Session: s, mailboxes: names, mailbox: createError.mailbox, createErr: createError.err, listed: &listed}
+		}
+		if phantom != 0 {
+			s = &phantomUIDSession{Session: s, uid: phantom, claimed: &claimed}
+		}
+		return s
+	}
+	user := serveIMAPMemServerWithCaps(t, ln, messages, nil, "", 0, "", nil, nil, nil, false, nil, nil, "", wrap)
+	return ln.Addr().String(), user
 }

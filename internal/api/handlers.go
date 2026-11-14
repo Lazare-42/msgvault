@@ -314,6 +314,7 @@ type MessageSummary struct {
 	ID                int64    `json:"id"`
 	SourceID          int64    `json:"source_id,omitzero"`
 	SourceMessageID   string   `json:"source_message_id,omitempty"`
+	RFC822MessageID   string   `json:"rfc822_message_id,omitempty" doc:"Original Message-ID header for reply threading."`
 	ConversationID    int64    `json:"conversation_id,omitzero"`
 	Subject           string   `json:"subject"`
 	MessageType       string   `json:"message_type,omitempty"`
@@ -587,6 +588,7 @@ func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 		ID:                qMsg.ID,
 		SourceID:          qMsg.SourceID,
 		SourceMessageID:   qMsg.SourceMessageID,
+		RFC822MessageID:   qMsg.RFC822MessageID,
 		ConversationID:    qMsg.ConversationID,
 		Subject:           qMsg.Subject,
 		MessageType:       qMsg.MessageType,
@@ -626,6 +628,7 @@ func toMessageSummary(m APIMessage) MessageSummary {
 		ID:                m.ID,
 		SourceID:          m.SourceID,
 		SourceMessageID:   m.SourceMessageID,
+		RFC822MessageID:   m.RFC822MessageID,
 		ConversationID:    m.ConversationID,
 		Subject:           m.Subject,
 		MessageType:       m.MessageType,
@@ -2936,6 +2939,7 @@ func toMessageSummaryFromQuery(m query.MessageSummary) MessageSummary {
 		ID:                m.ID,
 		SourceID:          m.SourceID,
 		SourceMessageID:   m.SourceMessageID,
+		RFC822MessageID:   m.RFC822MessageID,
 		ConversationID:    m.ConversationID,
 		Subject:           m.Subject,
 		MessageType:       m.MessageType,

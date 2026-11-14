@@ -1346,6 +1346,13 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 				"alias": "archive",
 				"message_count": 1234,
 				"last_sync": "2024-01-02T03:04:05Z"
+			}, {
+				"id": 8,
+				"email": "shared@example.com",
+				"type": "imap",
+				"display_name": "Shared",
+				"message_count": 5,
+				"sync_config": "{\"host\":\"imap.example.com\",\"port\":993}"
 			}]
 		}`))
 	}))
@@ -1356,7 +1363,7 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 	require.NoError(
 		err, "GetCLIAccounts")
 
-	require.Len(accounts, 1, "accounts")
+	require.Len(accounts, 2, "accounts")
 	assert.Equal(int64(7), accounts[0].ID, "ID")
 	assert.Equal("alice@example.com", accounts[0].Email, "Email")
 	assert.Equal("imap", accounts[0].Type, "Type")
@@ -1369,6 +1376,10 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 	assert.Equal("2024-02-03T04:05:06Z", accounts[0].AsOf.UTC().Format(time.RFC3339))
 	require.NotNil(accounts[0].LastSync, "LastSync")
 	assert.Equal("2024-01-02T03:04:05Z", accounts[0].LastSync.UTC().Format(time.RFC3339), "LastSync")
+	assert.Empty(accounts[0].SyncConfig, "gmail SyncConfig empty")
+
+	assert.Equal("imap", accounts[1].Type, "imap Type")
+	assert.JSONEq(`{"host":"imap.example.com","port":993}`, accounts[1].SyncConfig, "imap SyncConfig")
 }
 
 func TestCLICollectionMutations(t *testing.T) {

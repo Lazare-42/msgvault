@@ -35,6 +35,17 @@ type Config struct {
 	// they are applied after config folders in
 	// buildMessageListCache, so CLI values always take precedence.
 	Folders []string `json:"folders,omitempty"`
+
+	// Microsoft 365 app-only (certificate client-credentials) auth. When
+	// MSAppOnly is true, the XOAUTH2 token is minted from a signed JWT client
+	// assertion rather than a per-user delegated refresh token — the
+	// unattended-service path for a single shared mailbox (Username is the
+	// mailbox). MSTenantID/MSClientID identify the Entra app; MSCertPath is a
+	// PEM file with the app's private key + certificate.
+	MSAppOnly  bool   `json:"ms_app_only,omitempty"`
+	MSTenantID string `json:"ms_tenant_id,omitempty"`
+	MSClientID string `json:"ms_client_id,omitempty"`
+	MSCertPath string `json:"ms_cert_path,omitempty"`
 }
 
 // EffectiveAuthMethod returns the auth method, defaulting to password

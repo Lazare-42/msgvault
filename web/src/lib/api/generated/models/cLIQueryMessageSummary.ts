@@ -21,6 +21,7 @@ export interface CLIQueryMessageSummary {
   labels: string[];
   match_snippet?: string;
   message_type?: string;
+  rfc822_message_id?: string;
   sent_at: string;
   size_estimate: number;
   snippet: string;

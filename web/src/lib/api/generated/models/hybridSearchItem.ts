@@ -22,6 +22,8 @@ export interface HybridSearchItem {
   matches?: HybridSearchMatch[];
   matches_truncated?: boolean;
   message_type?: string;
+  /** Original Message-ID header for reply threading. */
+  rfc822_message_id?: string;
   score?: ScoreBreakdown;
   sent_at: string;
   size_bytes: number;

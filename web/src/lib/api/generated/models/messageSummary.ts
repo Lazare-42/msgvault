@@ -16,6 +16,8 @@ export interface MessageSummary {
   id: number;
   labels: string[];
   message_type?: string;
+  /** Original Message-ID header for reply threading. */
+  rfc822_message_id?: string;
   sent_at: string;
   size_bytes: number;
   snippet: string;

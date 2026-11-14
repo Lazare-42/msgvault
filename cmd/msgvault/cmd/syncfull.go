@@ -18,6 +18,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/gmail"
 	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/sync"
@@ -312,19 +313,7 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(ctx
 		), nil
 
 	case sourceTypeIMAP:
-		if !src.SyncConfig.Valid || src.SyncConfig.String == "" {
-			return nil, fmt.Errorf("IMAP source %s has no config (run 'add-imap' first)", src.Identifier)
-		}
-		imapCfg, err := imaplib.ConfigFromJSON(src.SyncConfig.String)
-		if err != nil {
-			return nil, fmt.Errorf("parse IMAP config: %w", err)
-		}
-
-		var opts []imaplib.Option
-		opts = append(opts,
-			imaplib.WithLogger(logger),
-			imaplib.WithMaxCommandsPerMinute(cfg.Sync.IMAPMaxCommandsPerMinute),
-		)
+		opts := []imaplib.Option{imaplib.WithMaxCommandsPerMinute(cfg.Sync.IMAPMaxCommandsPerMinute)}
 		opts = append(opts, imapOpts...)
 
 		var since, before time.Time
@@ -346,28 +335,11 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(ctx
 			opts = append(opts, imaplib.WithDateFilter(since, before))
 		}
 
-		switch imapCfg.EffectiveAuthMethod() {
-		case imaplib.AuthXOAuth2:
-			if sourceOAuthApp(src) == "" && cfg.Microsoft.ClientID == "" {
-				return nil, errors.New("microsoft OAuth not configured — add a [microsoft] section with client_id to config.toml")
-			}
-			msMgr, err := newMicrosoftIMAPManager(cfg, logger, src)
-			if err != nil {
-				return nil, err
-			}
-			tokenFn, err := msMgr.TokenSource(ctx, imapCfg.Username)
-			if err != nil {
-				return nil, fmt.Errorf("load Microsoft token: %w (run 'add-o365' first)", err)
-			}
-			opts = append(opts, imaplib.WithTokenSource(tokenFn))
-			return imaplib.NewClient(imapCfg, "", opts...), nil
-		default:
-			password, err := imaplib.LoadCredentials(cfg.TokensDir(), src.Identifier)
-			if err != nil {
-				return nil, fmt.Errorf("load IMAP credentials: %w (run 'add-imap' first)", err)
-			}
-			return imaplib.NewClient(imapCfg, password, opts...), nil
+		syncConfig := ""
+		if src.SyncConfig.Valid {
+			syncConfig = src.SyncConfig.String
 		}
+		return buildIMAPAPIClient(ctx, src.Identifier, syncConfig, opts...)
 
 	default:
 		return nil, fmt.Errorf("unsupported source type %q", src.SourceType)
@@ -385,6 +357,45 @@ func configuredTrustedSentMailboxes(identifier string, cfg *config.Config) []str
 		return nil
 	}
 	return cfg.Sync.TrustedIMAPSentMailboxes[identifier]
+}
+
+// buildIMAPAPIClient constructs an IMAP-backed gmail.API client from a
+// source's sync_config JSON. Shared by the sync path (buildAPIClient) and
+// the MCP factory (buildMailFactory), which resolves accounts through the
+// daemon rather than a local *store.Source. Handles both auth models:
+// XOAUTH2 (Microsoft 365 delegated or app-only certificate flow) and
+// password (stored credentials in the tokens dir).
+func buildIMAPAPIClient(ctx context.Context, identifier, syncConfigJSON string, imapOpts ...imaplib.Option) (gmail.LiveAPI, error) {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg, logger := state.cfg, state.logger
+	if syncConfigJSON == "" {
+		return nil, fmt.Errorf("IMAP source %s has no config (run 'add-imap' first)", identifier)
+	}
+	imapCfg, err := imaplib.ConfigFromJSON(syncConfigJSON)
+	if err != nil {
+		return nil, fmt.Errorf("parse IMAP config: %w", err)
+	}
+
+	opts := append([]imaplib.Option{imaplib.WithLogger(logger)}, imapOpts...)
+
+	switch imapCfg.EffectiveAuthMethod() {
+	case imaplib.AuthXOAuth2:
+		tokenFn, err := microsoftIMAPTokenSource(ctx, imapCfg)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, imaplib.WithTokenSource(tokenFn))
+		return imaplib.NewClient(imapCfg, "", opts...), nil
+	default:
+		password, err := imaplib.LoadCredentials(cfg.TokensDir(), identifier)
+		if err != nil {
+			return nil, fmt.Errorf("load IMAP credentials: %w (run 'add-imap' first)", err)
+		}
+		return imaplib.NewClient(imapCfg, password, opts...), nil
+	}
 }
 
 // loadIMAPFolderStates returns the saved per-mailbox states in the map
@@ -433,21 +444,6 @@ func imapFolderStateOptions(
 	opts = append(opts, imaplib.WithSourceMessageAliasLoader(
 		func(mailbox string, uids []uint32) (map[string]string, error) {
 			return s.GetIMAPSourceMessageAliases(src.ID, mailbox, uids)
-		}), imaplib.WithStoredMembershipLoader(
-		func(ctx context.Context, mailbox string, uidValidity uint32, uids []uint32) (map[uint32]imaplib.StoredMembership, error) {
-			stored, err := s.GetIMAPStoredMemberships(ctx, src.ID, mailbox, uidValidity, uids)
-			if err != nil {
-				return nil, err
-			}
-			result := make(map[uint32]imaplib.StoredMembership, len(stored))
-			for uid, membership := range stored {
-				result[uid] = imaplib.StoredMembership{
-					MessageID:       membership.MessageID,
-					SourceMessageID: membership.SourceMessageID,
-					Flags:           membership.Flags,
-				}
-			}
-			return result, nil
 		}), imaplib.WithRelocationCandidateLoader(
 		func(ctx context.Context, lost []string) ([]imaplib.RelocationCandidate, error) {
 			candidates, err := s.GetIMAPRelocationCandidatesContext(ctx, src.ID, lost)
@@ -498,9 +494,6 @@ func applyIMAPMailboxDeltas(
 			if existing.CanonicalSourceMessageID == "" {
 				existing.CanonicalSourceMessageID = observation.CanonicalSourceMessageID
 			}
-			if existing.ArchivedMessageID == 0 {
-				existing.ArchivedMessageID = observation.ArchivedMessageID
-			}
 			if existing.RFC822MessageID == "" {
 				existing.RFC822MessageID = observation.RFC822MessageID
 			}
@@ -523,7 +516,6 @@ func applyIMAPMailboxDeltas(
 			RawSHA256:                observation.RawSHA256,
 			RawSize:                  observation.RawSize,
 			Flags:                    append([]string(nil), observation.Flags...),
-			ArchivedMessageID:        observation.ArchivedMessageID,
 		})
 	}
 	byMailbox := make(map[string][]store.IMAPMembershipObservation)
@@ -615,9 +607,21 @@ func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(ctx conte
 	// completed run still saves fresh high water marks afterwards.
 	imapOpts := imapFolderStateOptions(s, src, syncNoResume, cfg, logger)
 
+	// Pass CLI folder filter strings to the IMAP client. The IMAP
+	// client selects the effective include list (CLI --folder when
+	// set, otherwise config Folders) and applies CLI --skip-folder
+	// as an exclusion on top. Both CLI filters are applied in a
+	// single call to filterMailboxes so --folder can fully
+	// override configuration and --skip-folder works together with
+	// --folder.
+	imapOpts = append(imapOpts,
+		imaplib.WithFolderFilter(
+			parseFolderFilter(syncFolders),
+			parseFolderFilter(syncSkipFolders),
+		))
+
 	if src.SourceType == sourceTypeIMAP {
 		imapOpts = append(imapOpts,
-			imapSyncFolderFilter(ctx, s, src.Identifier, state, syncFolders, syncSkipFolders),
 			imaplib.WithListProgress(progress.OnIMAPListProgress),
 		)
 	}
@@ -987,12 +991,12 @@ func (p *CLIProgress) printProgress() {
 
 	if p.outputMode() == progressModePlain {
 		_, _ = fmt.Fprintf(p.writer(),
-			"  Scanned: %07d | Added: %07d | Skipped: %07d | Rate: %.1f/s | Elapsed: %s%s\n",
+			"  Scanned: %d | Added: %d | Skipped: %d | Rate: %.1f/s | Elapsed: %s%s\n",
 			p.processed, p.added, p.skipped, rate, elapsedStr, dateStr)
 		return
 	}
 	_, _ = fmt.Fprintf(p.writer(),
-		"\r  Scanned: %07d | Added: %07d | Skipped: %07d | Rate: %.1f/s | Elapsed: %s%s    ",
+		"\r  Scanned: %d | Added: %d | Skipped: %d | Rate: %.1f/s | Elapsed: %s%s    ",
 		p.processed, p.added, p.skipped, rate, elapsedStr, dateStr)
 }
 
@@ -1028,13 +1032,16 @@ func imapSkipReason(src *store.Source, cfg *config.Config, logger *slog.Logger) 
 	}
 	switch imapCfg.EffectiveAuthMethod() {
 	case imaplib.AuthXOAuth2:
-		if sourceOAuthApp(src) == "" && cfg.Microsoft.ClientID == "" {
+		if cfg.Microsoft.ClientID == "" {
 			return fmt.Sprintf("Skipping %s (Microsoft OAuth not configured — add client_id to [microsoft] in config.toml)", src.Identifier), nil
 		}
-		msMgr, err := newMicrosoftIMAPManager(cfg, repairLogger(logger), src)
-		if err != nil {
-			return fmt.Sprintf("Skipping %s (%v)", src.Identifier, err), nil
-		}
+		msMgr := microsoft.NewManager(
+			cfg.Microsoft.ClientID,
+			cfg.Microsoft.EffectiveTenantID(),
+			cfg.Microsoft.EffectiveRedirectURI(),
+			cfg.TokensDir(),
+			repairLogger(logger),
+		)
 		if !msMgr.HasToken(imapCfg.Username) {
 			return fmt.Sprintf("Skipping %s (no Microsoft token — run 'add-o365' first)", src.Identifier), nil
 		}
@@ -1055,7 +1062,7 @@ func init() {
 	syncFullCmd.Flags().StringVar(&syncBefore, "before", "", "Only messages before this date (YYYY-MM-DD)")
 	syncFullCmd.Flags().StringVar(&syncAfter, "after", "", "Only messages after this date (YYYY-MM-DD)")
 	syncFullCmd.Flags().IntVar(&syncLimit, "limit", 0, "Limit number of messages (for testing)")
-	syncFullCmd.Flags().StringArrayVar(&syncFolders, "folder", []string{}, "IMAP folder to scan; either folder flag replaces saved exclusions for this run (repeatable)")
-	syncFullCmd.Flags().StringArrayVar(&syncSkipFolders, "skip-folder", []string{}, "IMAP folder to skip; either folder flag replaces saved exclusions for this run (repeatable)")
+	syncFullCmd.Flags().StringArrayVar(&syncFolders, "folder", []string{}, "IMAP folder to scan (repeatable)")
+	syncFullCmd.Flags().StringArrayVar(&syncSkipFolders, "skip-folder", []string{}, "IMAP folder to skip (repeatable)")
 	rootCmd.AddCommand(addManualSyncCacheFlags(syncFullCmd))
 }

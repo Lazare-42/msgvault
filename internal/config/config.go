@@ -30,6 +30,7 @@ import (
 	"go.kenn.io/msgvault/internal/identityops"
 	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/netguard"
+	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/omi"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personenrichment"
@@ -381,9 +382,10 @@ func (s *ServerConfig) ValidateSecure() error {
 
 // AccountSchedule defines sync schedule for a single account.
 type AccountSchedule struct {
-	Email    string `toml:"email"`    // Gmail account email
-	Schedule string `toml:"schedule"` // Cron expression (e.g., "0 2 * * *" for 2am daily)
-	Enabled  bool   `toml:"enabled"`  // Whether scheduled sync is active
+	Email       string   `toml:"email"`        // Account identifier or display name
+	Schedule    string   `toml:"schedule"`     // Cron expression (e.g., "0 2 * * *" for 2am daily)
+	Enabled     bool     `toml:"enabled"`      // Whether scheduled sync is active
+	SkipFolders []string `toml:"skip_folders"` // Legacy per-account IMAP exclusions
 }
 
 // CardDAVConfig contains non-secret connection settings for the external
@@ -453,6 +455,18 @@ type SynctechSMSSource struct {
 	IncludeAttachments bool   `toml:"include_attachments"`
 	StableAfter        string `toml:"stable_after"`
 	OAuthApp           string `toml:"oauth_app"`
+}
+
+type GoogleDocsConfig struct {
+	Sources []GoogleDocsSource `toml:"sources"`
+}
+
+type GoogleDocsSource struct {
+	Name          string `toml:"name"`
+	Enabled       bool   `toml:"enabled"`
+	FolderID      string `toml:"folder_id"`
+	GoogleAccount string `toml:"google_account"`
+	OAuthApp      string `toml:"oauth_app"`
 }
 
 // RemoteConfig holds configuration for a remote msgvault server.
@@ -593,6 +607,14 @@ type SenderAuthSource struct {
 	TrustedAuthservIDs []string `toml:"trusted_authserv_ids"`
 }
 
+type MailConfig struct {
+	Accounts map[string]MailAccountConfig `toml:"accounts"`
+}
+
+type MailAccountConfig struct {
+	AllowedFrom []string `toml:"allowed_from"`
+}
+
 // Pins returns a snapshot that callers can retain across config edits.
 func (c SenderAuthConfig) Pins() map[int64][]string {
 	pins := make(map[int64][]string, len(c.Sources))
@@ -603,6 +625,7 @@ func (c SenderAuthConfig) Pins() map[int64][]string {
 }
 
 type Config struct {
+	Mail               MailConfig                `toml:"mail"`
 	RelayedSenders     []mime.RelayedSenderRule  `toml:"relayed_senders"`
 	SenderAuth         SenderAuthConfig          `toml:"sender_auth"`
 	ConversationPolicy ConversationPolicyConfig  `toml:"conversation_policy"`
@@ -653,6 +676,8 @@ type Config struct {
 	IMAP               IMAPConfig                `toml:"imap"`
 	Gmail              GmailConfig               `toml:"gmail"`
 	Telemetry          TelemetryConfig           `toml:"telemetry"`
+	GoogleDocs         GoogleDocsConfig          `toml:"google_docs"`
+	OCR                OCRConfig                 `toml:"ocr"`
 
 	// Computed paths (not from config file)
 	HomeDir            string `toml:"-"`
@@ -788,11 +813,98 @@ func (a *ActivityConfig) Validate() error {
 	return nil
 }
 
-// LogConfig holds logging configuration. File logging is opt-in:
-// set enabled = true or dir = "..." to write structured JSON logs
-// to disk. Without either, msgvault only writes to stderr (which
-// is the default behavior users already expect). The --log-file
-// CLI flag also enables file logging for a single run.
+// OCRConfig controls asynchronous attachment text extraction. It is disabled
+// by default; the daemon remains the sole archive/CAS owner and talks to a
+// stateless executor over a local Unix socket.
+type OCRConfig struct {
+	Enabled            bool          `toml:"enabled"`
+	Socket             string        `toml:"socket"`
+	Schedule           string        `toml:"schedule"`
+	Languages          string        `toml:"languages"`
+	Fingerprint        string        `toml:"fingerprint"`
+	BatchSize          int           `toml:"batch_size"`
+	LeaseDuration      time.Duration `toml:"lease_duration"`
+	RequestTimeout     time.Duration `toml:"request_timeout"`
+	MaxFileBytes       int64         `toml:"max_file_bytes"`
+	MaxPages           int           `toml:"max_pages"`
+	MaxPixels          int64         `toml:"max_pixels"`
+	MaxPreprocessBytes int64         `toml:"max_preprocess_bytes"`
+	MaxOutputBytes     int64         `toml:"max_output_bytes"`
+	MaxAttempts        int           `toml:"max_attempts"`
+	MinImageSide       int           `toml:"min_image_side"`
+	MaxImageScale      int           `toml:"max_image_scale"`
+}
+
+func (o *OCRConfig) ApplyDefaults(homeDir string) {
+	if o.Socket == "" {
+		o.Socket = ocr.DefaultSocket(homeDir)
+	}
+	if o.Schedule == "" {
+		o.Schedule = "*/10 * * * *"
+	}
+	if o.Languages == "" {
+		o.Languages = ocr.DefaultLanguages
+	}
+	if o.Fingerprint == "" {
+		o.Fingerprint = "poppler+tesseract-v1:" + o.Languages
+	}
+	if o.BatchSize <= 0 {
+		o.BatchSize = 1
+	}
+	if o.LeaseDuration <= 0 {
+		o.LeaseDuration = 15 * time.Minute
+	}
+	if o.RequestTimeout <= 0 {
+		o.RequestTimeout = ocr.DefaultRequestTimeout
+	}
+	limits := ocr.Limits{
+		MaxFileBytes: o.MaxFileBytes, MaxPages: o.MaxPages,
+		MaxPixels: o.MaxPixels, MaxPreprocessBytes: o.MaxPreprocessBytes,
+		MaxOutputBytes: o.MaxOutputBytes,
+	}
+	ocr.ApplyLimitDefaults(&limits)
+	o.MaxFileBytes, o.MaxPages = limits.MaxFileBytes, limits.MaxPages
+	o.MaxPixels, o.MaxPreprocessBytes = limits.MaxPixels, limits.MaxPreprocessBytes
+	o.MaxOutputBytes = limits.MaxOutputBytes
+	if o.MaxAttempts <= 0 {
+		o.MaxAttempts = ocr.DefaultMaxAttempts
+	}
+	if o.MinImageSide <= 0 {
+		o.MinImageSide = ocr.DefaultMinImageSide
+	}
+	if o.MaxImageScale <= 0 {
+		o.MaxImageScale = ocr.DefaultMaxImageScale
+	}
+}
+
+func (o *OCRConfig) Validate() error {
+	if o.Enabled && !filepath.IsAbs(o.Socket) {
+		return fmt.Errorf("invalid [ocr] socket %q: must be an absolute path", o.Socket)
+	}
+	if o.BatchSize < 1 || o.BatchSize > 16 {
+		return fmt.Errorf("invalid [ocr] batch_size %d: must be between 1 and 16", o.BatchSize)
+	}
+	if o.MaxAttempts < 1 || o.MaxAttempts > 100 {
+		return fmt.Errorf("invalid [ocr] max_attempts %d: must be between 1 and 100", o.MaxAttempts)
+	}
+	if o.MaxPixels > ocr.MaxConfiguredPixels {
+		return fmt.Errorf("invalid [ocr] max_pixels %d: must not exceed %d", o.MaxPixels, ocr.MaxConfiguredPixels)
+	}
+	if o.MaxPreprocessBytes > ocr.MaxConfiguredPreprocessBytes {
+		return fmt.Errorf("invalid [ocr] max_preprocess_bytes %d: must not exceed %d", o.MaxPreprocessBytes, ocr.MaxConfiguredPreprocessBytes)
+	}
+	if o.MinImageSide < 1 || o.MinImageSide > 4096 {
+		return fmt.Errorf("invalid [ocr] min_image_side %d: must be between 1 and 4096", o.MinImageSide)
+	}
+	if o.MaxImageScale < 1 || o.MaxImageScale > 8 {
+		return fmt.Errorf("invalid [ocr] max_image_scale %d: must be between 1 and 8", o.MaxImageScale)
+	}
+	return nil
+}
+
+// LogConfig holds logging configuration. File logging is opt-in: set enabled
+// or dir to write structured JSON logs to disk. Without either, msgvault only
+// writes to stderr. The --log-file CLI flag enables file logging for one run.
 type LogConfig struct {
 	// Dir is the directory where log files live. Empty means
 	// "<data dir>/logs". Setting this implicitly enables file
@@ -1015,13 +1127,14 @@ func NewDefaultConfig() *Config {
 		SynctechSMS:        SynctechSMSConfig{Sources: []SynctechSMSSource{}},
 		GCal:               []GCalSource{},
 		// Group-room media is capped by default; see DefaultMediaMaxParticipants.
-		Beeper:   BeeperConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		Matrix:   MatrixConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		Slack:    SlackConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		Inline:   InlineConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		Discord:  DiscordConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		Teams:    TeamsConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		IMessage: IMessageConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Beeper:     BeeperConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Matrix:     MatrixConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Slack:      SlackConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Inline:     InlineConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Discord:    DiscordConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Teams:      TeamsConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		IMessage:   IMessageConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		GoogleDocs: GoogleDocsConfig{Sources: []GoogleDocsSource{}},
 	}
 	cfg.Vector.ApplyDefaults()
 	cfg.resolveCredentialPaths()
@@ -1035,6 +1148,7 @@ func NewDefaultConfig() *Config {
 	cfg.People.Enrichment.ApplyDefaults()
 	cfg.People.IdentityScoring.ApplyDefaults()
 	cfg.People.Tiers = persontiers.DefaultConfig()
+	cfg.OCR.ApplyDefaults(cfg.HomeDir)
 	return cfg
 }
 
@@ -1053,6 +1167,7 @@ func loadWithOverrides(path, homeDir string, overrides RuntimeOverrides) (*Confi
 	// --home overrides the default home directory, just like MSGVAULT_HOME.
 	if homeDir != "" {
 		homeDir = expandPath(homeDir)
+		cfg.rebaseDefaultOCRSocket(homeDir)
 		cfg.HomeDir = homeDir
 		cfg.Data.DataDir = homeDir
 	}
@@ -1127,6 +1242,7 @@ func loadConfigFileLenient(snapshot ConfigFile, homeDir string, overrides *Runti
 	cfg := NewDefaultConfig()
 	if homeDir != "" {
 		homeDir = expandPath(homeDir)
+		cfg.rebaseDefaultOCRSocket(homeDir)
 		cfg.HomeDir = homeDir
 		cfg.Data.DataDir = homeDir
 	}
@@ -1136,6 +1252,7 @@ func loadConfigFileLenient(snapshot ConfigFile, homeDir string, overrides *Runti
 	}
 	if !snapshot.Exists {
 		if homeDir == "" && decodePath != "" {
+			cfg.rebaseDefaultOCRSocket(filepath.Dir(decodePath))
 			cfg.HomeDir = filepath.Dir(decodePath)
 			cfg.Data.DataDir = cfg.HomeDir
 		}
@@ -1160,6 +1277,7 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	// directory so that tokens, database, attachments, etc. live alongside
 	// the config.
 	if explicit && !homeOverride {
+		cfg.rebaseDefaultOCRSocket(filepath.Dir(path))
 		cfg.HomeDir = filepath.Dir(path)
 		cfg.Data.DataDir = cfg.HomeDir
 	}
@@ -1362,6 +1480,10 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	cfg.People.IdentityScoring.ApplyDefaults()
 	cfg.deferDaemonError(cfg.People.IdentityScoring.Validate())
 	cfg.deferDaemonError(cfg.People.Tiers.Validate())
+	cfg.OCR.ApplyDefaults(cfg.HomeDir)
+	if err := cfg.OCR.Validate(); err != nil {
+		return nil, err
+	}
 	if err := cfg.Backup.Validate(); err != nil {
 		return nil, err
 	}
@@ -1606,6 +1728,32 @@ func (c *Config) FastmailSourceFor(st FastmailSourceStore, sourceID int64) (*Fas
 func fastmailAccountMatchesSource(account string, source *store.Source) bool {
 	return strings.EqualFold(account, source.Identifier) ||
 		(source.DisplayName.Valid && strings.EqualFold(account, source.DisplayName.String))
+}
+
+func (c *Config) GetGoogleDocsSource(name string) *GoogleDocsSource {
+	for _, src := range c.GoogleDocs.Sources {
+		if strings.EqualFold(src.Name, name) {
+			matched := src
+			return &matched
+		}
+	}
+	return nil
+}
+
+func (c *Config) EnabledGoogleDocsSources() []GoogleDocsSource {
+	var sources []GoogleDocsSource
+	for _, src := range c.GoogleDocs.Sources {
+		if src.Enabled {
+			sources = append(sources, src)
+		}
+	}
+	return sources
+}
+
+func (c *Config) rebaseDefaultOCRSocket(homeDir string) {
+	if c.OCR.Socket == "" || c.OCR.Socket == ocr.DefaultSocket(c.HomeDir) {
+		c.OCR.Socket = ocr.DefaultSocket(homeDir)
+	}
 }
 
 func (c *Config) applySynctechSMSDefaults() {

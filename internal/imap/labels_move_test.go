@@ -1,0 +1,399 @@
+package imap
+
+import (
+	"strings"
+	"testing"
+
+	goimap "github.com/emersion/go-imap/v2"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	gmailapi "go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/testutil"
+)
+
+func TestClientModifyMessageLabelsMoveToFolder(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	client := newDraftTestClient(t)
+	id := appendTestMessage(t, client, "INBOX", &gmailapi.DraftCompose{
+		To:      []string{"applicant@example.com"},
+		Subject: "file me",
+		Body:    "body",
+	})
+	require. // "Recruiting" is not pre-created — the move must create it on demand.
+			NoError(client.ModifyMessageLabels(
+			t.Context(),
+			id,
+			[]string{"folder:Recruiting"},
+			nil,
+		))
+
+	// Gone from INBOX...
+	_, err := client.GetMessageRaw(t.Context(), id)
+	require.Error(err)
+
+	// ...and present in Recruiting.
+	movedIDs := listMailboxMessageIDs(t, client, "Recruiting")
+	require.Len(movedIDs, 1)
+	raw, err := client.GetMessageRaw(t.Context(), movedIDs[0])
+	require.NoError(err)
+	assert.Contains(string(raw.Raw), "Subject: file me")
+}
+
+func TestClientMoveMessageToFolderReportsConfirmedMove(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	client := newDraftTestClient(t)
+	id := appendTestMessage(t, client, "INBOX", &gmailapi.DraftCompose{
+		To:      []string{"applicant@example.com"},
+		Subject: "file with result",
+		Body:    "body",
+	})
+
+	moved, err := client.MoveMessageToFolder(t.Context(), id, "INBOX", "Archive")
+	require.NoError(err)
+	assert.True(moved)
+
+	moved, err = client.MoveMessageToFolder(t.Context(), id, "INBOX", "Archive")
+	require.NoError(err)
+	assert.False(moved, "stale source UID must report a no-op")
+}
+
+func TestClientMoveMessageToFolderRejectsSourceMismatch(t *testing.T) {
+	client := newDraftTestClient(t)
+	id := appendTestMessage(t, client, "Archive", &gmailapi.DraftCompose{
+		To:      []string{"applicant@example.com"},
+		Subject: "keep in archive",
+		Body:    "body",
+	})
+
+	moved, err := client.MoveMessageToFolder(t.Context(), id, "INBOX", "Queue")
+	require.ErrorContains(t, err, "source mailbox mismatch")
+	assert.False(t, moved)
+	assert.Len(t, listMailboxMessageIDs(t, client, "Archive"), 1)
+}
+
+func TestClientModifyMessageLabelsMoveToExistingFolderWithFlag(t *testing.T) {
+	require := require.New(t)
+	client := newDraftTestClient(t)
+	id := appendTestMessage(t, client, "INBOX", &gmailapi.DraftCompose{
+		To:      []string{"applicant@example.com"},
+		Subject: "star and file",
+		Body:    "body",
+	})
+	require. // Archive pre-exists (created by the harness); a flag rides along with the move.
+			NoError(client.ModifyMessageLabels(
+			t.Context(),
+			id,
+			[]string{"STARRED", "folder:Archive"},
+			nil,
+		))
+
+	moved := listMailboxMessageIDs(t, client, "Archive")
+	require.Len(moved, 1)
+	_, uid, err := parseCompositeID(moved[0])
+	require.NoError(err)
+	flags := fetchMessageFlags(t, client, "Archive", uid)
+	assert.Contains(t, flags, goimap.FlagFlagged)
+}
+
+func TestClientModifyMessageLabelsMoveToExistingFolderWithPlainCreateNO(t *testing.T) {
+	addr, user := testutil.StartIMAPMemServerWithCreateError(t, map[string]int{
+		"INBOX": 0,
+		"queue": 0,
+	}, "Queue")
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+	client := newTestClient(t, addr)
+
+	require.NoError(t, client.ModifyMessageLabels(
+		t.Context(),
+		"INBOX|1",
+		[]string{"folder:Queue"},
+		nil,
+	))
+	assert.Len(t, listMailboxMessageIDs(t, client, "queue"), 1)
+}
+
+func TestClientModifyMessageLabelsPreservesRealCreateError(t *testing.T) {
+	addr, user := testutil.StartIMAPMemServerWithCreateFailure(t, map[string]int{
+		"INBOX": 0,
+		"Queue": 0,
+	}, "Queue")
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+	client := newTestClient(t, addr)
+
+	err := client.ModifyMessageLabels(
+		t.Context(),
+		"INBOX|1",
+		[]string{"folder:Queue"},
+		nil,
+	)
+	require.ErrorContains(t, err, "OVERQUOTA")
+	assert.Len(t, listMailboxMessageIDs(t, client, "INBOX"), 1)
+}
+
+func TestClientModifyMessageLabelsRefreshesMailboxExistence(t *testing.T) {
+	require := require.New(t)
+	addr, user := testutil.StartIMAPMemServer(t, map[string]int{
+		"INBOX": 0,
+		"Queue": 0,
+	})
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+	client := newTestClient(t, addr)
+	require.NoError(client.ModifyMessageLabels(
+		t.Context(), "INBOX|1", []string{"folder:Queue"}, nil))
+	require.NoError(user.Delete("Queue"))
+	require.NoError(client.ModifyMessageLabels(
+		t.Context(), "INBOX|2", []string{"folder:Queue"}, nil))
+
+	assert.Len(t, listMailboxMessageIDs(t, client, "Queue"), 1)
+}
+
+func TestClientModifyMessageLabelsRecoversFromEmptyCopyUID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const missingUID = goimap.UID(999)
+	addr, user := testutil.StartIMAPMemServerWithPhantomUID(t, map[string]int{
+		"INBOX": 0,
+		"Queue": 0,
+	}, missingUID)
+	client := newTestClient(t, addr)
+
+	moved, err := client.MoveMessageToFolder(t.Context(), "INBOX|999", "INBOX", "Queue")
+	require.NoError(err)
+	assert.False(moved, "empty COPYUID cannot confirm a move")
+
+	// Malformed COPYUID closes the first connection. A subsequent real move
+	// proves recovery left the client usable.
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+	moved, err = client.MoveMessageToFolder(t.Context(), "INBOX|1", "INBOX", "Queue")
+	require.NoError(err)
+	assert.True(moved)
+	assert.Len(listMailboxMessageIDs(t, client, "Queue"), 1)
+}
+
+func TestClientModifyMessageLabelsMoveIdempotentWhenAlreadyThere(t *testing.T) {
+	client := newDraftTestClient(t)
+	id := appendTestMessage(t, client, "Archive", &gmailapi.DraftCompose{
+		To:      []string{"a@example.com"},
+		Subject: "already here",
+		Body:    "body",
+	})
+
+	// Moving to the mailbox it already lives in is a no-op, not an error.
+	require.NoError(t, client.ModifyMessageLabels(
+		t.Context(),
+		id,
+		[]string{"folder:Archive"},
+		nil,
+	))
+	assert.Len(t, listMailboxMessageIDs(t, client, "Archive"), 1)
+}
+
+func TestParseIMAPLabelOpsFolder(t *testing.T) {
+	t.Run("parses folder destination, not upper-cased", func(t *testing.T) {
+		ops, err := parseIMAPLabelOps([]string{"folder:Recruiting/2026"}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "Recruiting/2026", ops.destFolder)
+	})
+
+	t.Run("prefix is case-insensitive", func(t *testing.T) {
+		ops, err := parseIMAPLabelOps([]string{"FOLDER:Payroll"}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "Payroll", ops.destFolder)
+	})
+
+	t.Run("empty destination is rejected", func(t *testing.T) {
+		_, err := parseIMAPLabelOps([]string{"folder:   "}, nil)
+		require.ErrorContains(t, err, "empty destination")
+	})
+
+	t.Run("two different folders conflict", func(t *testing.T) {
+		_, err := parseIMAPLabelOps([]string{"folder:A", "folder:B"}, nil)
+		require.ErrorContains(t, err, "two folders")
+	})
+
+	t.Run("same folder twice is fine", func(t *testing.T) {
+		ops, err := parseIMAPLabelOps([]string{"folder:A", "folder:a"}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "A", ops.destFolder)
+	})
+
+	t.Run("folder move conflicts with archive", func(t *testing.T) {
+		_, err := parseIMAPLabelOps([]string{"folder:A"}, []string{"INBOX"})
+		require.ErrorContains(t, err, "conflicting IMAP moves")
+	})
+
+	t.Run("folder move conflicts with move-to-inbox", func(t *testing.T) {
+		_, err := parseIMAPLabelOps([]string{"folder:A", "INBOX"}, nil)
+		require.ErrorContains(t, err, "conflicting IMAP moves")
+	})
+
+	t.Run("folder can combine with a flag", func(t *testing.T) {
+		ops, err := parseIMAPLabelOps([]string{"folder:A", "STARRED"}, nil)
+		require.NoError(t, err)
+		assert.Equal(t, "A", ops.destFolder)
+		assert.Contains(t, ops.addFlags, goimap.FlagFlagged)
+	})
+
+	t.Run("removing a folder label is rejected", func(t *testing.T) {
+		_, err := parseIMAPLabelOps(nil, []string{"folder:A"})
+		require.ErrorContains(t, err, "not supported")
+	})
+}
+
+// flagsContainFold reports whether flags contains name, compared
+// case-insensitively: servers (including imapmemserver) may canonicalize
+// keyword atoms to a different case than the client sent.
+func flagsContainFold(flags []goimap.Flag, name string) bool {
+	for _, f := range flags {
+		if strings.EqualFold(string(f), name) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestClientModifyMessageLabelsAddRemoveKeyword(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	client := newDraftTestClient(t)
+	id := appendTestMessage(t, client, "INBOX", &gmailapi.DraftCompose{
+		To:      []string{"applicant@example.com"},
+		Subject: "tag me",
+		Body:    "body",
+	})
+	_, uid, err := parseCompositeID(id)
+	require.NoError(err)
+	require.NoError(client.ModifyMessageLabels(
+		t.Context(),
+		id,
+		[]string{"keyword:Handled"},
+		nil,
+	))
+	flags := fetchMessageFlags(t, client, "INBOX", uid)
+	assert.True(flagsContainFold(flags, "Handled"), "flags %v should contain Handled", flags)
+	require.NoError(client.ModifyMessageLabels(
+		t.Context(),
+		id,
+		nil,
+		[]string{"keyword:Handled"},
+	))
+	flags = fetchMessageFlags(t, client, "INBOX", uid)
+	assert.False(flagsContainFold(flags, "Handled"), "flags %v should no longer contain Handled", flags)
+}
+
+func TestClientModifyMessageLabelsKeywordWithFolderMove(t *testing.T) {
+	require := require.New(t)
+	client := newDraftTestClient(t)
+	id := appendTestMessage(t, client, "INBOX", &gmailapi.DraftCompose{
+		To:      []string{"applicant@example.com"},
+		Subject: "tag and file",
+		Body:    "body",
+	})
+	require. // The keyword STORE happens before the MOVE and travels with the message.
+			NoError(client.ModifyMessageLabels(
+			t.Context(),
+			id,
+			[]string{"keyword:Handled", "folder:Archive"},
+			nil,
+		))
+
+	moved := listMailboxMessageIDs(t, client, "Archive")
+	require.Len(moved, 1)
+	_, uid, err := parseCompositeID(moved[0])
+	require.NoError(err)
+	flags := fetchMessageFlags(t, client, "Archive", uid)
+	assert.True(t, flagsContainFold(flags, "Handled"), "flags %v should contain Handled", flags)
+}
+
+func TestParseIMAPLabelOpsKeyword(t *testing.T) {
+	tests := []struct {
+		name       string
+		add        []string
+		remove     []string
+		wantAdd    []goimap.Flag
+		wantRemove []goimap.Flag
+		wantFolder string
+		wantErr    string
+	}{
+		{
+			name:    "add keyword preserves case",
+			add:     []string{"keyword:Handled"},
+			wantAdd: []goimap.Flag{"Handled"},
+		},
+		{
+			name:    "prefix is case-insensitive",
+			add:     []string{"KEYWORD:Handled"},
+			wantAdd: []goimap.Flag{"Handled"},
+		},
+		{
+			name:    "whitespace around name is trimmed",
+			add:     []string{"  keyword:  Handled  "},
+			wantAdd: []goimap.Flag{"Handled"},
+		},
+		{
+			name:    "utf-8 keyword passes through untouched",
+			add:     []string{"keyword:Traité"},
+			wantAdd: []goimap.Flag{"Traité"},
+		},
+		{
+			name:    "empty keyword name on add is rejected",
+			add:     []string{"keyword:   "},
+			wantErr: "empty keyword name",
+		},
+		{
+			name:       "remove keyword clears the flag",
+			remove:     []string{"keyword:Handled"},
+			wantRemove: []goimap.Flag{"Handled"},
+		},
+		{
+			name:    "empty keyword name on remove is rejected",
+			remove:  []string{"keyword:"},
+			wantErr: "empty keyword name",
+		},
+		{
+			name:       "keyword combines with folder move and flags",
+			add:        []string{"keyword:Handled", "folder:Archive", "STARRED"},
+			wantAdd:    []goimap.Flag{"Handled", goimap.FlagFlagged},
+			wantFolder: "Archive",
+		},
+		{
+			name:    "keyword with inner space is rejected",
+			add:     []string{"keyword:My Tag"},
+			wantErr: "not allowed in a flag atom",
+		},
+		{
+			name:    "keyword with parenthesis is rejected",
+			add:     []string{"keyword:Tag(1)"},
+			wantErr: "not allowed in a flag atom",
+		},
+		{
+			name:    "keyword with asterisk is rejected",
+			add:     []string{"keyword:Tag*"},
+			wantErr: "not allowed in a flag atom",
+		},
+		{
+			name:    "keyword with atom-special on remove is rejected",
+			remove:  []string{`keyword:Tag"quote`},
+			wantErr: "not allowed in a flag atom",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			ops, err := parseIMAPLabelOps(tt.add, tt.remove)
+			if tt.wantErr != "" {
+				require.ErrorContains(err, tt.wantErr)
+				return
+			}
+			require.NoError(err)
+			assert.ElementsMatch(tt.wantAdd, ops.addFlags)
+			assert.ElementsMatch(tt.wantRemove, ops.removeFlags)
+			assert.Equal(tt.wantFolder, ops.destFolder)
+		})
+	}
+}

@@ -144,13 +144,10 @@ type Store struct {
 // 128 fits ~33-64 statements plus recipient variants; larger caches were no faster and use more memory.
 const sqliteStmtCacheParams = "&_stmt_cache_size=128"
 
-// synchronous=FULL + fullfsync=true protects WAL writes against OS/power crashes
-// (NORMAL only protects against process crashes). msgvault is commonly run as a
-// laptop daemon (`msgvault serve`) where sleep/wake, forced reboots, and OOM kills
-// give many opportunities to leave a torn page on disk; the write volume is tiny
-// so the durability cost is negligible. fullfsync is macOS-only (F_FULLFSYNC
-// fcntl) and a no-op on other platforms.
-const defaultSQLiteParams = "?_journal_mode=WAL&_busy_timeout=30000&_synchronous=FULL&_fullfsync=true&_foreign_keys=ON" + sqliteStmtCacheParams
+// WAL+NORMAL retains SQLite's database-integrity guarantee while allowing the
+// sync cursors to recover the last few commits after an abrupt power loss. It
+// avoids a per-commit fsync penalty on external archive drives.
+const defaultSQLiteParams = "?_journal_mode=WAL&_busy_timeout=30000&_synchronous=NORMAL&_foreign_keys=ON" + sqliteStmtCacheParams
 
 // sqlitePoolSize bounds open SQLite connections. All of them stay idle in the
 // pool: each connection has its own page cache and preloads the metadata FTS

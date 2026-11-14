@@ -20,4 +20,3 @@ it('names its menu for the row, disables unavailable actions, and calls the sele
   expect(remove).toHaveBeenCalledOnce();
   expect(edit).not.toHaveBeenCalled();
 });
-
