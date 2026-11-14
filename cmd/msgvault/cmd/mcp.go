@@ -272,6 +272,7 @@ func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client, state *
 		MediaSearcher:      st,
 		PersonFileSearcher: daemonMCPPersonFileSearcher{client: st},
 		Drafts:             daemonMCPDraftRunner{client: st},
+		OCR:                st,
 	}
 	if cfg != nil {
 		opts.AttachmentsDir = cfg.AttachmentsDir()

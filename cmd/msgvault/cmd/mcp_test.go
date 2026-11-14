@@ -165,6 +165,7 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 
 	require.ErrorIs(err, wantErr)
 	assert.ElementsMatch([]mcpserver.OperationFamily{mcpserver.OperationFamilyRecords, mcpserver.OperationFamilyLoops}, gotServeOpts.OperationWriteFamilies)
+	assert.NotNil(gotServeOpts.OCR, "daemon-backed MCP must expose attachment OCR")
 	assert.True(gotServeOpts.AllowProfileWrites)
 	assert.True(gotServeOpts.AllowIdentityDecisions)
 	assert.True(gotServeOpts.AllowIdentityScoring)

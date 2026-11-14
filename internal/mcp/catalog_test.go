@@ -21,6 +21,7 @@ import (
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 )
@@ -97,6 +98,43 @@ func rawListTools(t *testing.T, opts ServeOptions, allowWrites bool) []map[strin
 		require.True(t, ok, "tool %d: %#v", i, tool)
 	}
 	return out
+}
+
+type catalogOCRBackend struct{}
+
+func (catalogOCRBackend) OCRStatus(context.Context) (*store.OCRRuntimeStatus, error) {
+	return &store.OCRRuntimeStatus{}, nil
+}
+
+func (catalogOCRBackend) SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error) {
+	return nil, nil
+}
+
+func (catalogOCRBackend) GetOCRResult(context.Context, string, bool) (*store.OCRResult, error) {
+	return &store.OCRResult{}, nil
+}
+
+func (catalogOCRBackend) RequestOCR(context.Context, string, string) (*store.OCRResult, error) {
+	return &store.OCRResult{}, nil
+}
+
+func TestOCRBackendExposesAttachmentTextTools(t *testing.T) {
+	tools := rawListTools(t, ServeOptions{
+		Engine: &querytest.MockEngine{},
+		OCR:    catalogOCRBackend{},
+	}, true)
+	names := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		name, ok := tool["name"].(string)
+		require.True(t, ok)
+		names = append(names, name)
+	}
+	assert.Subset(t, names, []string{
+		ToolGetOCRStatus,
+		ToolSearchAttachmentText,
+		ToolGetAttachmentText,
+		ToolRequestAttachmentText,
+	})
 }
 
 func rawCallTool(t *testing.T, opts ServeOptions, name string, arguments map[string]any) map[string]any {
