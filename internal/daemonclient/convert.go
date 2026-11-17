@@ -513,6 +513,7 @@ func cliAccountsFromGenerated(resp *generated.ListCLIAccountsResponse) []CLIAcco
 			Stale:              boolValue(resp.Stale),
 			AsOf:               copyTime(resp.AsOf),
 			LastSync:           account.LastSync,
+			SyncConfig:         stringValue(account.SyncConfig),
 			VirtualAccounts:    virtualAccountsFromGenerated(account.VirtualAccounts),
 		}
 	}

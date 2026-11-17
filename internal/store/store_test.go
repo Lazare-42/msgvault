@@ -679,6 +679,65 @@ func TestStore_MessageLabels(t *testing.T) {
 	assert.Equal(t, labels["SENT"], labelID, "label_id (SENT)")
 }
 
+func TestStore_RemoveStaleFlagLabels(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	f := storetest.New(t)
+
+	msgID := f.CreateMessage("msg-1")
+
+	systemLabels := f.EnsureLabels(map[string]string{
+		"INBOX":    "INBOX",
+		"UNREAD":   "UNREAD",
+		"STARRED":  "STARRED",
+		"ANSWERED": "ANSWERED",
+	}, "system")
+	userLabels := f.EnsureLabels(map[string]string{
+		"Archive": "Archive",
+	}, "user")
+	keywordLabels := f.EnsureLabels(map[string]string{
+		"Traite": "Traite",
+	}, store.LabelTypeKeyword)
+
+	err := f.Store.ReplaceMessageLabels(msgID, []int64{
+		systemLabels["INBOX"],
+		systemLabels["UNREAD"],
+		systemLabels["STARRED"],
+		userLabels["Archive"],
+		keywordLabels["Traite"],
+	})
+	require.NoError(err, "ReplaceMessageLabels()")
+
+	// The message was read and its category removed; the star remains.
+	keep := []int64{
+		systemLabels["INBOX"],
+		userLabels["Archive"],
+		systemLabels["STARRED"],
+	}
+	changed, err := f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, keep)
+	require.NoError(err, "RemoveStaleFlagLabels()")
+	assert.True(changed, "stale UNREAD and Traite should be removed")
+
+	f.AssertLabelCount(msgID, 3)
+	f.AssertMessageHasLabel(msgID, systemLabels["INBOX"])
+	f.AssertMessageHasLabel(msgID, userLabels["Archive"])
+	f.AssertMessageHasLabel(msgID, systemLabels["STARRED"])
+
+	// Idempotent: nothing left to remove.
+	changed, err = f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, keep)
+	require.NoError(err, "RemoveStaleFlagLabels() second call")
+	assert.False(changed, "no stale flag labels remain")
+
+	// An empty keep set clears all flag-derived labels but preserves
+	// mailbox and user labels.
+	changed, err = f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, nil)
+	require.NoError(err, "RemoveStaleFlagLabels() empty keep")
+	assert.True(changed, "STARRED should be removed")
+	f.AssertLabelCount(msgID, 2)
+	f.AssertMessageHasLabel(msgID, systemLabels["INBOX"])
+	f.AssertMessageHasLabel(msgID, userLabels["Archive"])
+}
+
 func TestStore_MessageRecipients(t *testing.T) {
 	f := storetest.New(t)
 
@@ -2322,4 +2381,38 @@ func TestStore_GetStatsForScope_ExcludesSourceDeleted(t *testing.T) {
 	stats, err := f.Store.GetStatsForScope([]int64{f.Source.ID})
 	require.NoError(t, err, "GetStatsForScope")
 	assert.Equal(t, int64(1), stats.MessageCount, "MessageCount (source-deleted excluded)")
+}
+
+// TestStore_OpenUsesWALWithSynchronousNormal locks in the production
+// connection pragmas store.Open applies: WAL journaling, synchronous=NORMAL,
+// and foreign keys on. WAL+NORMAL is SQLite's own documented safe
+// combination — it cannot corrupt the database file on crash or power loss,
+// only the last few not-yet-checkpointed commits can be lost — and
+// msgvault's sync paths (Gmail history IDs, IMAP UIDs, watermark-based
+// incremental sync) already tolerate exactly that by re-fetching on the next
+// run. This was previously synchronous=FULL, which fsyncs on every commit
+// rather than only at checkpoints; regressing back to FULL (or losing WAL or
+// foreign_keys) should fail this test, not surface only as a production
+// stall on a slow or contended disk.
+func TestStore_OpenUsesWALWithSynchronousNormal(t *testing.T) {
+	testutil.SkipIfPostgres(t, "connection pragmas are SQLite-specific")
+	require := require.New(t)
+	assert := assert.New(t)
+	dbPath := filepath.Join(t.TempDir(), "pragmas.db")
+	st, err := store.Open(dbPath)
+	require.NoError(err, "open store")
+	t.Cleanup(func() { _ = st.Close() })
+
+	var journalMode string
+	require.NoError(st.DB().QueryRow("PRAGMA journal_mode").Scan(&journalMode), "read journal_mode")
+	assert.Equal("wal", journalMode, "journal_mode")
+
+	// SQLite reports synchronous as an integer: 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+	var synchronous int
+	require.NoError(st.DB().QueryRow("PRAGMA synchronous").Scan(&synchronous), "read synchronous")
+	assert.Equal(1, synchronous, "synchronous (1=NORMAL)")
+
+	var foreignKeys int
+	require.NoError(st.DB().QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys), "read foreign_keys")
+	assert.Equal(1, foreignKeys, "foreign_keys")
 }

@@ -294,6 +294,9 @@ type CLIAccount struct {
 	Stale              bool       `json:"stale,omitempty"`
 	AsOf               *time.Time `json:"as_of,omitempty"`
 	LastSync           *time.Time `json:"last_sync"`
+	// SyncConfig is the source's sync_config JSON; the daemon only
+	// populates it for IMAP sources (connection parameters, no secrets).
+	SyncConfig string `json:"sync_config,omitempty"`
 }
 
 type CLIAccountUpdateRequest = accountops.UpdateRequest

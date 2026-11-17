@@ -4660,7 +4660,15 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	cfg := state.cfg
 	logger := state.logger
 	imapOpts := imapFolderStateOptions(s, src, false, cfg, logger)
-	imapOpts = append(imapOpts, imapSyncFolderFilter(ctx, s, src.Identifier, state, nil, nil))
+	var legacySkipFolders []string
+	if account := cfg.GetAccountSchedule(src.Identifier); account != nil {
+		legacySkipFolders = account.SkipFolders
+	} else if src.DisplayName.Valid {
+		if account := cfg.GetAccountSchedule(src.DisplayName.String); account != nil {
+			legacySkipFolders = account.SkipFolders
+		}
+	}
+	imapOpts = append(imapOpts, imapSyncFolderFilter(ctx, s, src.Identifier, state, nil, legacySkipFolders))
 	apiClient, err := buildAPIClient(ctx, src, nil, nil, imapOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("build IMAP client: %w", err)

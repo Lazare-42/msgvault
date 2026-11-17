@@ -73,6 +73,14 @@ type GetAttachmentContentErrorResponseJSON503 = ErrorResponse
 
 type GetAttachmentContentErrorResponseJSONDefault = ErrorResponse
 
+type GetAttachmentTextResponse = OCRResult
+
+type GetAttachmentTextErrorResponse = ErrorResponse
+
+type RequestAttachmentTextResponse = OCRResult
+
+type RequestAttachmentTextErrorResponse = ErrorResponse
+
 type GetAttachmentResponse = AttachmentInfo
 
 type GetAttachmentErrorResponse = ErrorResponse
@@ -1483,6 +1491,10 @@ type SuggestFilesErrorResponseJSON503 = ErrorResponse
 
 type SuggestFilesErrorResponseJSONDefault = ErrorResponse
 
+type SearchAttachmentTextResponse = OcrSearchResponse
+
+type SearchAttachmentTextErrorResponse = ErrorResponse
+
 type GetFileResponse = FileMetadataResponse
 
 type GetFileErrorResponse = ErrorResponse
@@ -2138,6 +2150,10 @@ type ResumeVisualAttachmentBuildErrorResponse = ErrorResponse
 type GetVisualAttachmentStatusResponse = Status
 
 type GetVisualAttachmentStatusErrorResponse = ErrorResponse
+
+type GetOCRStatusResponse = OCRRuntimeStatus
+
+type GetOCRStatusErrorResponse = ErrorResponse
 
 type ListOperationRunsResponse = OperationRunsResponse
 
@@ -4225,6 +4241,22 @@ type GetAttachmentContentResp struct {
 	JSONDefault  *GetAttachmentContentErrorResponseJSONDefault
 }
 
+type GetAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetAttachmentTextResponse
+	JSONDefault  *GetAttachmentTextErrorResponse
+}
+
+type RequestAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON202      *RequestAttachmentTextResponse
+	JSONDefault  *RequestAttachmentTextErrorResponse
+}
+
 type GetAttachmentResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -5444,6 +5476,14 @@ type SuggestFilesResp struct {
 	JSONDefault  *SuggestFilesErrorResponseJSONDefault
 }
 
+type SearchAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *SearchAttachmentTextResponse
+	JSONDefault  *SearchAttachmentTextErrorResponse
+}
+
 type GetFileResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -6099,6 +6139,14 @@ type GetVisualAttachmentStatusResp struct {
 	StatusCode   int
 	JSON200      *GetVisualAttachmentStatusResponse
 	JSONDefault  *GetVisualAttachmentStatusErrorResponse
+}
+
+type GetOCRStatusResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetOCRStatusResponse
+	JSONDefault  *GetOCRStatusErrorResponse
 }
 
 type ListOperationRunsResp struct {

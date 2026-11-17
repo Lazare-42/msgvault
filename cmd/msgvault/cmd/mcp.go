@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,12 +16,19 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
+	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/googledocs"
+	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/mailclient"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/vector/visual"
 	"go.kenn.io/msgvault/pkg/client/generated"
+	"google.golang.org/api/docs/v1"
+	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/option"
 )
 
 var mcpForceSQL bool
@@ -111,6 +119,13 @@ Add to Claude Desktop config:
 			opts = daemonMCPServeOptions(ctx, st, state)
 		}
 		applyMCPWriteFlags(cmd, "", &opts)
+		// Live mail and Google Docs clients are available only for the local
+		// daemon mode. Delegated agents use the daemon-backed operation surface.
+		if !isAgentMode(state) {
+			opts.GmailFactory = buildMailFactory(ctx, st)
+			opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
+			hideUnusedManagedDraftTools(&opts, cfg)
+		}
 
 		if httpAddr != "" {
 			return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{
@@ -513,6 +528,131 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 		},
 		Messages: resp.Messages,
 	}, nil
+}
+
+// buildMailFactory creates authenticated live clients for the MCP mail tools.
+func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.MailClientFactory {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil
+	}
+	cfg, logger := state.cfg, state.logger
+	oauthConfigured := cfg.OAuth.HasAnyConfig()
+	hasIMAP := false
+	if accounts, _, err := st.GetCLIAccounts(ctx); err == nil {
+		for _, account := range accounts {
+			if account.Type == sourceTypeIMAP {
+				hasIMAP = true
+				break
+			}
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Note: could not list accounts to detect IMAP sources: %v\n", err)
+	}
+	if !oauthConfigured && !hasIMAP {
+		fmt.Fprintln(os.Stderr, "Note: OAuth not configured and no IMAP accounts, draft tools disabled")
+		return nil
+	}
+	return func(ctx context.Context, email string) (client gmail.LiveAPI, err error) {
+		sender := email
+		defer func() {
+			if err != nil || client == nil {
+				return
+			}
+			backend := client
+			mailAccount, ok := cfg.Mail.Accounts[sender]
+			if !ok {
+				mailAccount = cfg.Mail.Accounts[email]
+			}
+			client, err = mailclient.New(backend, sender, mailAccount.AllowedFrom)
+			if err != nil {
+				_ = backend.Close()
+			}
+		}()
+		ctx = withInvocation(ctx, state)
+		accounts, _, err := st.GetCLIAccounts(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("lookup account %s: %w", email, err)
+		}
+		var account *daemonclient.CLIAccount
+		for i := range accounts {
+			if accounts[i].Email == email {
+				account = &accounts[i]
+				break
+			}
+		}
+		if account == nil {
+			return nil, fmt.Errorf("account %s not found in database", email)
+		}
+		switch account.Type {
+		case sourceTypeIMAP:
+			if imapCfg, cfgErr := imaplib.ConfigFromJSON(account.SyncConfig); cfgErr == nil && imapCfg.Username != "" {
+				sender = imapCfg.Username
+			}
+			return buildIMAPAPIClient(ctx, account.Email, account.SyncConfig)
+		case sourceTypeGmail, "":
+			oauthMgr, err := loadOAuthManager(ctx, state, account.OAuthApp)
+			if err != nil {
+				return nil, fmt.Errorf("create OAuth manager: %w", err)
+			}
+			tokenSource, err := oauthMgr.TokenSource(ctx, email)
+			if err != nil {
+				return nil, fmt.Errorf("get token for %s: %w (run 'msgvault add-account %s' first)", email, err, email)
+			}
+			rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
+			gmailClient := gmail.NewClient(tokenSource, gmail.WithLogger(logger), gmail.WithRateLimiter(rateLimiter))
+			return gmail.NewLiveClient(gmailClient), nil
+		default:
+			return nil, fmt.Errorf("account %s has source type %q, which does not support draft/label operations", email, account.Type)
+		}
+	}
+}
+
+// buildGoogleDocsFactory creates a client for enabled Drive folder sources.
+func buildGoogleDocsFactory(ctx context.Context) mcpserver.GoogleDocsClientFactory {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil
+	}
+	cfg := state.cfg
+	sources := cfg.EnabledGoogleDocsSources()
+	if len(sources) == 0 {
+		return nil
+	}
+	return func(ctx context.Context) (googledocs.Client, error) {
+		ctx = withInvocation(ctx, state)
+		services := make([]googledocs.SourceServices, 0, len(sources))
+		for _, src := range sources {
+			if err := googledocs.ValidateSource(src); err != nil {
+				return nil, err
+			}
+			clientSecrets, err := cfg.OAuth.CredentialsFor(src.OAuthApp)
+			if err != nil {
+				return nil, fmt.Errorf("OAuth for google-docs source %q: %w", src.Name, err)
+			}
+			mgr, err := newGoogleDocsDriveOAuthManager(ctx, clientSecrets)
+			if err != nil {
+				return nil, fmt.Errorf("create OAuth manager for google-docs source %q: %w", src.Name, err)
+			}
+			if !googleDocsDriveTokenReady(ctx, mgr, src.GoogleAccount) {
+				return nil, fmt.Errorf("no Google Docs OAuth token with Drive/Docs scopes for %s; run 'msgvault add-google-docs-drive %s --folder-id %s --google-account %s' on a machine with browser auth first", src.GoogleAccount, src.Name, src.FolderID, src.GoogleAccount)
+			}
+			ts, err := mgr.TokenSource(ctx, src.GoogleAccount)
+			if err != nil {
+				return nil, fmt.Errorf("get token for google-docs source %q (%s): %w", src.Name, src.GoogleAccount, err)
+			}
+			driveService, err := drive.NewService(ctx, option.WithTokenSource(ts))
+			if err != nil {
+				return nil, fmt.Errorf("create Drive service for google-docs source %q: %w", src.Name, err)
+			}
+			docsService, err := docs.NewService(ctx, option.WithTokenSource(ts))
+			if err != nil {
+				return nil, fmt.Errorf("create Docs service for google-docs source %q: %w", src.Name, err)
+			}
+			services = append(services, googledocs.SourceServices{Source: src, Drive: driveService, Docs: docsService})
+		}
+		return googledocs.NewClient(services)
+	}
 }
 
 func init() {

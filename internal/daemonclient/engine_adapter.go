@@ -611,6 +611,7 @@ func querySummaryFromAPIMessage(msg store.APIMessage) query.MessageSummary {
 		ID:                   msg.ID,
 		SourceID:             msg.SourceID,
 		SourceMessageID:      msg.SourceMessageID,
+		RFC822MessageID:      msg.RFC822MessageID,
 		ConversationID:       msg.ConversationID,
 		SourceConversationID: msg.SourceConversationID,
 		Subject:              msg.Subject,
@@ -832,6 +833,7 @@ func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
 		Calendar:             msg.Calendar,
 		SourceID:             msg.SourceID,
 		SourceMessageID:      msg.SourceMessageID,
+		RFC822MessageID:      msg.RFC822MessageID,
 		ConversationID:       msg.ConversationID,
 		SourceConversationID: msg.SourceConversationID,
 		Subject:              msg.Subject,
@@ -844,7 +846,7 @@ func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
 		HasAttachments:       msg.HasAttachments,
 		HiddenTextPresent:    msg.HiddenTextPresent,
 		Labels:               msg.Labels,
-		BodyText:             msg.BodyText,
+		BodyText:             apiMessageBodyText(msg),
 		BodyHTML:             msg.BodyHTML,
 		From:                 apiMessageFromAddress(msg),
 		To:                   apiMessageAddresses(msg.To),
@@ -866,6 +868,16 @@ func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
 		detail.HasAttachments = true
 	}
 	return detail
+}
+
+func apiMessageBodyText(msg *store.APIMessage) string {
+	if msg.BodyText != "" {
+		return msg.BodyText
+	}
+	if msg.BodyHTML != "" && msg.Body == msg.BodyHTML {
+		return ""
+	}
+	return msg.Body
 }
 
 func apiMessageFromAddress(msg *store.APIMessage) []query.Address {

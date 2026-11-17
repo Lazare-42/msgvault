@@ -510,3 +510,67 @@ preserve the archived content instead of replacing it.
 These rules apply during later syncs. They do not automatically repair older
 archive rows that already lost the location information needed to identify the
 outgoing copy.
+## Flag-Derived Labels
+
+Besides folder names, msgvault stores each message's IMAP flags as searchable
+labels:
+
+- `UNREAD` — the message has no `\Seen` flag.
+- `STARRED` — the message carries the `\Flagged` flag.
+- `ANSWERED` — the message carries the `\Answered` flag (you replied to it).
+- Custom IMAP keywords appear verbatim as labels. Outlook categories arrive
+  this way: a category named `Traite` becomes a `Traite` label. Some servers
+  store keywords lowercased, so the label may appear as `traite`.
+
+Internal client bookkeeping is not turned into labels: system flags such as
+`\Draft` and `\Deleted`, `$`-prefixed keywords such as `$Forwarded`, and bare
+spam-training keywords such as `NonJunk` are skipped.
+
+Flag labels track the server on every sync, including folder-filtered ones.
+Reading a message removes its `UNREAD` label on the next sync, replying adds
+`ANSWERED`, and removing a category drops the matching keyword label. This
+makes searches such as "in INBOX, not replied, without the Traite category"
+possible from the TUI or query interface.
+
+## Filing Messages Into Folders
+
+IMAP has no multi-label model: a message lives in exactly one mailbox, so
+"labeling" over IMAP is a MOVE. The `modify_labels` MCP tool accepts these
+labels for IMAP and Microsoft 365 accounts:
+
+- `UNREAD` — add to mark unread, remove to mark read (`\Seen`).
+- `STARRED` — add/remove the `\Flagged` flag (a "pin").
+- `INBOX` — add to move back to INBOX, remove to archive.
+- `folder:<name>` — add to MOVE the message into the named mailbox, e.g.
+  `folder:Recruiting`. The mailbox is created on demand if it does not exist.
+- `keyword:<name>` — add/remove an IMAP keyword (custom flag) on the message,
+  e.g. `keyword:Traite`. Exchange and Microsoft 365 surface keywords as
+  Outlook categories; servers may canonicalize the keyword's case. Keywords
+  combine freely with other flags and with a folder/INBOX move in one call.
+  The name must be a single IMAP flag atom: accented/UTF-8 letters are fine,
+  but spaces and the special characters `( ) { } % * " \ ]` are rejected.
+
+A `folder:` move is mutually exclusive with an INBOX add/remove in the same
+call, but a flag (e.g. `STARRED`) can be applied alongside it. Removing a
+`folder:` label is not supported — move to a different folder instead. The
+`create_label` tool pre-provisions an empty mailbox without moving anything.
+
+## Applying Labels From the CLI
+
+The same label operations are available without MCP through the
+`modify-labels` command:
+
+```bash
+msgvault modify-labels --account user@example.com --ids 12,34 \
+  --add "keyword:Handled" --remove UNREAD
+```
+
+`--ids` takes archive message IDs (the numeric IDs shown by the TUI and
+query interface, resolved through the msgvault daemon); `--source-ids`
+takes the mail server's own message IDs and passes them through as-is.
+At least one of `--ids`/`--source-ids` and at least one of
+`--add`/`--remove` is required. Writes are applied in chunks and require
+an IMAP-backed account; `--dry-run` previews the operation for any
+account type. The command prints a single JSON report on stdout
+(`{"modified": [...], "errors": N, "dry_run": ...}`) with progress on
+stderr.

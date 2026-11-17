@@ -104,6 +104,7 @@ func generatedMessageToAPIMessage(m generated.MessageSummary) store.APIMessage {
 		ID:                m.ID,
 		SourceID:          int64Value(m.SourceID),
 		SourceMessageID:   stringValue(m.SourceMessageID),
+		RFC822MessageID:   stringValue(m.Rfc822MessageID),
 		ConversationID:    int64Value(m.ConversationID),
 		Subject:           m.Subject,
 		MessageType:       stringValue(m.MessageType),
@@ -156,6 +157,7 @@ func generatedDetailToAPIMessage(m *generated.MessageDetail) *store.APIMessage {
 		Calendar:          calendarProjectionFromGenerated(m.Calendar),
 		SourceID:          int64Value(m.SourceID),
 		SourceMessageID:   stringValue(m.SourceMessageID),
+		RFC822MessageID:   stringValue(m.Rfc822MessageID),
 		ConversationID:    int64Value(m.ConversationID),
 		Subject:           m.Subject,
 		MessageType:       stringValue(m.MessageType),
@@ -174,12 +176,17 @@ func generatedDetailToAPIMessage(m *generated.MessageDetail) *store.APIMessage {
 		HiddenTextPresent: m.HiddenTextPresent,
 		SizeEstimate:      m.SizeBytes,
 		Body:              m.Body,
-		BodyText:          m.Body,
 		BodyHTML:          stringValue(m.BodyHTML),
 		Attachments:       apiAttachmentsFromGenerated(m.Attachments),
 	}
 	if m.BodyText != nil {
 		msg.BodyText = *m.BodyText
+	} else {
+		// Older daemons predate body_text and expose their best available
+		// body through body. Preserve that documented fallback. New daemons
+		// send body_text explicitly, including an empty value for HTML-only
+		// messages, so the branches remain distinguishable.
+		msg.BodyText = msg.Body
 	}
 	return msg
 }

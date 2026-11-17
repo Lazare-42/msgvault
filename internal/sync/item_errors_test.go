@@ -55,6 +55,46 @@ func (c *legacyRawBatchClient) Close() error {
 	return nil
 }
 
+func (c *legacyRawBatchClient) ListDrafts(context.Context, string, int) ([]*gmail.ComposedDraft, error) {
+	return nil, nil
+}
+
+func (c *legacyRawBatchClient) GetDraft(context.Context, string) (*gmail.ComposedDraft, error) {
+	return nil, errors.New("draft operation not supported by raw sync test client")
+}
+
+func (c *legacyRawBatchClient) CreateDraft(context.Context, *gmail.DraftCompose) (*gmail.ComposedDraft, error) {
+	return nil, errors.New("draft operation not supported by raw sync test client")
+}
+
+func (c *legacyRawBatchClient) UpdateDraft(context.Context, string, *gmail.DraftCompose) (*gmail.ComposedDraft, error) {
+	return nil, errors.New("draft operation not supported by raw sync test client")
+}
+
+func (c *legacyRawBatchClient) DeleteDraft(context.Context, string) error {
+	return nil
+}
+
+func (c *legacyRawBatchClient) SendDraft(context.Context, string) (*gmail.SentMessage, error) {
+	return nil, errors.New("sending not supported by raw sync test client")
+}
+
+func (c *legacyRawBatchClient) ModifyMessageLabels(context.Context, string, []string, []string) error {
+	return nil
+}
+
+func (c *legacyRawBatchClient) BatchModifyLabels(context.Context, []string, []string, []string) error {
+	return nil
+}
+
+func (c *legacyRawBatchClient) CreateLabel(context.Context, string) (*gmail.Label, error) {
+	return nil, errors.New("label creation not supported by raw sync test client")
+}
+
+func (c *legacyRawBatchClient) DeleteLabel(context.Context, string) error {
+	return nil
+}
+
 var _ gmail.API = (*legacyRawBatchClient)(nil)
 
 type diagnosticRawBatchClient struct {
