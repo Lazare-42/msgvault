@@ -609,6 +609,10 @@ type SenderAuthSource struct {
 
 type MailConfig struct {
 	Accounts map[string]MailAccountConfig `toml:"accounts"`
+	// AttachmentDirs lists the directories, or glob patterns matching
+	// directories, from which draft tools may attach local files by path.
+	// Empty disables attachment_paths.
+	AttachmentDirs []string `toml:"attachment_dirs"`
 }
 
 type MailAccountConfig struct {

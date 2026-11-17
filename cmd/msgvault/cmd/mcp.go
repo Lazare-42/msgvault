@@ -123,6 +123,7 @@ Add to Claude Desktop config:
 		// daemon mode. Delegated agents use the daemon-backed operation surface.
 		if !isAgentMode(state) {
 			opts.GmailFactory = buildMailFactory(ctx, st)
+			opts.DraftAttachmentDirs = cfg.Mail.AttachmentDirs
 			opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
 			hideUnusedManagedDraftTools(&opts, cfg)
 		}

@@ -730,6 +730,31 @@ server errors with an uncertain outcome. These checks do not provide durable
 exactly-once delivery: unattended callers should retain their own delivery
 receipts and reconcile uncertain outcomes.
 
+### Attaching local files to drafts
+
+`create_draft` and `update_draft` attach files three ways: `attachment_ids`
+for files already in the archive, `new_attachments` for inline base64 content,
+and `attachment_paths` for files on the machine running the MCP process.
+`attachment_paths` keeps large files out of the tool call, because the MCP
+process reads them itself.
+
+`attachment_paths` is off until you list the folders it may read from. Each
+entry is a directory or a glob pattern matching directories:
+
+```toml
+[mail]
+attachment_dirs = ["/home/owner/outbox", "/tmp/agent-*/scratchpad"]
+```
+
+Patterns are re-read on every call, so folders created after startup still
+match. Paths must be absolute. msgvault resolves symlinks first and accepts
+only regular files whose real location is inside a listed folder, so a link
+cannot pull in a file from elsewhere. Each file is limited to 50 MiB, and all
+attachments on one draft to 18 MiB combined. The attachment is named after the
+file, and its type comes from the file extension or, failing that, from the
+content. Delegated agent sessions don't get the live mail tools, so they can't
+use `attachment_paths`.
+
 ### `[microsoft]`
 
 Configuration for Microsoft 365 / Outlook.com OAuth and Microsoft Teams Graph

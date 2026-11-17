@@ -267,6 +267,9 @@ type ServeOptions struct {
 	Drafts        DraftRunner
 	DraftCommands []string
 	GmailFactory  GmailClientFactory
+	// DraftAttachmentDirs lists the directories (or glob patterns) draft
+	// tools may read attachment_paths from. Empty disables attachment_paths.
+	DraftAttachmentDirs []string
 	// WhatsAppFactory is optional. When non-nil, live WhatsApp tools are exposed.
 	WhatsAppFactory WhatsAppClientFactory
 	// WhatsAppLoginURL is an optional browser URL for QR login/resync.
@@ -501,6 +504,7 @@ func newMCPServerWithPolicy(
 		contactRoutesBackend: opts.ContactRoutesBackend,
 		chatDiscoveryBackend: opts.ChatDiscoveryBackend,
 		gmailFactory:         opts.GmailFactory,
+		draftAttachmentDirs:  opts.DraftAttachmentDirs,
 		whatsAppFactory:      opts.WhatsAppFactory,
 		googleDocsFactory:    opts.GoogleDocsFactory,
 		whatsAppLoginURL:     strings.TrimSpace(opts.WhatsAppLoginURL),
@@ -792,6 +796,16 @@ func withAccount() mcp.ToolOption {
 	)
 }
 
+// withAttachmentPaths declares the "attachment_paths" draft parameter shared
+// by create_draft and update_draft: local files the MCP process reads itself,
+// so large files never pass through the tool call.
+func withAttachmentPaths() mcp.ToolOption {
+	return mcp.WithArray("attachment_paths",
+		mcp.Description("Absolute paths of local files to attach, read by the msgvault process. Only files inside the directories configured as [mail] attachment_dirs are accepted; symlinks are resolved before that check. Prefer this over new_attachments for large files. Subject to the same per-file and combined draft size limits."),
+		mcp.Items(map[string]any{"type": "string"}),
+	)
+}
+
 // withNewAttachments declares the "new_attachments" draft parameter shared by
 // create_draft and update_draft: file content that has never been archived
 // (e.g. a document just written or scanned), supplied inline as base64 rather
@@ -916,6 +930,7 @@ func createDraftTool() mcp.Tool {
 			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Attaches the archived file directly — no need to export first."),
 		),
 		withNewAttachments(),
+		withAttachmentPaths(),
 	)
 }
 
@@ -962,6 +977,7 @@ func updateDraftTool() mcp.Tool {
 			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Replaces any existing attachments."),
 		),
 		withNewAttachments(),
+		withAttachmentPaths(),
 	)
 }
 
