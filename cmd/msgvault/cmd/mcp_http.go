@@ -73,6 +73,7 @@ Example Claude Desktop config (with port-forward):
 
 		opts := daemonMCPServeOptions(ctx, st, state)
 		opts.GmailFactory = buildMailFactory(ctx, st)
+		opts.DraftAttachmentDirs = state.cfg.Mail.AttachmentDirs
 		opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
 		hideUnusedManagedDraftTools(&opts, state.cfg)
 

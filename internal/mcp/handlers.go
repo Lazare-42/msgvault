@@ -178,6 +178,7 @@ type handlers struct {
 	contactRoutesBackend ContactRoutesBackend
 	chatDiscoveryBackend ChatDiscoveryBackend
 	gmailFactory         GmailClientFactory
+	draftAttachmentDirs  []string
 	whatsAppFactory      WhatsAppClientFactory
 	whatsAppLoginURL     string
 	googleDocsFactory    GoogleDocsClientFactory
@@ -890,8 +891,12 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 	if err != nil {
 		return nil, err
 	}
+	paths, err := parseAttachmentPathArgs(args)
+	if err != nil {
+		return nil, err
+	}
 
-	if len(ids) == 0 && len(newAttachments) == 0 {
+	if len(ids) == 0 && len(newAttachments) == 0 && len(paths) == 0 {
 		return nil, nil
 	}
 	if len(ids) > 0 && h.attachmentsDir == "" && h.attachmentReader == nil {
@@ -944,6 +949,18 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 			ContentType: na.mimeType,
 			Content:     content,
 		})
+	}
+
+	for i, path := range paths {
+		att, err := readDraftAttachmentPath(path, h.draftAttachmentDirs)
+		if err != nil {
+			return nil, fmt.Errorf("attachment_paths[%d]: %w", i, err)
+		}
+		total += int64(len(att.Content))
+		if total > maxDraftAttachmentsSize {
+			return nil, fmt.Errorf("total attachment size exceeds %d bytes", maxDraftAttachmentsSize)
+		}
+		atts = append(atts, att)
 	}
 
 	return atts, nil

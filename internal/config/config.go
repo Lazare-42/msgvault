@@ -607,6 +607,18 @@ type SenderAuthSource struct {
 	TrustedAuthservIDs []string `toml:"trusted_authserv_ids"`
 }
 
+type MailConfig struct {
+	Accounts map[string]MailAccountConfig `toml:"accounts"`
+	// AttachmentDirs lists the directories, or glob patterns matching
+	// directories, from which draft tools may attach local files by path.
+	// Empty disables attachment_paths.
+	AttachmentDirs []string `toml:"attachment_dirs"`
+}
+
+type MailAccountConfig struct {
+	AllowedFrom []string `toml:"allowed_from"`
+}
+
 // Pins returns a snapshot that callers can retain across config edits.
 func (c SenderAuthConfig) Pins() map[int64][]string {
 	pins := make(map[int64][]string, len(c.Sources))
@@ -614,14 +626,6 @@ func (c SenderAuthConfig) Pins() map[int64][]string {
 		pins[source.SourceID] = append([]string(nil), source.TrustedAuthservIDs...)
 	}
 	return pins
-}
-
-type MailConfig struct {
-	Accounts map[string]MailAccountConfig `toml:"accounts"`
-}
-
-type MailAccountConfig struct {
-	AllowedFrom []string `toml:"allowed_from"`
 }
 
 type Config struct {
