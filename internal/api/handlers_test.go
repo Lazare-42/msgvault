@@ -3179,12 +3179,12 @@ func TestHandleCLIAccountsExposesIMAPSyncConfigOnly(t *testing.T) {
 	imapSrc, err := st.GetOrCreateSource("imap", "shared@example.com")
 	require.NoError(err, "GetOrCreateSource imap")
 	imapConfig := `{"host":"imap.example.com","port":993,"tls":true,"username":"shared@example.com","auth_method":"xoauth2","ms_app_only":true}`
-	require.NoError(st.UpdateSourceSyncConfig(imapSrc.ID, imapConfig), "UpdateSourceSyncConfig imap")
+	require.NoError(st.UpdateSourceSyncConfig(t.Context(), imapSrc.ID, imapConfig), "UpdateSourceSyncConfig imap")
 
 	gmailSrc, err := st.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "GetOrCreateSource gmail")
 	require.NoError(
-		st.UpdateSourceSyncConfig(gmailSrc.ID, `{"private":"stays-private"}`),
+		st.UpdateSourceSyncConfig(t.Context(), gmailSrc.ID, `{"private":"stays-private"}`),
 		"UpdateSourceSyncConfig gmail",
 	)
 

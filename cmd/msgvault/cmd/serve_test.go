@@ -3554,14 +3554,14 @@ func TestRunScheduledIMAPSync_AppliesConfiguredSkipFolders(t *testing.T) {
 	require.NoError(s.UpdateSourceDisplayName(src.ID, "user@example.com"))
 	configJSON, err := imapCfg.ToJSON()
 	require.NoError(err)
-	require.NoError(s.UpdateSourceSyncConfig(src.ID, configJSON))
+	require.NoError(s.UpdateSourceSyncConfig(t.Context(), src.ID, configJSON))
 	require.NoError(imaplib.SaveCredentials(
 		cfg.TokensDir(), imapCfg.Identifier(), testutil.IMAPTestPassword))
 
 	src, err = s.GetSourceByID(src.ID)
 	require.NoError(err)
 	summary, err := runScheduledIMAPSync(
-		testInvocationContext(t.Context(), cfg, invocationOptions{}), src, s, nil, "user@example.com")
+		testInvocationContext(t.Context(), cfg, invocationOptions{}), src, s, nil)
 	require.NoError(err)
 	assert.Equal(int64(1), summary.MessagesFound)
 	assert.Equal(int64(1), summary.MessagesAdded)

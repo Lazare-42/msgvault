@@ -312,7 +312,7 @@ func listMailboxMessageIDs(t *testing.T, client *Client, mailbox string) []strin
 
 	var ids []string
 	err := client.withConn(context.Background(), func(conn *imapclient.Client) error {
-		if err := client.selectMailbox(mailbox); err != nil {
+		if err := client.selectMailbox(t.Context(), mailbox); err != nil {
 			return err
 		}
 		searchData, err := conn.UIDSearch(&goimap.SearchCriteria{}, nil).Wait()
@@ -338,7 +338,7 @@ func fetchMessageFlags(t *testing.T, client *Client, mailbox string, uid goimap.
 
 	var flags []goimap.Flag
 	err := client.withConn(context.Background(), func(conn *imapclient.Client) error {
-		if err := client.selectMailbox(mailbox); err != nil {
+		if err := client.selectMailbox(t.Context(), mailbox); err != nil {
 			return err
 		}
 		var uidSet goimap.UIDSet

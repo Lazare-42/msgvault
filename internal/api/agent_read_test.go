@@ -656,7 +656,7 @@ func TestAgentReadScopeCounts(t *testing.T) {
 	_, err = st.UpsertMessage(&store.Message{SourceID: src.ID, ConversationID: conv, SourceMessageID: "deleted-email", MessageType: "email"})
 	requirements.NoError(err)
 	requirements.NoError(st.MarkMessageDeleted(src.ID, "deleted-email"))
-	requirements.NoError(st.UpdateSourceSyncConfig(src.ID, `{"host":"mail.example.test","ms_cert_path":"/private/client.pem"}`))
+	requirements.NoError(st.UpdateSourceSyncConfig(t.Context(), src.ID, `{"host":"mail.example.test","ms_cert_path":"/private/client.pem"}`))
 	requirements.NoError(st.UpdateSourceDisplayName(src.ID, "Reader archive"))
 	srv := NewServerWithOptions(ServerOptions{Config: &config.Config{Server: config.ServerConfig{APIKey: "owner", AgentAccess: true}}, Store: st, Engine: newExploreDuckDBFixture(t), Logger: testLogger()})
 	defer srv.agentGrants.Close()

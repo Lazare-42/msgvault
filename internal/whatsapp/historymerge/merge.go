@@ -357,7 +357,7 @@ func mergeMessage(
 	if err := mergeAttachments(ctx, opts, m.ID, intoMessageID, fromBlobs, report); err != nil {
 		return fmt.Errorf("attachments: %w", err)
 	}
-	if err := mergeReactions(m.ID, intoMessageID, opts, report); err != nil {
+	if err := mergeReactions(ctx, m.ID, intoMessageID, opts, report); err != nil {
 		return fmt.Errorf("reactions: %w", err)
 	}
 	return nil
@@ -493,7 +493,7 @@ func canonicalStoragePath(hash string) string {
 	return hash[:2] + "/" + hash
 }
 
-func mergeReactions(fromMessageID, intoMessageID int64, opts Options, report *Report) error {
+func mergeReactions(ctx context.Context, fromMessageID, intoMessageID int64, opts Options, report *Report) error {
 	reactions, err := opts.From.ListActiveWhatsAppReactions(fromMessageID)
 	if err != nil {
 		return fmt.Errorf("list source reactions: %w", err)
@@ -520,7 +520,7 @@ func mergeReactions(fromMessageID, intoMessageID int64, opts Options, report *Re
 			report.recordError(fmt.Sprintf("message %d: ensure reactor participant: %v", fromMessageID, err))
 			continue
 		}
-		if err := opts.Into.UpsertReaction(intoMessageID, pid, r.ReactionType, r.ReactionValue, r.CreatedAt); err != nil {
+		if err := opts.Into.UpsertReaction(ctx, intoMessageID, pid, r.ReactionType, r.ReactionValue, r.CreatedAt); err != nil {
 			report.ReactionsFailed++
 			report.recordError(fmt.Sprintf("message %d: write reaction: %v", fromMessageID, err))
 			continue

@@ -152,7 +152,7 @@ func newFileStore(t *testing.T, dir string) (*store.Store, string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(dir, 0o700))
 	dbPath := filepath.Join(dir, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
+	st, err := store.OpenForTest(t.Context(), dbPath)
 	require.NoError(t, err)
 	require.NoError(t, st.InitSchema())
 	return st, dbPath

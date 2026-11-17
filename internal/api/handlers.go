@@ -2939,7 +2939,6 @@ func toMessageSummaryFromQuery(m query.MessageSummary) MessageSummary {
 		ID:                m.ID,
 		SourceID:          m.SourceID,
 		SourceMessageID:   m.SourceMessageID,
-		RFC822MessageID:   m.RFC822MessageID,
 		ConversationID:    m.ConversationID,
 		Subject:           m.Subject,
 		MessageType:       m.MessageType,

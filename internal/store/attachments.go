@@ -661,7 +661,13 @@ func normalizeDiscordAttachmentRefs(refs []AttachmentRef) []AttachmentRef {
 // "download failed" marker left by storeInboundAttachment (see
 // internal/whatsapp/live/service.go) and carries no retrievable blob.
 func (s *Store) MessageWhatsAppAttachments(messageID int64) (map[string]AttachmentRef, error) {
-	return s.messageProviderAttachments(messageID, "whatsapp:")
+	return s.MessageWhatsAppAttachmentsContext(context.Background(), messageID)
+}
+
+// MessageWhatsAppAttachmentsContext is MessageWhatsAppAttachments with
+// caller-controlled cancellation.
+func (s *Store) MessageWhatsAppAttachmentsContext(ctx context.Context, messageID int64) (map[string]AttachmentRef, error) {
+	return s.messageProviderAttachmentsContext(ctx, messageID, "whatsapp:")
 }
 
 // IsDiscordAttachmentDownloaded reports whether a Discord row references a

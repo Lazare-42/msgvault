@@ -2,6 +2,7 @@ package imap
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"

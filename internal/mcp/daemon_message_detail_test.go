@@ -24,7 +24,7 @@ func TestDaemonGetMessagePreservesReplyHeaders(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	src, err := st.GetOrCreateSource("imap", "reader@example.test")
 	requirements.NoError(err)
-	conv, err := st.EnsureConversation(src.ID, "INBOX|1", "Synthetic")
+	conv, err := st.EnsureConversation(t.Context(), src.ID, "INBOX|1", "Synthetic")
 	requirements.NoError(err)
 	id, err := st.UpsertMessage(&store.Message{SourceID: src.ID, ConversationID: conv, SourceMessageID: "INBOX|1", MessageType: "email", RFC822MessageID: sql.NullString{String: "<Case-Sensitive-ID@example.test>", Valid: true}})
 	requirements.NoError(err)

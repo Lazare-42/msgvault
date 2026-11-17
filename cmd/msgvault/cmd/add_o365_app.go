@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 	imapclient "go.kenn.io/msgvault/internal/imap"
@@ -84,7 +85,7 @@ func runAddO365App(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("app-only IMAP verification failed for %s: %w", mailbox, err)
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(invocationFromCommand(cmd))
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(cmd.Context(), invocationFromCommand(cmd))
 	if err != nil {
 		return err
 	}
@@ -104,7 +105,7 @@ func runAddO365App(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if source != nil {
-		if err := s.UpdateSourceIdentifier(source.ID, identifier); err != nil {
+		if err := s.UpdateSourceIdentifier(cmd.Context(), source.ID, identifier); err != nil {
 			return fmt.Errorf("update source identifier: %w", err)
 		}
 	} else {
@@ -118,13 +119,13 @@ func runAddO365App(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("serialize config: %w", err)
 	}
-	if err := s.UpdateSourceSyncConfig(source.ID, cfgJSON); err != nil {
+	if err := s.UpdateSourceSyncConfig(cmd.Context(), source.ID, cfgJSON); err != nil {
 		return fmt.Errorf("store config: %w", err)
 	}
 	if err := s.UpdateSourceDisplayName(source.ID, mailbox); err != nil {
 		return fmt.Errorf("set display name: %w", err)
 	}
-	if err := runPostSourceCreateMigrationsForInvocation(s, invocationFromCommand(cmd)); err != nil {
+	if err := runPostSourceCreateMigrationsForInvocation(cmd.Context(), s, invocationFromCommand(cmd)); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
@@ -140,4 +141,19 @@ func runAddO365App(cmd *cobra.Command, args []string) error {
 
 func init() {
 	rootCmd.AddCommand(newAddO365AppCmd())
+}
+
+// isMicrosoftIMAPSource reports whether src is an IMAP source already
+// configured for Microsoft XOAUTH2 with the given username, so a
+// password-auth source sharing the display name is never repointed.
+func isMicrosoftIMAPSource(src *store.Source, email string) bool {
+	if !src.SyncConfig.Valid {
+		return false
+	}
+	cfg, err := imapclient.ConfigFromJSON(src.SyncConfig.String)
+	if err != nil {
+		return false
+	}
+	return cfg.EffectiveAuthMethod() == imapclient.AuthXOAuth2 &&
+		strings.EqualFold(cfg.Username, email)
 }

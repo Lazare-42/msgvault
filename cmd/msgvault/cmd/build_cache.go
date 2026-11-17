@@ -2416,7 +2416,7 @@ func rebuildCacheAfterManualSync(dbPath string, state *invocation) error {
 // which writes into an explicit --into archive home that may differ from
 // (or not even be) the process's own MSGVAULT_HOME. Takes analyticsDir
 // explicitly instead of reading cfg.AnalyticsDir().
-func rebuildCacheForHome(dbPath, analyticsDir string) error {
+func rebuildCacheForHome(ctx context.Context, dbPath, analyticsDir string) error {
 	if store.IsPostgresURL(dbPath) {
 		return nil
 	}
@@ -2424,7 +2424,7 @@ func rebuildCacheForHome(dbPath, analyticsDir string) error {
 	if !staleness.NeedsBuild {
 		return nil
 	}
-	result, err := buildCacheAuto(dbPath, analyticsDir)
+	result, err := buildCacheAuto(ctx, dbPath, analyticsDir)
 	if err != nil {
 		return fmt.Errorf("refresh analytics cache: %w", err)
 	}
