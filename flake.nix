@@ -34,10 +34,10 @@
         # Scoped to msgvault only — do NOT export via overlay, that would
         # invalidate every Go derivation in the transitive closure.
         goPinned = pkgs.go_1_26.overrideAttrs (old: rec {
-          version = "1.27.3";
+          version = "1.27.4";
           src = pkgs.fetchurl {
             url = "https://go.dev/dl/go${version}.src.tar.gz";
-            hash = "sha256-bndJA1zzYPBrJXXRYup535/ajvZxiJ5cN1+OUHd/Jrs=";
+            hash = "sha256-c8+4VxrsDAEXdofbhxY9Rqog6XeWcncokaoXZU2aYJk=";
           };
           patches =
             builtins.filter (

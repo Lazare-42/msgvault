@@ -10,10 +10,10 @@
 }:
 let
   version = "0.22.0";
-  kitUIURL = "https://github.com/kenn-io/kit-ui/archive/1bd3bb05ac0fbb0dba8b6372ba53106380e64632.tar.gz";
+  kitUIURL = "https://github.com/kenn-io/kit-ui/archive/e0bd6e90bafac377a40a3fc3b284fb6e81e33c6e.tar.gz";
   kitUI = fetchurl {
     url = kitUIURL;
-    hash = "sha512-N2c0xfkx6uZTSfdslAZqdpk0/AUQ7eadMxoBzW8SKT6WI4PXXyOmA1Vdd6iJx9x9LSXkxHQwMISvCQLFxoZhgg==";
+    hash = "sha512-qbckMb/L6quQyBJtY16IArc7xRItI5RxOHndv0q5x8f2Grc7C9wSDRux83rp0UzwlFQ/xim5IxrosU491HvEfA==";
   };
 in
 buildGoModule {
@@ -22,7 +22,7 @@ buildGoModule {
 
   src = gitignoreSource ../.;
 
-  vendorHash = "sha256-sdIziX/FkUbAoRQfzkdmopyY6EaEYzigJGJdwGjPyUc=";
+  vendorHash = "sha256-qOZ07oqAPjHDJyAyGeDebbOdgUDzkO6ZRzjtCfs97ZA=";
   proxyVendor = true;
 
   # Bun's copyfile backend can install incomplete packages when fetchBunDeps'
