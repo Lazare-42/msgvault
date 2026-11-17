@@ -114,6 +114,44 @@ type StatusError struct {
 
 func (e *StatusError) Error() string { return e.msg }
 
+// DraftManager provides composed drafts and sending for live mail clients.
+type DraftManager interface {
+	// ListDrafts returns drafts matching the optional query.
+	ListDrafts(ctx context.Context, query string, maxResults int) ([]*ComposedDraft, error)
+
+	// GetDraft returns a single draft by ID.
+	GetDraft(ctx context.Context, draftID string) (*ComposedDraft, error)
+
+	// CreateDraft creates a new draft. If threadID is non-empty, the draft
+	// is created as a reply within that thread.
+	CreateDraft(ctx context.Context, draft *DraftCompose) (*ComposedDraft, error)
+
+	// UpdateDraft replaces the content of an existing draft.
+	UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*ComposedDraft, error)
+
+	// DeleteDraft permanently deletes a draft.
+	DeleteDraft(ctx context.Context, draftID string) error
+
+	// SendDraft sends a draft. The draft is removed from drafts and a
+	// message is created in the sent folder.
+	SendDraft(ctx context.Context, draftID string) (*SentMessage, error)
+}
+
+// LabelManager provides operations for modifying Gmail labels on messages.
+type LabelManager interface {
+	// ModifyMessageLabels adds and/or removes labels on a single message.
+	ModifyMessageLabels(ctx context.Context, messageID string, addLabelIDs, removeLabelIDs []string) error
+
+	// BatchModifyLabels adds and/or removes labels on multiple messages (max 1000).
+	BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error
+
+	// CreateLabel creates a new user label and returns it.
+	CreateLabel(ctx context.Context, name string) (*Label, error)
+
+	// DeleteLabel permanently deletes a user label. Messages with this label are not deleted.
+	DeleteLabel(ctx context.Context, labelID string) error
+}
+
 // API defines the interface for Gmail operations.
 // This interface enables mocking for tests without hitting the real API.
 type API interface {
@@ -163,6 +201,7 @@ type RawMessage struct {
 	ID           string
 	ThreadID     string
 	LabelIDs     []string
+	FlagLabels   []string // labels derived from per-message flags (IMAP); subset of LabelIDs
 	Snippet      string
 	HistoryID    uint64
 	InternalDate int64 // Unix milliseconds
@@ -190,6 +229,7 @@ var ErrMessageGone = errors.New("message no longer present in the mailbox")
 type MessageLabelsBatchResult struct {
 	ID              string
 	LabelIDs        []string
+	FlagLabels      []string // labels derived from per-message flags (IMAP); subset of LabelIDs
 	RFC822MessageID string
 	Err             error
 }
@@ -229,4 +269,77 @@ type MessageRelocationTarget struct {
 	SourceMessageID    string // Expected old archived composite ID.
 	RFC822MessageID    string
 	NewSourceMessageID string
+}
+
+// ComposedDraft represents a Gmail draft with its message content.
+type ComposedDraft struct {
+	ID      string // Draft ID (used for update/send/delete)
+	Message DraftMessage
+}
+
+// DraftMessage contains the parsed fields of a draft's message.
+type DraftMessage struct {
+	ID       string // Message ID
+	ThreadID string
+	LabelIDs []string
+	Snippet  string
+	From     string
+	ReplyTo  []string // Reply destinations, independent of conversation threading.
+	To       []string
+	Cc       []string
+	Bcc      []string
+	Subject  string
+	Body     string // Plain text body (or HTML if no plain text)
+	Date     int64  // Unix milliseconds
+	// InReplyTo and References are the draft's threading headers, so callers
+	// can confirm a reply will thread under its parent.
+	InReplyTo  string
+	References string
+}
+
+// DraftCompose holds the fields for creating or updating a draft.
+type DraftCompose struct {
+	From        string   // Visible sender; empty defaults to the selected account.
+	ReplyTo     []string // nil preserves on update; an empty slice clears Reply-To.
+	To          []string
+	Cc          []string
+	Bcc         []string
+	Subject     string
+	Body        string // Email body (plain text or HTML)
+	ContentType string // "text/plain" (default) or "text/html"
+	ThreadID    string // Optional: set to reply within a thread
+
+	// InReplyTo and References make the draft a true reply rather than a
+	// new message dropped into a thread. InReplyTo is the RFC 5322
+	// Message-ID of the message being replied to (with angle brackets,
+	// e.g. "<abc@mail.gmail.com>"). References is the full reference chain
+	// (space-separated Message-IDs); when empty it defaults to InReplyTo.
+	// Setting these lets non-Gmail clients (Outlook, etc.) nest the reply
+	// correctly, which ThreadID alone does not guarantee.
+	InReplyTo  string
+	References string
+
+	Attachments []DraftAttachment // Optional file attachments
+}
+
+// DraftAttachment is a file attached to a draft. Content holds the raw
+// (un-encoded) bytes; the message builder base64-encodes them.
+type DraftAttachment struct {
+	Filename    string
+	ContentType string // MIME type; defaults to application/octet-stream
+	Content     []byte
+}
+
+// SentMessage contains the result of sending a draft.
+type SentMessage struct {
+	ID       string
+	ThreadID string
+	LabelIDs []string
+}
+
+// LiveAPI adds the fork mail-writing surface to archive access.
+type LiveAPI interface {
+	API
+	DraftManager
+	LabelManager
 }

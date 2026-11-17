@@ -27,6 +27,7 @@ import (
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/msgsegment"
 	"go.kenn.io/msgvault/internal/personscope"
 	"go.kenn.io/msgvault/internal/query"
@@ -38,6 +39,7 @@ import (
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/internal/vector/visual"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
@@ -70,6 +72,90 @@ func (f similarSearcherFunc) FindSimilar(ctx context.Context, req SimilarSearchR
 
 // toolHandler is the function signature for MCP tool handler methods.
 type toolHandler func(context.Context, toolRequest) (*toolResult, error)
+
+type mockWhatsAppClient struct {
+	status                  whatsapplive.Status
+	loginState              whatsapplive.LoginState
+	startLogin              func(context.Context) (whatsapplive.LoginState, error)
+	logout                  func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error)
+	sendMessage             func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
+	sendReaction            func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
+	createGroup             func(context.Context, whatsapplive.CreateGroupRequest) (whatsapplive.CreateGroupResult, error)
+	getGroupInfo            func(context.Context, whatsapplive.GetGroupInfoRequest) (whatsapplive.GroupInfoResult, error)
+	updateGroupParticipants func(context.Context, whatsapplive.UpdateGroupParticipantsRequest) (whatsapplive.GroupParticipantsResult, error)
+	requestHistorySync      func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error)
+}
+
+func (m *mockWhatsAppClient) Status(context.Context) (whatsapplive.Status, error) {
+	return m.status, nil
+}
+func (m *mockWhatsAppClient) Connect(context.Context) error { return nil }
+func (m *mockWhatsAppClient) Close() error                  { return nil }
+func (m *mockWhatsAppClient) StartLogin(ctx context.Context) (whatsapplive.LoginState, error) {
+	if m.startLogin != nil {
+		return m.startLogin(ctx)
+	}
+	return m.loginState, nil
+}
+func (m *mockWhatsAppClient) LoginState(context.Context) (whatsapplive.LoginState, error) {
+	return m.loginState, nil
+}
+func (m *mockWhatsAppClient) Logout(ctx context.Context, req whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+	if m.logout != nil {
+		return m.logout(ctx, req)
+	}
+	return whatsapplive.LogoutResult{}, nil
+}
+func (m *mockWhatsAppClient) SendMessage(ctx context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+	return m.sendMessage(ctx, req)
+}
+func (m *mockWhatsAppClient) SendReaction(ctx context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
+	return m.sendReaction(ctx, req)
+}
+func (m *mockWhatsAppClient) RequestHistorySync(ctx context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+	return m.requestHistorySync(ctx, req)
+}
+func (m *mockWhatsAppClient) CreateGroup(ctx context.Context, req whatsapplive.CreateGroupRequest) (whatsapplive.CreateGroupResult, error) {
+	if m.createGroup != nil {
+		return m.createGroup(ctx, req)
+	}
+	return whatsapplive.CreateGroupResult{}, nil
+}
+func (m *mockWhatsAppClient) GetGroupInfo(ctx context.Context, req whatsapplive.GetGroupInfoRequest) (whatsapplive.GroupInfoResult, error) {
+	if m.getGroupInfo != nil {
+		return m.getGroupInfo(ctx, req)
+	}
+	return whatsapplive.GroupInfoResult{}, nil
+}
+func (m *mockWhatsAppClient) UpdateGroupParticipants(ctx context.Context, req whatsapplive.UpdateGroupParticipantsRequest) (whatsapplive.GroupParticipantsResult, error) {
+	if m.updateGroupParticipants != nil {
+		return m.updateGroupParticipants(ctx, req)
+	}
+	return whatsapplive.GroupParticipantsResult{}, nil
+}
+
+type mockGoogleDocsClient struct {
+	listDocs    func(context.Context, string, string, int) ([]googledocs.File, error)
+	getDoc      func(context.Context, string, string, int) (*googledocs.Document, error)
+	appendText  func(context.Context, string, string, string) (*googledocs.AppendResult, error)
+	replaceText func(context.Context, string, string, string, string, bool) (*googledocs.ReplaceResult, error)
+}
+
+func (m *mockGoogleDocsClient) ListDocs(ctx context.Context, sourceName, query string, limit int) ([]googledocs.File, error) {
+	return m.listDocs(ctx, sourceName, query, limit)
+}
+
+func (m *mockGoogleDocsClient) GetDoc(ctx context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+	return m.getDoc(ctx, sourceName, documentID, maxChars)
+}
+
+func (m *mockGoogleDocsClient) AppendText(ctx context.Context, sourceName, documentID, text string) (*googledocs.AppendResult, error) {
+	return m.appendText(ctx, sourceName, documentID, text)
+}
+
+func (m *mockGoogleDocsClient) ReplaceText(ctx context.Context, sourceName, documentID, find, replacement string, matchCase bool) (*googledocs.ReplaceResult, error) {
+	return m.replaceText(ctx, sourceName, documentID, find, replacement, matchCase)
+}
 
 // Response types for runTool generic calls.
 type statsResponse struct {
@@ -114,17 +200,18 @@ type searchMessageRow struct {
 }
 
 type getMessageResp struct {
-	ID             int64           `json:"id"`
-	Subject        string          `json:"subject"`
-	From           []query.Address `json:"from"`
-	BodyText       string          `json:"body_text"`
-	BodyHTML       string          `json:"body_html"`
-	BodyFormat     string          `json:"body_format"`
-	BodyLength     int             `json:"body_length"`
-	BodyReturned   int             `json:"body_returned"`
-	Offset         int             `json:"offset"`
-	HasMore        bool            `json:"has_more"`
-	ConversationID int64           `json:"conversation_id"`
+	ID              int64           `json:"id"`
+	RFC822MessageID string          `json:"rfc822_message_id"`
+	Subject         string          `json:"subject"`
+	From            []query.Address `json:"from"`
+	BodyText        string          `json:"body_text"`
+	BodyHTML        string          `json:"body_html"`
+	BodyFormat      string          `json:"body_format"`
+	BodyLength      int             `json:"body_length"`
+	BodyReturned    int             `json:"body_returned"`
+	Offset          int             `json:"offset"`
+	HasMore         bool            `json:"has_more"`
+	ConversationID  int64           `json:"conversation_id"`
 }
 
 type paginatedInMessageMatches struct {
@@ -250,6 +337,605 @@ func TestErrorIsolationMiddlewarePreservesWrappedJSONRPCErrors(t *testing.T) {
 	checks.Same(protocolErr, gotProtocolErr)
 }
 
+func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 1, SourceType: "gmail", Identifier: "lazare@example.com"},
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var factoryAccount string
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Account:    "15551234567@s.whatsapp.net",
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   true,
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			factoryAccount = account
+			return client, nil
+		},
+	}
+
+	status := runTool[whatsapplive.Status](t, ToolWhatsAppStatus, h.whatsAppStatus, map[string]any{})
+	assert.Equal("15551234567@s.whatsapp.net", factoryAccount)
+	assert.True(status.Paired)
+	assert.True(status.Ready)
+	assert.Equal("15551234567@s.whatsapp.net", status.AccountJID)
+}
+
+func TestWhatsAppStartLoginReturnsQRPayload(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{Paired: false},
+			Pairing: whatsapplive.QRPairingState{
+				Active: true,
+				Code:   "test-qr-code",
+				Event:  "code",
+			},
+		},
+	}
+	h := &handlers{
+		engine:           eng,
+		whatsAppLoginURL: "https://whats.lazare.ai/work/qr",
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppStartLogin, h.whatsAppStartLogin, map[string]any{
+		"include_qr_png": false,
+		"wait_ms":        float64(0),
+	})
+	assert.True(result.NeedsPairing)
+	assert.Equal("test-qr-code", result.QRCode)
+	assert.Empty(result.QRPNGBase64)
+	assert.Equal("https://whats.lazare.ai/work/qr", result.QRPageURL)
+}
+
+func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{Paired: false},
+			Pairing: whatsapplive.QRPairingState{
+				Active: true,
+				Code:   "test-qr-code",
+				Event:  "code",
+			},
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
+	assert.Equal(t, "test-qr-code", result.QRCode)
+	assert.NotEmpty(t, result.QRPNGBase64)
+}
+
+func TestWhatsAppLoginStatusReportsPairedButNotReady(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{
+				AccountJID: "15551234567@s.whatsapp.net",
+				Paired:     true,
+				Connected:  true,
+				LoggedIn:   false,
+			},
+			Pairing: whatsapplive.QRPairingState{
+				Active: false,
+				Paired: true,
+			},
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
+	assert.True(result.AlreadyPaired)
+	assert.False(result.NeedsPairing)
+	assert.False(result.Ready)
+	assert.False(result.Status.Ready)
+	assert.True(result.NeedsReconnect)
+	assert.True(result.NeedsAuth)
+	assert.Equal(5, result.PollAfterSecs)
+}
+
+func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	var called bool
+	client := &mockWhatsAppClient{
+		logout: func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+			called = true
+			return whatsapplive.LogoutResult{}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{})
+	assert.Contains(t, resultText(t, result), "confirm=true is required")
+	assert.False(t, called)
+}
+
+func TestWhatsAppLogoutForwardsForceLocal(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.LogoutRequest
+	client := &mockWhatsAppClient{
+		logout: func(_ context.Context, req whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+			gotReq = req
+			return whatsapplive.LogoutResult{
+				StatusBefore: whatsapplive.Status{
+					AccountJID: "15551234567@s.whatsapp.net",
+					Paired:     true,
+					Connected:  true,
+				},
+				StatusAfter:         whatsapplive.Status{},
+				RemoteLogout:        true,
+				LocalSessionCleared: true,
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal("15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.LogoutResult](t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{
+		"confirm":     true,
+		"force_local": false,
+	})
+	assert.Equal("15551234567@s.whatsapp.net", gotReq.Account)
+	assert.False(gotReq.ForceLocal)
+	assert.True(result.RemoteLogout)
+	assert.True(result.LocalSessionCleared)
+}
+
+func TestSendWhatsAppMessage(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.SendMessageRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		sendMessage: func(_ context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+			gotReq = req
+			return whatsapplive.SendResult{
+				LocalRequestID:  req.LocalRequestID,
+				OutboxID:        7,
+				MessageID:       8,
+				RemoteMessageID: "remote-1",
+				ChatJID:         req.ChatID,
+				Status:          "sent",
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal("15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
+		"chat_id":          "15557654321@s.whatsapp.net",
+		"body":             "hello",
+		"local_request_id": "req-1",
+	})
+	assert.Equal("15557654321@s.whatsapp.net", gotReq.ChatID)
+	assert.Equal("hello", gotReq.Body)
+	assert.Equal("req-1", gotReq.LocalRequestID)
+	assert.Equal(int64(8), result.MessageID)
+	assert.Equal("remote-1", result.RemoteMessageID)
+}
+
+func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var called bool
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   false,
+		},
+		sendMessage: func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+			called = true
+			return whatsapplive.SendResult{}, errors.New("send should not be called")
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+		"body":    "hello",
+	})
+	assert.Contains(t, resultText(t, result), "ready=true")
+	assert.False(t, called)
+}
+
+func TestWhatsAppRequestHistorySync(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.RequestHistorySyncRequest
+	anchorTime := time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC)
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		requestHistorySync: func(_ context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			gotReq = req
+			return whatsapplive.RequestHistorySyncResult{
+				ChatJID:         req.ChatID,
+				AnchorMessageID: "anchor-msg",
+				AnchorTimestamp: anchorTime,
+				AnchorIsFromMe:  true,
+				RequestedCount:  req.Count,
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal("15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[struct {
+		whatsapplive.RequestHistorySyncResult
+
+		Message string `json:"message"`
+	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+		"count":   float64(30),
+	})
+	assert.Equal("15557654321@s.whatsapp.net", gotReq.ChatID)
+	assert.Equal(30, gotReq.Count)
+	assert.Equal("anchor-msg", result.AnchorMessageID)
+	assert.Equal(30, result.RequestedCount)
+	assert.NotEmpty(result.Message)
+}
+
+func TestWhatsAppRequestHistorySyncDefaultsCount(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.RequestHistorySyncRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{Paired: true, Connected: true, LoggedIn: true},
+		requestHistorySync: func(_ context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			gotReq = req
+			return whatsapplive.RequestHistorySyncResult{RequestedCount: req.Count}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	runTool[struct {
+		whatsapplive.RequestHistorySyncResult
+
+		Message string `json:"message"`
+	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+	})
+	assert.Equal(t, whatsapplive.DefaultHistorySyncRequestCount, gotReq.Count)
+}
+
+func TestWhatsAppRequestHistorySyncRejectsNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var called bool
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   false,
+		},
+		requestHistorySync: func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			called = true
+			return whatsapplive.RequestHistorySyncResult{}, errors.New("request should not be called")
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+	})
+	assert.Contains(t, resultText(t, result), "ready=true")
+	assert.False(t, called)
+}
+
+func TestWhatsAppRequestHistorySyncRequiresChatID(t *testing.T) {
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{Paired: true, Connected: true, LoggedIn: true},
+	}
+	h := &handlers{
+		engine: &querytest.MockEngine{},
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{})
+	assert.Contains(t, resultText(t, result), "chat_id")
+}
+
+func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.SendReactionRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		sendReaction: func(_ context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
+			gotReq = req
+			return whatsapplive.SendResult{
+				LocalRequestID: req.LocalRequestID,
+				MessageID:      req.MessageID,
+				Status:         "sent",
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal("15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppReaction, h.sendWhatsAppReaction, map[string]any{
+		"message_id":       float64(42),
+		"emoji":            "",
+		"local_request_id": "react-1",
+	})
+	assert.Equal(int64(42), gotReq.MessageID)
+	assert.Empty(gotReq.Emoji)
+	assert.Equal("react-1", gotReq.LocalRequestID)
+	assert.Equal(int64(42), result.MessageID)
+}
+
+func TestGoogleDocsHandlers(t *testing.T) {
+	t.Run("list forwards filters", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			listDocs: func(_ context.Context, sourceName, query string, limit int) ([]googledocs.File, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("roadmap", query, "query")
+				assert.Equal(7, limit, "limit")
+				return []googledocs.File{{
+					Source:     "work",
+					DocumentID: "doc-1",
+					Name:       "Roadmap",
+				}}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		files := runTool[[]googledocs.File](t, ToolListGoogleDocs, h.listGoogleDocs, map[string]any{
+			"source": "work",
+			"query":  "roadmap",
+			"limit":  float64(7),
+		})
+		require.Len(t, files, 1, "files")
+		assert.Equal("doc-1", files[0].DocumentID, "document_id")
+	})
+
+	t.Run("get returns bounded text", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal(50, maxChars, "maxChars")
+				return &googledocs.Document{
+					Source: "work", DocumentID: "doc-1", Name: "Notes",
+					Text:       "body",
+					TextLength: 4,
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		doc := runTool[googledocs.Document](t, ToolGetGoogleDoc, h.getGoogleDoc, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"max_chars":   float64(50),
+		})
+		assert.Equal("body", doc.Text, "text")
+	})
+
+	t.Run("search returns snippets", func(t *testing.T) {
+		client := &mockGoogleDocsClient{
+			listDocs: func(context.Context, string, string, int) ([]googledocs.File, error) {
+				return []googledocs.File{{
+					Source:     "work",
+					DocumentID: "doc-1",
+					Name:       "Strategy",
+				}}, nil
+			},
+			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+				assert.Equal(t, "work", sourceName, "sourceName")
+				assert.Equal(t, "doc-1", documentID, "documentID")
+				assert.Equal(t, maxGoogleDocsMaxChars, maxChars, "maxChars")
+				return &googledocs.Document{
+					Source: "work", DocumentID: "doc-1", Name: "Strategy",
+					Text:       "intro alpha beta target phrase gamma delta conclusion",
+					TextLength: 53,
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		results := runTool[[]googleDocsSearchResult](t, ToolSearchGoogleDocs, h.searchGoogleDocs, map[string]any{
+			"query":         "target",
+			"snippet_chars": float64(20),
+		})
+		require.Len(t, results, 1, "results")
+		assert.Contains(t, results[0].Snippet, "target", "snippet")
+	})
+
+	t.Run("append forwards text unchanged", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			appendText: func(_ context.Context, sourceName, documentID, text string) (*googledocs.AppendResult, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal("\nnew note", text, "text")
+				return &googledocs.AppendResult{
+					Source:        sourceName,
+					DocumentID:    documentID,
+					InsertedChars: 9,
+					Status:        "appended",
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		result := runTool[googledocs.AppendResult](t, ToolAppendGoogleDocText, h.appendGoogleDocText, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"text":        "\nnew note",
+		})
+		assert.Equal("appended", result.Status, "status")
+	})
+
+	t.Run("replace accepts explicit empty replacement", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			replaceText: func(_ context.Context, sourceName, documentID, find, replacement string, matchCase bool) (*googledocs.ReplaceResult, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal("remove me", find, "find")
+				assert.Empty(replacement, "replacement")
+				assert.True(matchCase, "matchCase")
+				return &googledocs.ReplaceResult{
+					Source:             sourceName,
+					DocumentID:         documentID,
+					OccurrencesChanged: 2,
+					Status:             "replaced",
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		result := runTool[googledocs.ReplaceResult](t, ToolReplaceGoogleDocText, h.replaceGoogleDocText, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"find":        "remove me",
+			"replacement": "",
+			"match_case":  true,
+		})
+		assert.Equal(int64(2), result.OccurrencesChanged, "occurrences_changed")
+	})
+}
+
 func TestSearchMetadata(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
@@ -267,6 +953,13 @@ func TestSearchMetadata(t *testing.T) {
 		assert.Equal("thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
 		assert.Equal(int64(99), resp.Data[0].ConversationID, "conversation_id")
 		assert.Equal(int64(1), resp.Total, "total")
+	})
+
+	t.Run("full results when requested", func(t *testing.T) {
+		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice", "full": true})
+		if len(resp.Data) != 1 || resp.Data[0].Subject != "Hello" {
+			t.Fatalf("unexpected result: %v", resp.Data)
+		}
 	})
 
 	t.Run("missing query", func(t *testing.T) {
@@ -1987,6 +2680,46 @@ func TestGetMessage(t *testing.T) {
 		assert.Equal(t, []query.Address{{Email: "sender@example.com", Name: "Test Sender"}}, msg.From)
 	})
 
+	// TestGetMessage/exposes_rfc822_message_id_for_reply_threading locks in
+	// the fix for a real threading bug: create_draft's in_reply_to parameter
+	// needs the RFC 5322 Message-ID of the message being replied to, and its
+	// own tool description says to get that from get_message — but the field
+	// was fetched by the query engine and then silently dropped before the
+	// MCP response was built, so no caller could ever construct a correct
+	// in_reply_to, and replies threaded only on thread_id, which the
+	// codebase's own gmail.DraftCompose.InReplyTo doc comment already says
+	// "does not guarantee" correct threading. Uses the real query engine, not
+	// a mock, so this proves the whole path: sql.NullString column ->
+	// query.MessageSummary -> getMessageResponse -> JSON.
+	t.Run("exposes rfc822_message_id for reply threading", func(t *testing.T) {
+		f := storetest.New(t)
+		const wantMessageID = "<original-msg-abc123@mail.gmail.com>"
+		messageID := f.NewMessage().
+			WithSourceMessageID("thread-original").
+			WithSubject("Original message").
+			Create(t, f.Store)
+		_, err := f.Store.DB().Exec(f.Store.Rebind(
+			`UPDATE messages SET rfc822_message_id = ? WHERE id = ?`,
+		), wantMessageID, messageID)
+		require.NoError(t, err, "set rfc822_message_id")
+
+		realHandlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
+		msg := runTool[getMessageResp](t, "get_message", realHandlers.getMessage, map[string]any{"id": float64(messageID)})
+		assert.Equal(t, wantMessageID, msg.RFC822MessageID, "rfc822_message_id, angle brackets included, ready for in_reply_to")
+	})
+
+	t.Run("rfc822_message_id omitted when the source never carried one", func(t *testing.T) {
+		f := storetest.New(t)
+		messageID := f.NewMessage().
+			WithSourceMessageID("no-message-id-header").
+			WithSubject("Message without a Message-ID header").
+			Create(t, f.Store)
+
+		realHandlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
+		msg := runTool[getMessageResp](t, "get_message", realHandlers.getMessage, map[string]any{"id": float64(messageID)})
+		assert.Empty(t, msg.RFC822MessageID)
+	})
+
 	t.Run("html-only body returns html slice", func(t *testing.T) {
 		assert := assert.New(t)
 		htmlBody := "<p>Hello <strong>world</strong></p>"
@@ -2389,6 +3122,16 @@ func TestListMessages(t *testing.T) {
 		require.Len(t, resp.Data, 1, "data")
 		assert.Equal(t, "thread-list", resp.Data[0].SourceConversationID, "SourceConversationID")
 		assert.False(t, resp.HasMore, "has_more")
+	})
+
+	t.Run("full results when requested", func(t *testing.T) {
+		resp := runTool[paginatedListMessages](t, "list_messages", h.listMessages, map[string]any{
+			"from": "alice@example.com",
+			"full": true,
+		})
+		if len(resp.Data) != 1 || resp.Data[0].SourceConversationID != "thread-list" {
+			t.Fatalf("unexpected result: %v", resp.Data)
+		}
 	})
 
 	errorCases := []struct {
@@ -4388,4 +5131,288 @@ func TestHTTPCallsSkipFamilyDiscovery(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
 	assert.Zero(t, probes)
+}
+
+// TestResolveDraftAttachments_UsesAttachmentReaderOverLocalDisk locks in the
+// fix for a real production failure: on a daemon-routed MCP server, archived
+// attachments can live in packed storage with no loose file on this
+// process's own disk, and only attachmentReader.ReadAttachment knows how to
+// fetch packed content (get_attachment and export_attachment already go
+// through attachmentService, which prefers the reader; create_draft's
+// resolveDraftAttachments used to call a separate readAttachmentFile that
+// only ever did a raw os.Open under attachmentsDir, so any packed attachment
+// 404'd there even though export_attachment could read the exact same bytes
+// moments earlier). Also locks in that the "no local directory" guard checks
+// the reader too, not just attachmentsDir, matching attachmentService.load.
+func TestResolveDraftAttachments_UsesAttachmentReaderOverLocalDisk(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	content := []byte("packed-only content, no loose file on this disk")
+
+	var gotHash string
+	h := &handlers{
+		engine: &querytest.MockEngine{
+			Attachments: map[int64]*query.AttachmentInfo{
+				9001: {ID: 9001, Filename: "constat.pdf", MimeType: "application/pdf", Size: int64(len(content)), ContentHash: hash},
+			},
+		},
+		// Deliberately empty: a daemon-routed server has no local attachments
+		// directory of its own. If resolveDraftAttachments (or its guard)
+		// regresses to requiring attachmentsDir, this must fail, not silently
+		// pass by reading some other directory.
+		attachmentsDir: "",
+		attachmentReader: attachmentReaderFunc(func(_ context.Context, contentHash string) ([]byte, error) {
+			gotHash = contentHash
+			return content, nil
+		}),
+	}
+
+	atts, err := h.resolveDraftAttachments(context.Background(), map[string]any{"attachment_ids": "9001"})
+	require.NoError(err, "resolveDraftAttachments")
+	require.Len(atts, 1)
+	assert.Equal(hash, gotHash, "content hash passed to the reader")
+	assert.Equal("constat.pdf", atts[0].Filename)
+	assert.Equal("application/pdf", atts[0].ContentType)
+	assert.Equal(content, atts[0].Content)
+}
+
+// TestResolveDraftAttachments_NeitherReaderNorDirectoryConfigured proves the
+// guard still rejects attach requests when there is truly no way to read
+// attachment bytes — the fix for the above must not turn this into a silent
+// success or a nil-pointer panic.
+func TestResolveDraftAttachments_NeitherReaderNorDirectoryConfigured(t *testing.T) {
+	require := require.New(t)
+	h := &handlers{
+		engine: &querytest.MockEngine{
+			Attachments: map[int64]*query.AttachmentInfo{
+				1: {ID: 1, Filename: "x.pdf", MimeType: "application/pdf", Size: 3, ContentHash: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"},
+			},
+		},
+	}
+
+	_, err := h.resolveDraftAttachments(context.Background(), map[string]any{"attachment_ids": "1"})
+	require.Error(err)
+	assert.Contains(t, err.Error(), "attachments directory not configured")
+}
+
+// TestResolveDraftAttachments_NewAttachmentBase64 proves a brand-new file
+// that has never been archived — the real blocker this feature fixes, e.g.
+// a scan that only ever existed on local disk — can be attached to a draft
+// via "new_attachments" base64 content, producing a gmail.DraftAttachment
+// with the caller-supplied filename, MIME type, and decoded bytes. It also
+// locks in that no archive access (engine/attachmentsDir/attachmentReader)
+// is required when only new_attachments are supplied: a draft with no
+// attachment_ids reference should never need the local archive at all.
+func TestResolveDraftAttachments_NewAttachmentBase64(t *testing.T) {
+	require := require.New(t)
+	content := []byte("brand new pdf bytes, never archived")
+
+	h := &handlers{} // deliberately no engine, attachmentsDir, or attachmentReader
+
+	atts, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+		"new_attachments": []any{
+			map[string]any{
+				"filename":       "policy-scan.pdf",
+				"mime_type":      "application/pdf",
+				"content_base64": base64.StdEncoding.EncodeToString(content),
+			},
+		},
+	})
+	require.NoError(err)
+	require.Len(atts, 1)
+	assert.Equal(t, "policy-scan.pdf", atts[0].Filename)
+	assert.Equal(t, "application/pdf", atts[0].ContentType)
+	assert.Equal(t, content, atts[0].Content)
+}
+
+// TestResolveDraftAttachments_NewAttachmentDefaultsMimeType proves mime_type
+// is optional: writeDraftAttachment already defaults an empty ContentType to
+// application/octet-stream at MIME build time, so resolveDraftAttachments
+// must not invent a default itself.
+func TestResolveDraftAttachments_NewAttachmentDefaultsMimeType(t *testing.T) {
+	require := require.New(t)
+	h := &handlers{}
+
+	atts, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+		"new_attachments": []any{
+			map[string]any{
+				"filename":       "notes.txt",
+				"content_base64": base64.StdEncoding.EncodeToString([]byte("hello")),
+			},
+		},
+	})
+	require.NoError(err)
+	require.Len(atts, 1)
+	assert.Empty(t, atts[0].ContentType)
+}
+
+func TestResolveDraftAttachments_NewAttachmentValidation(t *testing.T) {
+	validBase64 := base64.StdEncoding.EncodeToString([]byte("x"))
+
+	tests := []struct {
+		name    string
+		args    map[string]any
+		wantErr string
+	}{
+		{
+			name:    "not an array",
+			args:    map[string]any{"new_attachments": "policy.pdf"},
+			wantErr: "new_attachments must be an array",
+		},
+		{
+			name:    "item not an object",
+			args:    map[string]any{"new_attachments": []any{"policy.pdf"}},
+			wantErr: "new_attachments[0]: must be an object",
+		},
+		{
+			name: "missing filename",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"content_base64": validBase64},
+			}},
+			wantErr: "new_attachments[0]: filename is required",
+		},
+		{
+			name: "blank filename",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"filename": "   ", "content_base64": validBase64},
+			}},
+			wantErr: "new_attachments[0]: filename is required",
+		},
+		{
+			name: "missing content_base64",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"filename": "a.txt"},
+			}},
+			wantErr: "new_attachments[0]: content_base64 is required",
+		},
+		{
+			name: "invalid base64",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"filename": "a.txt", "content_base64": "not-valid-base64!!"},
+			}},
+			wantErr: "new_attachments[0]: content_base64 is invalid",
+		},
+		{
+			name: "invalid mime_type",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"filename": "a.txt", "content_base64": validBase64, "mime_type": "totally not a mime type"},
+			}},
+			wantErr: "new_attachments[0]: invalid mime_type",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &handlers{}
+			_, err := h.resolveDraftAttachments(context.Background(), tc.args)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestResolveDraftAttachments_NewAttachmentSizeLimits proves new_attachments
+// bytes are checked against the same maxAttachmentSize (per file) and
+// maxDraftAttachmentsSize (combined) caps as archived attachment_ids, per
+// file — not a separate, looser budget for freshly uploaded content.
+func TestResolveDraftAttachments_NewAttachmentSizeLimits(t *testing.T) {
+	t.Run("single file over the combined draft cap", func(t *testing.T) {
+		require := require.New(t)
+		h := &handlers{}
+		content := make([]byte, maxDraftAttachmentsSize+1)
+
+		_, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+			"new_attachments": []any{
+				map[string]any{"filename": "huge.bin", "content_base64": base64.StdEncoding.EncodeToString(content)},
+			},
+		})
+		require.Error(err)
+		assert.Contains(t, err.Error(), "total attachment size exceeds")
+	})
+
+	t.Run("single file over the absolute per-file cap", func(t *testing.T) {
+		require := require.New(t)
+		h := &handlers{}
+		content := make([]byte, maxAttachmentSize+1)
+
+		_, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+			"new_attachments": []any{
+				map[string]any{"filename": "huge.bin", "content_base64": base64.StdEncoding.EncodeToString(content)},
+			},
+		})
+		require.Error(err)
+		assert.Contains(t, err.Error(), "attachment too large")
+	})
+
+	t.Run("archived plus new together trip the combined cap", func(t *testing.T) {
+		require := require.New(t)
+		hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+		archivedContent := make([]byte, maxDraftAttachmentsSize-100)
+		h := &handlers{
+			engine: &querytest.MockEngine{
+				Attachments: map[int64]*query.AttachmentInfo{
+					1: {ID: 1, Filename: "big.zip", MimeType: "application/zip", Size: int64(len(archivedContent)), ContentHash: hash},
+				},
+			},
+			attachmentReader: attachmentReaderFunc(func(context.Context, string) ([]byte, error) {
+				return archivedContent, nil
+			}),
+		}
+		newContent := make([]byte, 1000) // pushes the running total over the cap
+
+		_, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+			"attachment_ids": "1",
+			"new_attachments": []any{
+				map[string]any{"filename": "extra.bin", "content_base64": base64.StdEncoding.EncodeToString(newContent)},
+			},
+		})
+		require.Error(err)
+		assert.Contains(t, err.Error(), "total attachment size exceeds")
+	})
+}
+
+// TestResolveDraftAttachments_ArchivedAndNewCombined proves a draft can
+// attach both an already-archived file (attachment_ids) and a brand-new
+// upload (new_attachments) in the same call, each resolved through its own
+// path but landing in one combined attachment list.
+func TestResolveDraftAttachments_ArchivedAndNewCombined(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	archivedContent := []byte("previously archived attachment bytes")
+	newContent := []byte("brand new never-archived attachment bytes")
+
+	var gotHash string
+	h := &handlers{
+		engine: &querytest.MockEngine{
+			Attachments: map[int64]*query.AttachmentInfo{
+				9001: {ID: 9001, Filename: "id-card.jpg", MimeType: "image/jpeg", Size: int64(len(archivedContent)), ContentHash: hash},
+			},
+		},
+		attachmentReader: attachmentReaderFunc(func(_ context.Context, contentHash string) ([]byte, error) {
+			gotHash = contentHash
+			return archivedContent, nil
+		}),
+	}
+
+	atts, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+		"attachment_ids": "9001",
+		"new_attachments": []any{
+			map[string]any{
+				"filename":       "insurance-form.pdf",
+				"mime_type":      "application/pdf",
+				"content_base64": base64.StdEncoding.EncodeToString(newContent),
+			},
+		},
+	})
+	require.NoError(err)
+	require.Len(atts, 2)
+	assert.Equal(hash, gotHash)
+	assert.Equal("id-card.jpg", atts[0].Filename)
+	assert.Equal("image/jpeg", atts[0].ContentType)
+	assert.Equal(archivedContent, atts[0].Content)
+	assert.Equal("insurance-form.pdf", atts[1].Filename)
+	assert.Equal("application/pdf", atts[1].ContentType)
+	assert.Equal(newContent, atts[1].Content)
 }

@@ -95,7 +95,7 @@ func TestInitSchemaContext_FreshSQLiteCommitsTogether(t *testing.T) {
 	})
 	var synchronous int
 	require.NoError(s.db.QueryRowContext(t.Context(), "PRAGMA synchronous").Scan(&synchronous))
-	require.Equal(2, synchronous, "use production FULL durability")
+	require.Equal(1, synchronous, "use production NORMAL durability (fork: see defaultSQLiteParams)")
 	before := commits.Load()
 	require.NoError(s.InitSchemaContext(t.Context()))
 	assert.Equal(int64(1), setupCommits.Load()-before, "commit setup once before planner maintenance")

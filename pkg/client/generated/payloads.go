@@ -110,6 +110,8 @@ type SearchFilesBody = FileSearchHTTPRequest
 
 type SuggestFilesBody = FileSuggestionHTTPRequest
 
+type SearchAttachmentTextBody = OcrSearchRequest
+
 type LinkIdentityParticipantsBody = IdentityLinkRequest
 
 type ReviewAcceptIdentityMatchCandidateBody = DecideIdentityMatchReviewedRequest

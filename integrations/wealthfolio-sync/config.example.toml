@@ -1,0 +1,25 @@
+msgvault_home = "~/.msgvault"
+output_dir = "~/.msgvault/wealthfolio-outbox"
+state_file = "~/.msgvault/wealthfolio-sync-state.json"
+page_size = 100
+
+[delivery]
+rsync_target = "wealthfolio@prod:/srv/wealthfolio/maildrop/incoming/"
+rsync_args = ["-a", "--mkpath"]
+
+[[rule]]
+name = "hsbc-checking"
+query = 'label:"Statements/ToImport" from:alerts@hsbc.fr has:attachment'
+msgvault_account = "you@example.com"
+wealthfolio_account_id = "acc_hsbc_checking"
+attachment_filename_regex = '(?i)hsbc|releve.*\.pdf$'
+subject_regex = '(?i)releve'
+max_messages = 50
+
+[[rule]]
+name = "ibkr-taxable"
+query = 'label:"Statements/ToImport" from:statements@interactivebrokers.com has:attachment'
+msgvault_account = "you@example.com"
+wealthfolio_account_id = "acc_ibkr_taxable"
+attachment_filename_regex = '(?i)ibkr|interactivebrokers.*\.pdf$'
+max_messages = 50

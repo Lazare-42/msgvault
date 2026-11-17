@@ -7,15 +7,20 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	stdmime "mime"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/skip2/go-qrcode"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/msgsegment"
 	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/personscope"
@@ -30,6 +35,7 @@ import (
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/internal/vector/visual"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
@@ -74,6 +80,15 @@ const (
 	maxBodyChars = 4000
 	// maxContextSnippets is the maximum number of match excerpts returned for a single message.
 	maxContextSnippets = 5
+
+	defaultGoogleDocsListLimit    = 20
+	defaultGoogleDocsSearchLimit  = 10
+	defaultGoogleDocsSnippetChars = 1000
+	defaultGoogleDocsMaxChars     = 20000
+	maxGoogleDocsListLimit        = 100
+	maxGoogleDocsSearchLimit      = 20
+	maxGoogleDocsSnippetChars     = 4000
+	maxGoogleDocsMaxChars         = 100000
 	// totalCountUnknown is returned when the backend cannot report a full match
 	// count (hybrid/vector ranking depth, or list_messages without a separate
 	// count query). Clients should use has_more for paging.
@@ -162,6 +177,12 @@ type handlers struct {
 	drafts               DraftRunner
 	contactRoutesBackend ContactRoutesBackend
 	chatDiscoveryBackend ChatDiscoveryBackend
+	gmailFactory         GmailClientFactory
+	whatsAppFactory      WhatsAppClientFactory
+	whatsAppLoginURL     string
+	googleDocsFactory    GoogleDocsClientFactory
+	ocr                  OCRClient
+	whatsAppArchive      WhatsAppArchiveReader
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
@@ -425,6 +446,77 @@ func (h *handlers) searchPersonFiles(ctx context.Context, req toolRequest) (*too
 // servers can fetch the bytes over HTTP.
 type AttachmentReader interface {
 	ReadAttachment(ctx context.Context, contentHash string) ([]byte, error)
+}
+
+type OCRClient interface {
+	OCRStatus(ctx context.Context) (*store.OCRRuntimeStatus, error)
+	SearchOCR(ctx context.Context, query string, limit int) ([]store.OCRSearchHit, error)
+	GetOCRResult(ctx context.Context, hash string, includePages bool) (*store.OCRResult, error)
+	RequestOCR(ctx context.Context, hash string, fingerprint string) (*store.OCRResult, error)
+}
+
+// readAttachmentFile loads a content-addressed attachment for draft uploads.
+// It shares attachmentService.read rather than opening h.attachmentsDir
+// directly: on a daemon-routed MCP server (h.attachmentReader set), the
+// archive's attachments may live in packed storage with no loose file on
+// this process's own disk at all, and only attachmentReader.ReadAttachment
+// knows how to fetch packed content. A direct os.Open here would 404 on any
+// attachment that has been packed, which export_attachment and get_attachment
+// (both already routed through attachmentService) do not.
+func (h *handlers) readAttachmentFile(ctx context.Context, contentHash string) ([]byte, error) {
+	data, err := h.attachmentService().read(ctx, contentHash, maxAttachmentSize)
+	if err != nil {
+		if unavailable, ok := errors.AsType[*attachmentUnavailableError](err); ok {
+			return nil, errors.New(unavailable.message)
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+func (h *handlers) getOCRStatus(ctx context.Context, _ toolRequest) (*toolResult, error) {
+	status, err := h.ocr.OCRStatus(ctx)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("get OCR status: %v", err)), nil
+	}
+	return jsonResult(status)
+}
+
+func (h *handlers) searchAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
+	args := request.GetArguments()
+	query, _ := args["query"].(string)
+	if strings.TrimSpace(query) == "" {
+		return toolErrorResult("query is required"), nil
+	}
+	hits, err := h.ocr.SearchOCR(ctx, query, limitArg(args, "limit", 20))
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("search attachment text: %v", err)), nil
+	}
+	return jsonResult(hits)
+}
+
+func (h *handlers) getAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
+	hash, _ := request.GetArguments()["content_hash"].(string)
+	if strings.TrimSpace(hash) == "" {
+		return toolErrorResult("content_hash is required"), nil
+	}
+	result, err := h.ocr.GetOCRResult(ctx, hash, true)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("get attachment text: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) requestAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
+	hash, _ := request.GetArguments()["content_hash"].(string)
+	if strings.TrimSpace(hash) == "" {
+		return toolErrorResult("content_hash is required"), nil
+	}
+	result, err := h.ocr.RequestOCR(ctx, hash, "")
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("request attachment text: %v", err)), nil
+	}
+	return jsonResult(result)
 }
 
 // DeletionManifestSaver persists staged deletion manifests. It is optional:
@@ -720,6 +812,141 @@ type searchMessageItem struct {
 	Matches          []messageMatch        `json:"matches,omitempty"`
 	MatchesTruncated bool                  `json:"matches_truncated,omitzero"`
 	Score            *hybridScoreBreakdown `json:"score,omitzero"`
+}
+
+// maxDraftAttachmentsSize caps the combined raw size of attachments on a single
+// draft, applied uniformly whether the bytes come from an already-archived
+// attachment (attachment_ids) or a freshly uploaded one (new_attachments).
+// Gmail's API caps the fully MIME-encoded message at 35MB
+// (https://developers.google.com/workspace/gmail/api/guides/uploads); base64
+// inflates raw content by ~33%, so the raw total must stay below that ceiling.
+const maxDraftAttachmentsSize = 18 * 1024 * 1024
+
+// newDraftAttachmentInput is one validated element of the "new_attachments"
+// tool argument, prior to base64 decoding. Decoding happens in
+// resolveDraftAttachments so every attachment — archived or new — is checked
+// against the same running maxDraftAttachmentsSize total in one place.
+type newDraftAttachmentInput struct {
+	filename      string
+	mimeType      string
+	contentBase64 string
+}
+
+// parseNewAttachmentArgs validates the shape of the "new_attachments" array
+// argument (create_draft/update_draft): each element must be an object with
+// a non-empty filename and content_base64, and an optional, well-formed
+// mime_type. Returns (nil, nil) when the argument is absent.
+func parseNewAttachmentArgs(args map[string]any) ([]newDraftAttachmentInput, error) {
+	raw, found := args["new_attachments"]
+	if !found {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, errors.New("new_attachments must be an array of {filename, mime_type, content_base64} objects")
+	}
+	inputs := make([]newDraftAttachmentInput, 0, len(items))
+	for i, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("new_attachments[%d]: must be an object with filename and content_base64", i)
+		}
+		filename := strings.TrimSpace(stringField(obj, "filename"))
+		if filename == "" {
+			return nil, fmt.Errorf("new_attachments[%d]: filename is required", i)
+		}
+		contentBase64 := stringField(obj, "content_base64")
+		if strings.TrimSpace(contentBase64) == "" {
+			return nil, fmt.Errorf("new_attachments[%d]: content_base64 is required", i)
+		}
+		mimeType := strings.TrimSpace(stringField(obj, "mime_type"))
+		if mimeType != "" {
+			if _, _, err := stdmime.ParseMediaType(mimeType); err != nil {
+				return nil, fmt.Errorf("new_attachments[%d]: invalid mime_type %q: %w", i, mimeType, err)
+			}
+		}
+		inputs = append(inputs, newDraftAttachmentInput{filename: filename, mimeType: mimeType, contentBase64: contentBase64})
+	}
+	return inputs, nil
+}
+
+func stringField(obj map[string]any, key string) string {
+	v, _ := obj[key].(string)
+	return v
+}
+
+// resolveDraftAttachments builds the combined attachment list for a draft
+// from two independent sources: "attachment_ids", a comma-separated list of
+// IDs of attachments already in the archive (from a previously-received or
+// previously-sent message, looked up via get_message), and
+// "new_attachments", an array of files that have never been archived,
+// supplied inline as base64. A draft may use either, both, or neither.
+// Returns (nil, nil) when neither argument is provided.
+func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]any) ([]gmail.DraftAttachment, error) {
+	raw, _ := args["attachment_ids"].(string)
+	ids := splitCSV(raw)
+
+	newAttachments, err := parseNewAttachmentArgs(args)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 && len(newAttachments) == 0 {
+		return nil, nil
+	}
+	if len(ids) > 0 && h.attachmentsDir == "" && h.attachmentReader == nil {
+		return nil, errors.New("attachments directory not configured")
+	}
+
+	var atts []gmail.DraftAttachment
+	var total int64
+	for _, s := range ids {
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || id < 1 {
+			return nil, fmt.Errorf("invalid attachment_id %q: must be a positive integer", s)
+		}
+		att, err := h.engine.GetAttachment(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("get attachment %d: %w", id, err)
+		}
+		if att == nil {
+			return nil, fmt.Errorf("attachment %d not found", id)
+		}
+		data, err := h.readAttachmentFile(ctx, att.ContentHash)
+		if err != nil {
+			return nil, fmt.Errorf("attachment %d: %w", id, err)
+		}
+		total += int64(len(data))
+		if total > maxDraftAttachmentsSize {
+			return nil, fmt.Errorf("total attachment size exceeds %d bytes", maxDraftAttachmentsSize)
+		}
+		atts = append(atts, gmail.DraftAttachment{
+			Filename:    att.Filename,
+			ContentType: att.MimeType,
+			Content:     data,
+		})
+	}
+
+	for i, na := range newAttachments {
+		content, err := base64.StdEncoding.DecodeString(na.contentBase64)
+		if err != nil {
+			return nil, fmt.Errorf("new_attachments[%d]: content_base64 is invalid: %w", i, err)
+		}
+		if int64(len(content)) > maxAttachmentSize {
+			return nil, fmt.Errorf("new_attachments[%d]: attachment too large: %d bytes (max %d)", i, len(content), maxAttachmentSize)
+		}
+		total += int64(len(content))
+		if total > maxDraftAttachmentsSize {
+			return nil, fmt.Errorf("total attachment size exceeds %d bytes", maxDraftAttachmentsSize)
+		}
+		atts = append(atts, gmail.DraftAttachment{
+			Filename:    na.filename,
+			ContentType: na.mimeType,
+			Content:     content,
+		})
+	}
+
+	return atts, nil
 }
 
 // searchMessages preserves the legacy combined search tool while clients
@@ -1547,6 +1774,7 @@ type getMessageResponse struct {
 	HasMore              bool                      `json:"has_more"`
 	Labels               []string                  `json:"labels"`
 	Attachments          []query.AttachmentInfo    `json:"attachments"`
+	RFC822MessageID      string                    `json:"rfc822_message_id,omitempty"`
 }
 
 func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -1620,6 +1848,7 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 		SourceMessageID:      msg.SourceMessageID,
 		ConversationID:       msg.ConversationID,
 		SourceConversationID: msg.SourceConversationID,
+		RFC822MessageID:      msg.RFC822MessageID,
 		Subject:              msg.Subject,
 		MessageType:          msg.MessageType,
 		RelatedMessageID:     msg.RelatedMessageID,
@@ -2538,4 +2767,1122 @@ func nonNilSlice[T any](values []T) []T {
 		return []T{}
 	}
 	return values
+}
+
+// --- WhatsApp handlers ---
+
+func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (whatsapplive.Client, string, error) {
+	if h.whatsAppFactory == nil {
+		return nil, "", errors.New("WhatsApp live client not configured")
+	}
+
+	account, _ := args["account"].(string)
+	account = strings.TrimSpace(account)
+
+	accounts, err := h.engine.ListAccounts(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to list accounts: %w", err)
+	}
+	whatsAppAccounts := make([]query.AccountInfo, 0, len(accounts))
+	for _, acc := range accounts {
+		if acc.SourceType == store.WhatsAppSourceType {
+			whatsAppAccounts = append(whatsAppAccounts, acc)
+		}
+	}
+
+	if account == "" {
+		switch len(whatsAppAccounts) {
+		case 0:
+			// Allow the live client to report pairing status before the first
+			// archive source has been created.
+		case 1:
+			account = whatsAppAccounts[0].Identifier
+		default:
+			return nil, "", errors.New("multiple WhatsApp accounts configured, specify 'account' parameter")
+		}
+	} else if len(whatsAppAccounts) > 0 {
+		found := false
+		for _, acc := range whatsAppAccounts {
+			if acc.Identifier == account {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, "", fmt.Errorf("WhatsApp account not found: %s", account)
+		}
+	}
+
+	client, err := h.whatsAppFactory(ctx, account)
+	if err != nil {
+		return nil, "", fmt.Errorf("open WhatsApp client: %w", err)
+	}
+	return client, account, nil
+}
+
+func (h *handlers) whatsAppStatus(ctx context.Context, req toolRequest) (*toolResult, error) {
+	client, _, err := h.getWhatsAppClient(ctx, req.GetArguments())
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	status, err := client.Status(ctx)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("whatsapp status: %v", err)), nil
+	}
+	status.ApplyDerived()
+	return jsonResult(status)
+}
+
+type whatsappLoginClient interface {
+	StartLogin(ctx context.Context) (whatsapplive.LoginState, error)
+	LoginState(ctx context.Context) (whatsapplive.LoginState, error)
+}
+
+type whatsAppLoginResponse struct {
+	whatsapplive.LoginState
+
+	QRCode         string `json:"qr_code,omitempty"`
+	QRPNGBase64    string `json:"qr_png_base64,omitempty"`
+	QRPageURL      string `json:"qr_page_url,omitempty"`
+	PollAfterSecs  int    `json:"poll_after_secs,omitempty"`
+	Ready          bool   `json:"ready"`
+	AlreadyPaired  bool   `json:"already_paired"`
+	NeedsPairing   bool   `json:"needs_pairing"`
+	NeedsReconnect bool   `json:"needs_reconnect"`
+	NeedsAuth      bool   `json:"needs_authentication"`
+}
+
+func (h *handlers) whatsAppStartLogin(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	loginClient, err := h.getWhatsAppLoginClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	state, err := loginClient.StartLogin(ctx)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("start whatsapp login: %v", err)), nil
+	}
+
+	waitMS := boundedIntArg(args, "wait_ms", 3000, 15000)
+	if waitMS > 0 {
+		state, err = waitForWhatsAppLoginCode(ctx, loginClient, state, time.Duration(waitMS)*time.Millisecond)
+		if err != nil {
+			return toolErrorResult(fmt.Sprintf("wait for whatsapp login QR: %v", err)), nil
+		}
+	}
+	return jsonResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+}
+
+func (h *handlers) whatsAppLoginStatus(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	loginClient, err := h.getWhatsAppLoginClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	state, err := loginClient.LoginState(ctx)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("whatsapp login status: %v", err)), nil
+	}
+	return jsonResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+}
+
+func (h *handlers) whatsAppLogout(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	confirm, _ := args["confirm"].(bool)
+	if !confirm {
+		return toolErrorResult("confirm=true is required to log out WhatsApp and clear local pairing state"), nil
+	}
+	forceLocal := true
+	if v, ok := args["force_local"].(bool); ok {
+		forceLocal = v
+	}
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	result, err := client.Logout(ctx, whatsapplive.LogoutRequest{
+		Account:    account,
+		ForceLocal: forceLocal,
+	})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("whatsapp logout: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, error) {
+	client, _, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return nil, err
+	}
+	loginClient, ok := client.(whatsappLoginClient)
+	if !ok {
+		return nil, errors.New("WhatsApp live client does not support MCP login")
+	}
+	return loginClient, nil
+}
+
+func waitForWhatsAppLoginCode(ctx context.Context, client whatsappLoginClient, state whatsapplive.LoginState, wait time.Duration) (whatsapplive.LoginState, error) {
+	state.Status.ApplyDerived()
+	if wait <= 0 || state.Status.IsReady() || state.Pairing.Code != "" || state.Pairing.Error != "" || (!state.Status.Paired && !state.Pairing.Active) {
+		return state, nil
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return state, ctx.Err()
+		case <-deadline.C:
+			return state, nil
+		case <-ticker.C:
+			next, err := client.LoginState(ctx)
+			if err != nil {
+				return state, err
+			}
+			state = next
+			state.Status.ApplyDerived()
+			if state.Status.IsReady() || state.Pairing.Code != "" || state.Pairing.Error != "" || (!state.Status.Paired && !state.Pairing.Active) {
+				return state, nil
+			}
+		}
+	}
+}
+
+func (h *handlers) whatsAppLoginResponse(state whatsapplive.LoginState, includePNG bool) whatsAppLoginResponse {
+	state.Status.ApplyDerived()
+	ready := state.Status.IsReady()
+	resp := whatsAppLoginResponse{
+		LoginState:     state,
+		QRCode:         state.Pairing.Code,
+		QRPageURL:      h.whatsAppLoginURL,
+		PollAfterSecs:  5,
+		Ready:          ready,
+		AlreadyPaired:  state.Status.Paired,
+		NeedsPairing:   !state.Status.Paired,
+		NeedsReconnect: state.Status.Paired && !ready,
+		NeedsAuth:      state.Status.Paired && !state.Status.LoggedIn,
+	}
+	if ready {
+		resp.PollAfterSecs = 0
+	}
+	if includePNG && state.Pairing.Code != "" && !state.Status.Paired {
+		if png, err := qrcode.Encode(state.Pairing.Code, qrcode.Medium, 320); err == nil {
+			resp.QRPNGBase64 = base64.StdEncoding.EncodeToString(png)
+		}
+	}
+	return resp
+}
+
+func includeQRPNG(args map[string]any) bool {
+	v, ok := args["include_qr_png"].(bool)
+	return !ok || v
+}
+
+func requireWhatsAppReady(ctx context.Context, client whatsapplive.Client) error {
+	status, err := client.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("whatsapp status: %w", err)
+	}
+	status.ApplyDerived()
+	if !status.IsReady() {
+		return fmt.Errorf(
+			"whatsapp is not ready: paired=%t connected=%t logged_in=%t; run whatsapp_start_login and wait for ready=true before sending",
+			status.Paired,
+			status.Connected,
+			status.LoggedIn,
+		)
+	}
+	return nil
+}
+
+func (h *handlers) sendWhatsAppMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	chatID, _ := args["chat_id"].(string)
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return toolErrorResult("chat_id parameter is required"), nil
+	}
+	body, _ := args["body"].(string)
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return toolErrorResult("body parameter is required"), nil
+	}
+	localRequestID, _ := args["local_request_id"].(string)
+	var mentions []string
+	if raw, ok := args["mentions"].([]any); ok {
+		for _, m := range raw {
+			if s, ok := m.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					mentions = append(mentions, s)
+				}
+			}
+		}
+	}
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+
+	result, err := client.SendMessage(ctx, whatsapplive.SendMessageRequest{
+		Account:        account,
+		ChatID:         chatID,
+		Body:           body,
+		LocalRequestID: strings.TrimSpace(localRequestID),
+		Mentions:       mentions,
+	})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("send whatsapp message: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) createWhatsAppGroup(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	name, _ := args["name"].(string)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return toolErrorResult("name parameter is required"), nil
+	}
+	rawParticipants, _ := args["participants"].([]any)
+	var participants []string
+	for _, p := range rawParticipants {
+		if s, ok := p.(string); ok {
+			if s = strings.TrimSpace(s); s != "" {
+				participants = append(participants, s)
+			}
+		}
+	}
+	if len(participants) == 0 {
+		return toolErrorResult("participants parameter is required"), nil
+	}
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+
+	result, err := client.CreateGroup(ctx, whatsapplive.CreateGroupRequest{
+		Account:      account,
+		Name:         name,
+		Participants: participants,
+	})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("create whatsapp group: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) getWhatsAppGroupInfo(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	jid, _ := args["jid"].(string)
+	jid = strings.TrimSpace(jid)
+	if jid == "" {
+		return toolErrorResult("jid parameter is required"), nil
+	}
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+
+	result, err := client.GetGroupInfo(ctx, whatsapplive.GetGroupInfoRequest{Account: account, JID: jid})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("get whatsapp group info: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) updateWhatsAppGroupParticipants(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	jid, _ := args["jid"].(string)
+	jid = strings.TrimSpace(jid)
+	if jid == "" {
+		return toolErrorResult("jid parameter is required"), nil
+	}
+	action, _ := args["action"].(string)
+	action = strings.TrimSpace(action)
+	if action == "" {
+		return toolErrorResult("action parameter is required (add/remove/promote/demote)"), nil
+	}
+	rawParticipants, _ := args["participants"].([]any)
+	var participants []string
+	for _, p := range rawParticipants {
+		if s, ok := p.(string); ok {
+			if s = strings.TrimSpace(s); s != "" {
+				participants = append(participants, s)
+			}
+		}
+	}
+	if len(participants) == 0 {
+		return toolErrorResult("participants parameter is required"), nil
+	}
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+
+	result, err := client.UpdateGroupParticipants(ctx, whatsapplive.UpdateGroupParticipantsRequest{
+		Account:      account,
+		JID:          jid,
+		Participants: participants,
+		Action:       action,
+	})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("update whatsapp group participants: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) sendWhatsAppReaction(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	messageID, err := getIDArg(args, "message_id")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	emojiRaw, ok := args["emoji"]
+	if !ok {
+		return toolErrorResult("emoji parameter is required; use an empty string to clear"), nil
+	}
+	emoji, ok := emojiRaw.(string)
+	if !ok {
+		return toolErrorResult("emoji must be a string"), nil
+	}
+	localRequestID, _ := args["local_request_id"].(string)
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+
+	result, err := client.SendReaction(ctx, whatsapplive.SendReactionRequest{
+		Account:        account,
+		MessageID:      messageID,
+		Emoji:          emoji,
+		LocalRequestID: strings.TrimSpace(localRequestID),
+	})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("send whatsapp reaction: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	chatID, _ := args["chat_id"].(string)
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return toolErrorResult("chat_id parameter is required"), nil
+	}
+	count := boundedIntArg(args, "count", whatsapplive.DefaultHistorySyncRequestCount, whatsapplive.MaxHistorySyncRequestCount)
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+
+	result, err := client.RequestHistorySync(ctx, whatsapplive.RequestHistorySyncRequest{
+		Account: account,
+		ChatID:  chatID,
+		Count:   count,
+	})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("request whatsapp history sync: %v", err)), nil
+	}
+	return jsonResult(struct {
+		whatsapplive.RequestHistorySyncResult
+
+		Message string `json:"message"`
+	}{
+		RequestHistorySyncResult: result,
+		Message: "History sync requested. This is best-effort and asynchronous: WhatsApp decides " +
+			"whether to honor it, and if it does, matching older messages are archived automatically " +
+			"over the following seconds to minutes as they arrive — there is no synchronous confirmation. " +
+			"Check back later with list_messages or search_messages.",
+	})
+}
+
+// --- Google Docs handlers ---
+
+type googleDocsSearchResult struct {
+	googledocs.File
+
+	Snippet       string `json:"snippet"`
+	TextLength    int    `json:"text_length"`
+	TextTruncated bool   `json:"text_truncated"`
+}
+
+func (h *handlers) getGoogleDocsClient(ctx context.Context) (googledocs.Client, error) {
+	if h.googleDocsFactory == nil {
+		return nil, errors.New("google docs API not configured")
+	}
+	client, err := h.googleDocsFactory(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open Google Docs client: %w", err)
+	}
+	return client, nil
+}
+
+func (h *handlers) listGoogleDocs(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	files, err := client.ListDocs(
+		ctx,
+		optionalStringArg(args, "source"),
+		optionalStringArg(args, "query"),
+		boundedIntArg(args, "limit", defaultGoogleDocsListLimit, maxGoogleDocsListLimit),
+	)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("list Google Docs: %v", err)), nil
+	}
+	return jsonArrayResult("files", files)
+}
+
+func (h *handlers) searchGoogleDocs(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	query, err := requiredTrimmedStringArg(args, "query")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	limit := boundedIntArg(args, "limit", defaultGoogleDocsSearchLimit, maxGoogleDocsSearchLimit)
+	snippetChars := boundedIntArg(args, "snippet_chars", defaultGoogleDocsSnippetChars, maxGoogleDocsSnippetChars)
+	files, err := client.ListDocs(ctx, optionalStringArg(args, "source"), query, limit)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("search Google Docs: %v", err)), nil
+	}
+	results := make([]googleDocsSearchResult, 0, len(files))
+	for _, file := range files {
+		doc, err := client.GetDoc(ctx, file.Source, file.DocumentID, maxGoogleDocsMaxChars)
+		if err != nil {
+			return toolErrorResult(fmt.Sprintf("get Google Doc %s: %v", file.DocumentID, err)), nil
+		}
+		results = append(results, googleDocsSearchResult{
+			File:          file,
+			Snippet:       googleDocsSnippet(doc.Text, query, snippetChars),
+			TextLength:    doc.TextLength,
+			TextTruncated: doc.TextTruncated,
+		})
+	}
+	return jsonArrayResult("results", results)
+}
+
+func (h *handlers) getGoogleDoc(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	doc, err := client.GetDoc(
+		ctx,
+		optionalStringArg(args, "source"),
+		documentID,
+		boundedIntArg(args, "max_chars", defaultGoogleDocsMaxChars, maxGoogleDocsMaxChars),
+	)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("get Google Doc: %v", err)), nil
+	}
+	return jsonResult(doc)
+}
+
+func (h *handlers) appendGoogleDocText(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	text, err := requiredStringArg(args, "text")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	result, err := client.AppendText(ctx, optionalStringArg(args, "source"), documentID, text)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("append Google Doc text: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) replaceGoogleDocText(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	find, err := requiredStringArg(args, "find")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	replacement, err := requiredStringArgAllowEmpty(args, "replacement")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	matchCase, _ := args["match_case"].(bool)
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	result, err := client.ReplaceText(ctx, optionalStringArg(args, "source"), documentID, find, replacement, matchCase)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("replace Google Doc text: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func optionalStringArg(args map[string]any, key string) string {
+	v, _ := args[key].(string)
+	return strings.TrimSpace(v)
+}
+
+func requiredTrimmedStringArg(args map[string]any, key string) (string, error) {
+	v, err := requiredStringArg(args, key)
+	if err != nil {
+		return "", err
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func requiredStringArg(args map[string]any, key string) (string, error) {
+	v, ok := args[key].(string)
+	if !ok || v == "" {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func requiredStringArgAllowEmpty(args map[string]any, key string) (string, error) {
+	v, ok := args[key].(string)
+	if !ok {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func boundedIntArg(args map[string]any, key string, def, maxValue int) int {
+	v := limitArg(args, key, def)
+	if v <= 0 {
+		return def
+	}
+	return min(v, maxValue)
+}
+
+func googleDocsSnippet(text, query string, maxChars int) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	maxChars = min(max(maxChars, 1), maxGoogleDocsSnippetChars)
+	runes := []rune(text)
+	if len(runes) <= maxChars {
+		return text
+	}
+	needle := strings.ToLower(strings.TrimSpace(query))
+	startRune := 0
+	if needle != "" {
+		if idx := strings.Index(strings.ToLower(text), needle); idx >= 0 {
+			startRune = max(utf8.RuneCountInString(text[:idx])-maxChars/4, 0)
+		}
+	}
+	endRune := min(len(runes), startRune+maxChars)
+	snippet := string(runes[startRune:endRune])
+	if startRune > 0 {
+		snippet = "..." + snippet
+	}
+	if endRune < len(runes) {
+		snippet += "..."
+	}
+	return snippet
+}
+
+// --- Draft handlers ---
+
+// getMailClient resolves the account email and returns an authenticated mail
+// API client (Gmail OAuth or IMAP, depending on the account's source type).
+// The caller must close the returned client.
+func (h *handlers) getMailClient(ctx context.Context, args map[string]any) (gmail.LiveAPI, error) {
+	client, _, err := h.getMailClientForAccount(ctx, args)
+	return client, err
+}
+
+// getMailClientForAccount also returns the account identifier it resolved.
+func (h *handlers) getMailClientForAccount(ctx context.Context, args map[string]any) (gmail.LiveAPI, string, error) {
+	if h.gmailFactory == nil {
+		return nil, "", errors.New("live mail API not configured (Gmail OAuth credentials or an IMAP account needed)")
+	}
+
+	account, _ := args["account"].(string)
+	if account == "" {
+		// If no account specified, try to use the first/only account
+		accounts, err := h.engine.ListAccounts(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to list accounts: %w", err)
+		}
+		if len(accounts) == 0 {
+			return nil, "", errors.New("no accounts configured")
+		}
+		if len(accounts) > 1 {
+			return nil, "", errors.New("multiple accounts configured, specify 'account' parameter (use get_stats to list accounts)")
+		}
+		account = accounts[0].Identifier
+	}
+
+	client, err := h.gmailFactory(ctx, account)
+	if err != nil {
+		return nil, "", fmt.Errorf("authenticate %s: %w", account, err)
+	}
+
+	return client, account, nil
+}
+
+func (h *handlers) listDrafts(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	queryStr, _ := args["query"].(string)
+	limit := limitArg(args, "limit", 20)
+
+	drafts, err := client.ListDrafts(ctx, queryStr, limit)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("list drafts: %v", err)), nil
+	}
+
+	// Return a compact summary
+	type draftSummary struct {
+		DraftID string   `json:"draft_id"`
+		Subject string   `json:"subject"`
+		To      []string `json:"to,omitempty"`
+		Snippet string   `json:"snippet"`
+		BodyLen int      `json:"body_length"`
+	}
+
+	summaries := make([]draftSummary, len(drafts))
+	for i, d := range drafts {
+		summaries[i] = draftSummary{
+			DraftID: d.ID,
+			Subject: d.Message.Subject,
+			To:      d.Message.To,
+			Snippet: d.Message.Snippet,
+			BodyLen: len(d.Message.Body),
+		}
+	}
+
+	return jsonArrayResult("drafts", summaries)
+}
+
+func (h *handlers) getDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return toolErrorResult("draft_id parameter is required"), nil
+	}
+
+	draft, err := client.GetDraft(ctx, draftID)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("get draft: %v", err)), nil
+	}
+
+	return jsonResult(draft)
+}
+
+func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, account, err := h.getMailClientForAccount(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	body, _ := args["body"].(string)
+	if body == "" {
+		return toolErrorResult("body parameter is required"), nil
+	}
+
+	compose := &gmail.DraftCompose{
+		Body: body,
+	}
+
+	if v, ok := args["from"].(string); ok {
+		compose.From = v
+	}
+	if v, ok := args["reply_to"].(string); ok {
+		compose.ReplyTo = []string{}
+		if strings.TrimSpace(v) != "" {
+			compose.ReplyTo = []string{v}
+		}
+	}
+	if v, _ := args["to"].(string); v != "" {
+		compose.To = splitCSV(v)
+	}
+	if v, _ := args["cc"].(string); v != "" {
+		compose.Cc = splitCSV(v)
+	}
+	if v, _ := args["bcc"].(string); v != "" {
+		compose.Bcc = splitCSV(v)
+	}
+	if v, _ := args["subject"].(string); v != "" {
+		compose.Subject = v
+	}
+	if v, _ := args["content_type"].(string); v != "" {
+		compose.ContentType = v
+	}
+	if v, _ := args["thread_id"].(string); v != "" {
+		compose.ThreadID = v
+	}
+	if v, _ := args["in_reply_to"].(string); v != "" {
+		compose.InReplyTo = v
+	}
+	if v, _ := args["references"].(string); v != "" {
+		compose.References = v
+	}
+	if replyRequested(args) {
+		if err := h.applyReplyContext(ctx, args, client, account, draftSender(client, args), compose); err != nil {
+			return toolErrorResult(err.Error()), nil
+		}
+	}
+
+	atts, err := h.resolveDraftAttachments(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	compose.Attachments = atts
+
+	draft, err := client.CreateDraft(ctx, compose)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("create draft: %v", err)), nil
+	}
+
+	resp := struct {
+		DraftID     string   `json:"draft_id"`
+		Subject     string   `json:"subject"`
+		To          []string `json:"to,omitempty"`
+		Cc          []string `json:"cc,omitempty"`
+		InReplyTo   string   `json:"in_reply_to,omitempty"`
+		References  string   `json:"references,omitempty"`
+		Attachments int      `json:"attachments"`
+		NextStep    string   `json:"next_step"`
+	}{
+		DraftID:     draft.ID,
+		Subject:     draft.Message.Subject,
+		To:          compose.To,
+		Cc:          compose.Cc,
+		InReplyTo:   compose.InReplyTo,
+		References:  compose.References,
+		Attachments: len(atts),
+		NextStep:    "Use send_draft to send, update_draft to modify, or delete_draft to discard",
+	}
+
+	return jsonResult(resp)
+}
+
+func (h *handlers) updateDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return toolErrorResult("draft_id parameter is required"), nil
+	}
+
+	body, _ := args["body"].(string)
+	if body == "" {
+		return toolErrorResult("body parameter is required"), nil
+	}
+
+	compose := &gmail.DraftCompose{
+		Body: body,
+	}
+
+	if v, ok := args["from"].(string); ok {
+		compose.From = v
+	}
+	if v, ok := args["reply_to"].(string); ok {
+		compose.ReplyTo = []string{}
+		if strings.TrimSpace(v) != "" {
+			compose.ReplyTo = []string{v}
+		}
+	}
+	if v, _ := args["to"].(string); v != "" {
+		compose.To = splitCSV(v)
+	}
+	if v, _ := args["cc"].(string); v != "" {
+		compose.Cc = splitCSV(v)
+	}
+	if v, _ := args["bcc"].(string); v != "" {
+		compose.Bcc = splitCSV(v)
+	}
+	if v, _ := args["subject"].(string); v != "" {
+		compose.Subject = v
+	}
+	if v, _ := args["content_type"].(string); v != "" {
+		compose.ContentType = v
+	}
+	if v, _ := args["thread_id"].(string); v != "" {
+		compose.ThreadID = v
+	}
+	if v, _ := args["in_reply_to"].(string); v != "" {
+		compose.InReplyTo = v
+	}
+	if v, _ := args["references"].(string); v != "" {
+		compose.References = v
+	}
+
+	atts, err := h.resolveDraftAttachments(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	compose.Attachments = atts
+
+	draft, err := client.UpdateDraft(ctx, draftID, compose)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("update draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		DraftID string `json:"draft_id"`
+		Subject string `json:"subject"`
+		Status  string `json:"status"`
+	}{
+		DraftID: draft.ID,
+		Subject: draft.Message.Subject,
+		Status:  "updated",
+	})
+}
+
+func (h *handlers) deleteDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return toolErrorResult("draft_id parameter is required"), nil
+	}
+
+	if err := client.DeleteDraft(ctx, draftID); err != nil {
+		return toolErrorResult(fmt.Sprintf("delete draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		DraftID string `json:"draft_id"`
+		Status  string `json:"status"`
+	}{
+		DraftID: draftID,
+		Status:  "deleted",
+	})
+}
+
+func (h *handlers) sendDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return toolErrorResult("draft_id parameter is required"), nil
+	}
+
+	sent, err := client.SendDraft(ctx, draftID)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("send draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		MessageID string   `json:"message_id"`
+		ThreadID  string   `json:"thread_id"`
+		LabelIDs  []string `json:"label_ids"`
+		Status    string   `json:"status"`
+	}{
+		MessageID: sent.ID,
+		ThreadID:  sent.ThreadID,
+		LabelIDs:  sent.LabelIDs,
+		Status:    "sent",
+	})
+}
+
+// --- Label handlers ---
+
+func (h *handlers) modifyLabels(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	messageIDsStr, _ := args["message_ids"].(string)
+	if messageIDsStr == "" {
+		return toolErrorResult("message_ids parameter is required"), nil
+	}
+
+	addLabelsStr, _ := args["add_labels"].(string)
+	removeLabelsStr, _ := args["remove_labels"].(string)
+
+	if addLabelsStr == "" && removeLabelsStr == "" {
+		return toolErrorResult("at least one of add_labels or remove_labels is required"), nil
+	}
+
+	messageIDs := splitCSV(messageIDsStr)
+	addLabelIDs := splitCSV(addLabelsStr)
+	removeLabelIDs := splitCSV(removeLabelsStr)
+
+	if len(messageIDs) > 1 {
+		err = client.BatchModifyLabels(ctx, messageIDs, addLabelIDs, removeLabelIDs)
+	} else {
+		err = client.ModifyMessageLabels(ctx, messageIDs[0], addLabelIDs, removeLabelIDs)
+	}
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("modify labels: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		MessageCount int      `json:"message_count"`
+		Added        []string `json:"added_labels,omitempty"`
+		Removed      []string `json:"removed_labels,omitempty"`
+		Status       string   `json:"status"`
+	}{
+		MessageCount: len(messageIDs),
+		Added:        addLabelIDs,
+		Removed:      removeLabelIDs,
+		Status:       "modified",
+	})
+}
+
+func (h *handlers) createLabel(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	name, _ := args["name"].(string)
+	if name == "" {
+		return toolErrorResult("name parameter is required"), nil
+	}
+
+	label, err := client.CreateLabel(ctx, name)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("create label: %v", err)), nil
+	}
+
+	return jsonResult(label)
+}
+
+func (h *handlers) deleteLabel(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	labelID, _ := args["label_id"].(string)
+	if labelID == "" {
+		return toolErrorResult("label_id parameter is required"), nil
+	}
+
+	if err := client.DeleteLabel(ctx, labelID); err != nil {
+		return toolErrorResult(fmt.Sprintf("delete label: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		LabelID string `json:"label_id"`
+		Status  string `json:"status"`
+	}{
+		LabelID: labelID,
+		Status:  "deleted",
+	})
+}
+
+func (h *handlers) listGmailLabels(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	client, err := h.getMailClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	defer func() { _ = client.Close() }()
+
+	labels, err := client.ListLabels(ctx)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("list labels: %v", err)), nil
+	}
+
+	return jsonArrayResult("labels", labels)
+}
+
+// splitCSV splits a comma-separated string into trimmed parts.
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

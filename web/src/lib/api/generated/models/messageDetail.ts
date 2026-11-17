@@ -34,6 +34,8 @@ export interface MessageDetail {
   labels: string[];
   message_type?: string;
   related_message_id?: number;
+  /** Original Message-ID header for In-Reply-To and References when composing a reply. */
+  rfc822_message_id?: string;
   sender_auth?: SenderAuthVerdict;
   sent_at: string;
   size_bytes: number;

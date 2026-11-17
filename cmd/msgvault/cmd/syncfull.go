@@ -312,19 +312,8 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(ctx
 		), nil
 
 	case sourceTypeIMAP:
-		if !src.SyncConfig.Valid || src.SyncConfig.String == "" {
-			return nil, fmt.Errorf("IMAP source %s has no config (run 'add-imap' first)", src.Identifier)
-		}
-		imapCfg, err := imaplib.ConfigFromJSON(src.SyncConfig.String)
-		if err != nil {
-			return nil, fmt.Errorf("parse IMAP config: %w", err)
-		}
-
 		var opts []imaplib.Option
-		opts = append(opts,
-			imaplib.WithLogger(logger),
-			imaplib.WithMaxCommandsPerMinute(cfg.Sync.IMAPMaxCommandsPerMinute),
-		)
+		opts = append(opts, imaplib.WithMaxCommandsPerMinute(cfg.Sync.IMAPMaxCommandsPerMinute))
 		opts = append(opts, imapOpts...)
 
 		var since, before time.Time
@@ -346,28 +335,11 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(ctx
 			opts = append(opts, imaplib.WithDateFilter(since, before))
 		}
 
-		switch imapCfg.EffectiveAuthMethod() {
-		case imaplib.AuthXOAuth2:
-			if sourceOAuthApp(src) == "" && cfg.Microsoft.ClientID == "" {
-				return nil, errors.New("microsoft OAuth not configured — add a [microsoft] section with client_id to config.toml")
-			}
-			msMgr, err := newMicrosoftIMAPManager(cfg, logger, src)
-			if err != nil {
-				return nil, err
-			}
-			tokenFn, err := msMgr.TokenSource(ctx, imapCfg.Username)
-			if err != nil {
-				return nil, fmt.Errorf("load Microsoft token: %w (run 'add-o365' first)", err)
-			}
-			opts = append(opts, imaplib.WithTokenSource(tokenFn))
-			return imaplib.NewClient(imapCfg, "", opts...), nil
-		default:
-			password, err := imaplib.LoadCredentials(cfg.TokensDir(), src.Identifier)
-			if err != nil {
-				return nil, fmt.Errorf("load IMAP credentials: %w (run 'add-imap' first)", err)
-			}
-			return imaplib.NewClient(imapCfg, password, opts...), nil
+		syncConfig := ""
+		if src.SyncConfig.Valid {
+			syncConfig = src.SyncConfig.String
 		}
+		return buildIMAPAPIClient(ctx, src, src.Identifier, syncConfig, opts...)
 
 	default:
 		return nil, fmt.Errorf("unsupported source type %q", src.SourceType)
@@ -385,6 +357,46 @@ func configuredTrustedSentMailboxes(identifier string, cfg *config.Config) []str
 		return nil
 	}
 	return cfg.Sync.TrustedIMAPSentMailboxes[identifier]
+}
+
+// buildIMAPAPIClient constructs an IMAP-backed gmail.API client from a
+// source's sync_config JSON. Shared by the sync path (buildAPIClient) and
+// the MCP factory (buildMailFactory), which resolves accounts through the
+// daemon rather than a local *store.Source (src is then nil and the default
+// Microsoft app applies). Handles both auth models:
+// XOAUTH2 (Microsoft 365 delegated or app-only certificate flow) and
+// password (stored credentials in the tokens dir).
+func buildIMAPAPIClient(ctx context.Context, src *store.Source, identifier, syncConfigJSON string, imapOpts ...imaplib.Option) (gmail.LiveAPI, error) {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg, logger := state.cfg, state.logger
+	if syncConfigJSON == "" {
+		return nil, fmt.Errorf("IMAP source %s has no config (run 'add-imap' first)", identifier)
+	}
+	imapCfg, err := imaplib.ConfigFromJSON(syncConfigJSON)
+	if err != nil {
+		return nil, fmt.Errorf("parse IMAP config: %w", err)
+	}
+
+	opts := append([]imaplib.Option{imaplib.WithLogger(logger)}, imapOpts...)
+
+	switch imapCfg.EffectiveAuthMethod() {
+	case imaplib.AuthXOAuth2:
+		tokenFn, err := microsoftIMAPTokenSource(ctx, src, imapCfg)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, imaplib.WithTokenSource(tokenFn))
+		return imaplib.NewClient(imapCfg, "", opts...), nil
+	default:
+		password, err := imaplib.LoadCredentials(cfg.TokensDir(), identifier)
+		if err != nil {
+			return nil, fmt.Errorf("load IMAP credentials: %w (run 'add-imap' first)", err)
+		}
+		return imaplib.NewClient(imapCfg, password, opts...), nil
+	}
 }
 
 // loadIMAPFolderStates returns the saved per-mailbox states in the map

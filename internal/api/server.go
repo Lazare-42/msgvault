@@ -252,6 +252,13 @@ type analyticsEngineState struct {
 
 type analyticsEngineContextKey struct{}
 
+type OCRStore interface {
+	OCRSummary(ctx context.Context) (store.OCRSummary, error)
+	RequestOCR(ctx context.Context, hash string, fingerprint string) (*store.OCRResult, error)
+	GetOCRResult(ctx context.Context, hash string, includePages bool) (*store.OCRResult, error)
+	SearchOCR(ctx context.Context, query string, limit int) ([]store.OCRSearchHit, error)
+}
+
 // Server represents the HTTP API server.
 type Server struct {
 	nativeMCP nativeMCPHandlers
@@ -435,6 +442,7 @@ type Server struct {
 	// an empty list.
 	messageRecordings  *MessageRecordingReader
 	docbankAttachments *DocbankAttachmentReader
+	ocrStore           OCRStore
 	// remoteImages is the SSRF-hardened fetcher behind
 	// POST /api/v1/content/remote-image. Tests replace it to inject a fake
 	// resolver and dialer.
@@ -579,6 +587,9 @@ type ServerOptions struct {
 	// GET /api/v1/messages/{id}/recordings. Nil serves an empty list.
 	MessageRecordings  *MessageRecordingReader
 	DocbankAttachments *DocbankAttachmentReader
+	// OCRStore owns attachment text queue/results. Kept explicit because the
+	// production MessageStore is an adapter rather than the concrete archive.
+	OCRStore OCRStore
 	// RequestTimeout caps each request by adding a deadline to the request
 	// context. Zero defaults to 60s. The underlying http.Server's WriteTimeout
 	// is set to RequestTimeout + 5s so handlers that honor cancellation can
@@ -721,6 +732,7 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		// kit's nil-reporter handler admits no event.
 		s.telemetryCapture = posthog.NewCaptureHandler(nil)
 	}
+	s.ocrStore = opts.OCRStore
 	if s.taskIdentityResolver == nil {
 		s.taskIdentityResolver = s.resolveTaskMessageIdentity
 	}

@@ -96,7 +96,12 @@ func (c *Client) selectCommand(ctx context.Context, mailbox string, options *ima
 }
 
 func (c *Client) listCommand(ctx context.Context, options *imap.ListOptions) ([]*imap.ListData, error) {
-	return runCommand(ctx, c, func() ([]*imap.ListData, error) { return c.conn.List("", "*", options).Collect() })
+	return runCommand(ctx, c, func() ([]*imap.ListData, error) {
+		cmd := c.conn.List("", "*", options)
+		items, err := cmd.Collect()
+		logSkippedMailboxNames(c.logger, cmd.SkippedNames())
+		return items, err
+	})
 }
 
 func (c *Client) statusCommand(ctx context.Context, mailbox string, options *imap.StatusOptions) (*imap.StatusData, error) {

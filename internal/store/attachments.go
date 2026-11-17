@@ -521,6 +521,22 @@ func (s *Store) listPendingAttachmentMessages(sourceID int64, providerPrefix str
 	return items, rows.Err()
 }
 
+// ReplaceMessageWhatsAppAttachments replaces WhatsApp-managed attachment rows
+// for a message (rows whose source_attachment_id carries the "whatsapp:"
+// prefix). A WhatsApp message carries at most one downloadable attachment, so
+// refs normally holds zero or one entries. A row with a content hash is
+// downloaded media; a row without one is a marker left when the download
+// failed or attachment storage was not configured. Unlike the Beeper/Slack/
+// Discord pending markers of the same shape, this marker is not meant to be
+// retried by a later backfill pass — WhatsApp media keys/URLs are tied to the
+// live session that observed them and are typically gone from WhatsApp's CDN
+// soon after (see internal/whatsapp/live/service.go's storeInboundAttachment)
+// — it exists purely so the failure is visible/queryable instead of the
+// message looking attachment-free.
+func (s *Store) ReplaceMessageWhatsAppAttachments(messageID int64, refs []AttachmentRef) error {
+	return s.replaceMessageProviderAttachmentsContext(context.Background(), messageID, "whatsapp:", refs)
+}
+
 // ReplaceMessageDiscordAttachments replaces Discord-managed attachment rows.
 // Pending rows retain an observed CDN URL or deterministic provider sentinel.
 // Hashless rows with a trusted local CAS path are duplicate-content aliases.
@@ -637,6 +653,21 @@ func normalizeDiscordAttachmentRefs(refs []AttachmentRef) []AttachmentRef {
 		}
 	}
 	return normalized
+}
+
+// MessageWhatsAppAttachments returns WhatsApp-managed attachment rows for
+// messageID, keyed by source_attachment_id. A row with a non-empty
+// ContentHash has downloaded content; a row with an empty ContentHash is the
+// "download failed" marker left by storeInboundAttachment (see
+// internal/whatsapp/live/service.go) and carries no retrievable blob.
+func (s *Store) MessageWhatsAppAttachments(messageID int64) (map[string]AttachmentRef, error) {
+	return s.MessageWhatsAppAttachmentsContext(context.Background(), messageID)
+}
+
+// MessageWhatsAppAttachmentsContext is MessageWhatsAppAttachments with
+// caller-controlled cancellation.
+func (s *Store) MessageWhatsAppAttachmentsContext(ctx context.Context, messageID int64) (map[string]AttachmentRef, error) {
+	return s.messageProviderAttachmentsContext(ctx, messageID, "whatsapp:")
 }
 
 // IsDiscordAttachmentDownloaded reports whether a Discord row references a

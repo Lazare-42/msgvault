@@ -2378,6 +2378,7 @@ type CliAccountResponse struct {
 	OauthApp           *string          `json:"oauth_app,omitzero"`
 	ReanchorRequired   bool             `json:"reanchor_required"`
 	SourceDeletedCount int64            `json:"source_deleted_count"`
+	SyncConfig         *string          `json:"sync_config,omitzero"`
 	Type               string           `json:"type" validate:"required"`
 	VirtualAccounts    []VirtualAccount `json:"virtual_accounts,omitempty"`
 }
@@ -7955,23 +7956,26 @@ type MessageDetail struct {
 	FromName          *string `json:"from_name,omitzero"`
 
 	// FromParticipantID Sender participant ID, populated for conversation windows.
-	FromParticipantID *int64             `json:"from_participant_id,omitempty"`
-	FromPhone         *string            `json:"from_phone,omitzero"`
-	HasAttachments    bool               `json:"has_attachments"`
-	HiddenTextPresent bool               `json:"hidden_text_present"`
-	ID                int64              `json:"id"`
-	IsFromMe          *bool              `json:"is_from_me,omitempty"`
-	Labels            []string           `json:"labels" validate:"required"`
-	MessageType       *string            `json:"message_type,omitzero"`
-	RelatedMessageID  *int64             `json:"related_message_id,omitempty"`
-	SenderAuth        *SenderAuthVerdict `json:"sender_auth,omitempty"`
-	SentAt            string             `json:"sent_at" validate:"required"`
-	SizeBytes         int64              `json:"size_bytes"`
-	Snippet           string             `json:"snippet" validate:"required"`
-	SourceID          *int64             `json:"source_id,omitempty"`
-	SourceMessageID   *string            `json:"source_message_id,omitzero"`
-	Subject           string             `json:"subject" validate:"required"`
-	To                []string           `json:"to" validate:"required"`
+	FromParticipantID *int64   `json:"from_participant_id,omitempty"`
+	FromPhone         *string  `json:"from_phone,omitzero"`
+	HasAttachments    bool     `json:"has_attachments"`
+	HiddenTextPresent bool     `json:"hidden_text_present"`
+	ID                int64    `json:"id"`
+	IsFromMe          *bool    `json:"is_from_me,omitempty"`
+	Labels            []string `json:"labels" validate:"required"`
+	MessageType       *string  `json:"message_type,omitzero"`
+	RelatedMessageID  *int64   `json:"related_message_id,omitempty"`
+
+	// Rfc822MessageID Original Message-ID header for In-Reply-To and References when composing a reply.
+	Rfc822MessageID *string            `json:"rfc822_message_id,omitzero"`
+	SenderAuth      *SenderAuthVerdict `json:"sender_auth,omitempty"`
+	SentAt          string             `json:"sent_at" validate:"required"`
+	SizeBytes       int64              `json:"size_bytes"`
+	Snippet         string             `json:"snippet" validate:"required"`
+	SourceID        *int64             `json:"source_id,omitempty"`
+	SourceMessageID *string            `json:"source_message_id,omitzero"`
+	Subject         string             `json:"subject" validate:"required"`
+	To              []string           `json:"to" validate:"required"`
 
 	// ToParticipants Recipient participants, populated for conversation windows.
 	ToParticipants []ConversationParticipant `json:"to_participants,omitempty"`
@@ -8833,6 +8837,121 @@ func (n NetworkNode) Validate() error {
 	}
 	if err := typesValidator.Var(n.Label, "required"); err != nil {
 		errors = errors.Append("Label", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OCRPage struct {
+	Confidence *float64 `json:"confidence,omitempty"`
+	Method     string   `json:"method" validate:"required"`
+	PageNumber int64    `json:"page_number"`
+	Text       string   `json:"text" validate:"required"`
+}
+
+func (o OCRPage) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(o))
+}
+
+type OCRResult struct {
+	Attempts             int64     `json:"attempts"`
+	AverageConfidence    *float64  `json:"average_confidence,omitempty"`
+	ContentHash          string    `json:"content_hash" validate:"required"`
+	ErrorCode            *string   `json:"error_code,omitzero"`
+	ErrorDetail          *string   `json:"error_detail,omitzero"`
+	ExtractorFingerprint string    `json:"extractor_fingerprint" validate:"required"`
+	Method               *string   `json:"method,omitzero"`
+	PageCount            *int64    `json:"page_count,omitempty"`
+	Pages                []OCRPage `json:"pages,omitempty"`
+	Status               string    `json:"status" validate:"required"`
+	UpdatedAt            time.Time `json:"updated_at" validate:"required"`
+}
+
+func (o OCRResult) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.ContentHash, "required"); err != nil {
+		errors = errors.Append("ContentHash", err)
+	}
+	if err := typesValidator.Var(o.ExtractorFingerprint, "required"); err != nil {
+		errors = errors.Append("ExtractorFingerprint", err)
+	}
+	for i, item := range o.Pages {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Pages[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(o.Status, "required"); err != nil {
+		errors = errors.Append("Status", err)
+	}
+	if err := typesValidator.Var(o.UpdatedAt, "required"); err != nil {
+		errors = errors.Append("UpdatedAt", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OCRRuntimeStatus struct {
+	Enabled              bool   `json:"enabled"`
+	Exhausted            int64  `json:"exhausted"`
+	ExtractorFingerprint string `json:"extractor_fingerprint" validate:"required"`
+	Failed               int64  `json:"failed"`
+	Pending              int64  `json:"pending"`
+	Ready                int64  `json:"ready"`
+	Running              int64  `json:"running"`
+	Unsupported          int64  `json:"unsupported"`
+}
+
+func (o OCRRuntimeStatus) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(o))
+}
+
+type OCRSearchHit struct {
+	AttachmentID   int64    `json:"attachment_id"`
+	Confidence     *float64 `json:"confidence,omitempty"`
+	ContentHash    string   `json:"content_hash" validate:"required"`
+	ConversationID int64    `json:"conversation_id"`
+	Filename       string   `json:"filename" validate:"required"`
+	MessageID      int64    `json:"message_id"`
+	Method         string   `json:"method" validate:"required"`
+	MimeType       string   `json:"mime_type" validate:"required"`
+	PageNumber     int64    `json:"page_number"`
+	Snippet        string   `json:"snippet" validate:"required"`
+}
+
+func (o OCRSearchHit) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(o))
+}
+
+type OcrSearchRequest struct {
+	Limit *int64 `json:"limit,omitempty"`
+	Query string `json:"query" validate:"required"`
+}
+
+func (o OcrSearchRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(o))
+}
+
+type OcrSearchResponse struct {
+	Results []OCRSearchHit `json:"results" validate:"required"`
+}
+
+func (o OcrSearchResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.Results, "required"); err != nil {
+		errors = errors.Append("Results", err)
+	}
+	for i, item := range o.Results {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Results[%d]", i), err)
+			}
+		}
 	}
 	if len(errors) == 0 {
 		return nil

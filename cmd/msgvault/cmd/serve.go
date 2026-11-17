@@ -43,6 +43,7 @@ import (
 	"go.kenn.io/msgvault/internal/muesli"
 	"go.kenn.io/msgvault/internal/notionmeetings"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personagenda"
@@ -612,6 +613,28 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("schedule person enrichment: %w", err)
 	}
 
+	if cfg.OCR.Enabled {
+		ocrClient := ocr.NewClient(cfg.OCR.Socket, cfg.OCR.RequestTimeout)
+		ocrWorker := ocr.NewWorker(s, blobStore, ocrClient, ocr.WorkerConfig{
+			Fingerprint: cfg.OCR.Fingerprint, BatchSize: cfg.OCR.BatchSize,
+			Lease: cfg.OCR.LeaseDuration, MaxFileBytes: cfg.OCR.MaxFileBytes,
+			MaxAttempts: cfg.OCR.MaxAttempts,
+		}, logger)
+		if err := sched.AddJob(scheduler.Job{
+			Name: "attachment-ocr", Schedule: cfg.OCR.Schedule,
+			Run: func(ctx context.Context) error {
+				result, err := ocrWorker.RunOnce(ctx)
+				logger.Info("attachment OCR run", "discovered", result.Discovered,
+					"processed", result.Processed, "succeeded", result.Succeeded,
+					"failed", result.Failed, "lost_lease", result.LostLease)
+				return err
+			},
+		}); err != nil {
+			return fmt.Errorf("schedule attachment OCR: %w", err)
+		}
+		logger.Info("scheduled attachment OCR", "schedule", cfg.OCR.Schedule, "socket", cfg.OCR.Socket)
+	}
+
 	if cfg.Beeper.Enabled && cfg.Beeper.Schedule == "" {
 		logger.Warn("beeper is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
 			"hint", `set a cron schedule (e.g. "*/30 * * * *") on the [beeper] entry`)
@@ -1055,6 +1078,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		TelemetryCapture:              telemetry.CaptureHandler(telemetryReporter, cfg.Data.DataDir),
 		MessageRecordings:             messageRecordings,
 		DocbankAttachments:            docbankAttachments,
+		OCRStore:                      s,
 	}
 	apiOpts.GmailProfileAddress = func(ctx context.Context, source *store.Source) (string, error) {
 		client, serviceAccount, err := newDaemonGmailClient(
@@ -4309,6 +4333,13 @@ func runScheduledSync(ctx context.Context, identifier string, s *store.Store, ge
 				"messages_added", summary.MessagesAdded,
 				"duration", time.Since(startTime),
 			)
+		} else if errors.Is(syncErr, errOAuthNotConfiguredSentinel) {
+			// No sources row AND no usable Gmail OAuth config: this identifier
+			// was never registered at all (most likely a failed add-o365-app /
+			// add-imap / add-account), not a case of a real Gmail-token-first
+			// account missing its client secrets. Say so, since the message
+			// above otherwise sends people looking for a missing secret.
+			syncErr = fmt.Errorf("%w (no source is registered for %s either — run add-o365-app, add-imap, or add-account first)", syncErr, identifier)
 		}
 		return errors.Join(syncErr, rebuildCacheAfterScheduledSourceRun(context.WithoutCancel(ctx), identifier))
 	}
@@ -4660,7 +4691,17 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	cfg := state.cfg
 	logger := state.logger
 	imapOpts := imapFolderStateOptions(s, src, false, cfg, logger)
-	imapOpts = append(imapOpts, imapSyncFolderFilter(ctx, s, src.Identifier, state, nil, nil))
+	// [[accounts]] skip_folders is keyed by the configured account email,
+	// which for IMAP sources is the source's display name.
+	var accountSkipFolders []string
+	if account := cfg.GetAccountSchedule(src.Identifier); account != nil {
+		accountSkipFolders = account.SkipFolders
+	} else if src.DisplayName.Valid {
+		if account := cfg.GetAccountSchedule(src.DisplayName.String); account != nil {
+			accountSkipFolders = account.SkipFolders
+		}
+	}
+	imapOpts = append(imapOpts, imapSyncFolderFilter(ctx, s, src.Identifier, state, nil, accountSkipFolders))
 	apiClient, err := buildAPIClient(ctx, src, nil, nil, imapOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("build IMAP client: %w", err)

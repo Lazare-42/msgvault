@@ -156,6 +156,7 @@ func generatedDetailToAPIMessage(m *generated.MessageDetail) *store.APIMessage {
 		Calendar:          calendarProjectionFromGenerated(m.Calendar),
 		SourceID:          int64Value(m.SourceID),
 		SourceMessageID:   stringValue(m.SourceMessageID),
+		RFC822MessageID:   stringValue(m.Rfc822MessageID),
 		ConversationID:    int64Value(m.ConversationID),
 		Subject:           m.Subject,
 		MessageType:       stringValue(m.MessageType),
@@ -180,6 +181,14 @@ func generatedDetailToAPIMessage(m *generated.MessageDetail) *store.APIMessage {
 	}
 	if m.BodyText != nil {
 		msg.BodyText = *m.BodyText
+	}
+	// The daemon sends body = text, falling back to HTML when there is no
+	// text part, plus body_html. Rebuild both so callers can tell them apart.
+	if m.BodyHTML != nil {
+		msg.BodyHTML = *m.BodyHTML
+	}
+	if m.Body != msg.BodyHTML {
+		msg.BodyText = m.Body
 	}
 	return msg
 }

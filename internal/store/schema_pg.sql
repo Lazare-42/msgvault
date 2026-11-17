@@ -1443,6 +1443,26 @@ CREATE TABLE IF NOT EXISTS reaction_source_events (
 );
 CREATE INDEX IF NOT EXISTS idx_reaction_source_events_reaction
     ON reaction_source_events(reaction_id);
+CREATE TABLE IF NOT EXISTS whatsapp_outbox (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    local_request_id TEXT NOT NULL UNIQUE,
+    source_id BIGINT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
+    message_id BIGINT REFERENCES messages(id) ON DELETE SET NULL,
+
+    kind TEXT NOT NULL,
+    chat_jid TEXT NOT NULL,
+    target_source_message_id TEXT,
+    body TEXT,
+    emoji TEXT,
+
+    status TEXT NOT NULL DEFAULT 'pending',
+    remote_message_id TEXT,
+    error_text TEXT,
+
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Matrix events archived while encrypted. The ciphertext stays after recovery,
 -- so a replay conflict can return a recovered message to its placeholder.
@@ -1519,6 +1539,34 @@ CREATE TABLE IF NOT EXISTS attachments (
     encryption_version INTEGER DEFAULT 0,
 
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS attachment_ocr (
+    content_hash TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    extractor_fingerprint TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    method TEXT,
+    page_count INTEGER,
+    average_confidence DOUBLE PRECISION,
+    lease_expires_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ,
+    error_code TEXT,
+    error_detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS attachment_ocr_pages (
+    content_hash TEXT NOT NULL REFERENCES attachment_ocr(content_hash) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL,
+    method TEXT NOT NULL,
+    text TEXT NOT NULL,
+    confidence DOUBLE PRECISION,
+    search_fts TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', coalesce(text, ''))) STORED,
+    PRIMARY KEY (content_hash, page_number)
 );
 
 -- ============================================================================
@@ -3618,9 +3666,18 @@ CREATE INDEX IF NOT EXISTS idx_message_recipients_message ON message_recipients(
 CREATE INDEX IF NOT EXISTS idx_message_recipients_participant ON message_recipients(participant_id, recipient_type);
 
 CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_outbox_source_status
+    ON whatsapp_outbox(source_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_outbox_remote_message
+    ON whatsapp_outbox(source_id, remote_message_id);
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
+CREATE INDEX IF NOT EXISTS idx_attachments_ocr_candidates ON attachments(LOWER(content_hash))
+    WHERE content_hash IS NOT NULL AND content_hash <> ''
+      AND (LOWER(COALESCE(mime_type, '')) = 'application/pdf'
+           OR LOWER(COALESCE(mime_type, '')) LIKE 'image/%'
+           OR LOWER(COALESCE(filename, '')) LIKE '%.pdf');
 -- Thumbnail hash/path and LOWER(content_hash)/LOWER(thumbnail_hash) indexes
 -- are created in Go (Store.InitSchema) under the maintenance escape hatch:
 -- this file executes before that hatch is available, and the one-time index
@@ -3628,6 +3685,10 @@ CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
 -- statement_timeout on a large archive (finding S1). SQLite keeps the indexes
 -- in schema.sql (no statement_timeout there).
 CREATE INDEX IF NOT EXISTS idx_attachments_storage_path ON attachments(storage_path);
+CREATE INDEX IF NOT EXISTS idx_attachment_ocr_claim
+    ON attachment_ocr(status, priority DESC, next_attempt_at, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_attachment_ocr_pages_fts
+    ON attachment_ocr_pages USING GIN(search_fts);
 -- idx_attachments_msg_content_hash is created in Go (Store.InitSchema)
 -- after a one-shot dedupe of legacy duplicate rows.
 

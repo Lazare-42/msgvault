@@ -14,6 +14,7 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/ocr"
 )
 
 func TestPersonMatchConfigLoadsWithoutCredentialValue(t *testing.T) {
@@ -938,7 +939,10 @@ func TestGetAccountScheduleReturnsCopy(t *testing.T) {
 	assert := assert.New(t)
 	cfg := &Config{
 		Accounts: []AccountSchedule{
-			{Email: "test@gmail.com", Schedule: "0 2 * * *", Enabled: true},
+			{
+				Email: "test@gmail.com", Schedule: "0 2 * * *", Enabled: true,
+				SkipFolders: []string{"Calendar"},
+			},
 		},
 	}
 
@@ -950,9 +954,11 @@ func TestGetAccountScheduleReturnsCopy(t *testing.T) {
 	acc.Schedule = "modified"
 	acc.Enabled = false
 	acc.Email = "hacked@gmail.com"
+	acc.SkipFolders[0] = "mutated"
 
 	// Original config must be unchanged
 	assert.Equal("0 2 * * *", cfg.Accounts[0].Schedule, "original Schedule (mutation leaked)")
+	assert.Equal([]string{"Calendar"}, cfg.Accounts[0].SkipFolders, "original SkipFolders (mutation leaked)")
 	assert.True(cfg.Accounts[0].Enabled, "original Enabled (mutation leaked)")
 	assert.Equal("test@gmail.com", cfg.Accounts[0].Email, "original Email (mutation leaked)")
 }
@@ -982,6 +988,40 @@ oauth_app = "personal"
 	src := cfg.GetSynctechSMSSource("pixel")
 	require.NotNil(src, "GetSynctechSMSSource returned nil")
 	require.Truef(src.Backend == "drive" && src.OwnerPhone == "+15550000001" && src.FolderID == "drive-folder-id" && src.GoogleAccount == "user@example.com" && src.StableAfter == "10m", "source mismatch: %#v", src)
+}
+
+func TestGoogleDocsSourcesConfig(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	data := []byte(`
+[[google_docs.sources]]
+name = "docs"
+enabled = true
+folder_id = "drive-folder-id"
+google_account = "user@example.com"
+oauth_app = "personal"
+
+[[google_docs.sources]]
+name = "disabled"
+enabled = false
+folder_id = "disabled-folder-id"
+google_account = "user@example.com"
+`)
+	require.NoError(os.WriteFile(configPath, data, 0o600), "write config")
+	cfg, err := Load(configPath, "")
+	require.NoError(err, "Load")
+
+	src := cfg.GetGoogleDocsSource("DOCS")
+	require.NotNil(src, "GetGoogleDocsSource returned nil")
+	require.True(src.Enabled, "source should be enabled")
+	require.Equal("drive-folder-id", src.FolderID, "FolderID")
+	require.Equal("user@example.com", src.GoogleAccount, "GoogleAccount")
+	require.Equal("personal", src.OAuthApp, "OAuthApp")
+
+	enabled := cfg.EnabledGoogleDocsSources()
+	require.Len(enabled, 1, "EnabledGoogleDocsSources")
+	require.Equal("docs", enabled[0].Name, "enabled source name")
 }
 
 func TestSynctechSMSScheduledSources(t *testing.T) {
@@ -2653,6 +2693,50 @@ func TestLoadApplePhonePrefix(t *testing.T) {
 	}
 }
 
+func TestOCRDefaultsFollowArchiveHome(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	home := t.TempDir()
+	cfg, err := Load("", home)
+	requirements.NoError(err)
+	assertions.Equal(filepath.Join(home, "ocr", "executor.sock"), cfg.OCR.Socket)
+	assertions.Equal(5, cfg.OCR.MaxAttempts)
+	assertions.Equal("poppler+tesseract-v1:fra+eng", cfg.OCR.Fingerprint)
+	assertions.Equal(ocr.DefaultMinImageSide, cfg.OCR.MinImageSide)
+	assertions.Equal(ocr.DefaultMaxImageScale, cfg.OCR.MaxImageScale)
+	assertions.Equal(ocr.DefaultMaxPreprocessBytes, cfg.OCR.MaxPreprocessBytes)
+}
+
+func TestOCRMaxAttemptsValidation(t *testing.T) {
+	cfg := NewDefaultConfig()
+	cfg.OCR.MaxAttempts = 101
+	err := cfg.OCR.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_attempts")
+}
+
+func TestOCRResourceValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*OCRConfig)
+		field  string
+	}{
+		{name: "pixels", mutate: func(cfg *OCRConfig) { cfg.MaxPixels = ocr.MaxConfiguredPixels + 1 }, field: "max_pixels"},
+		{name: "preprocess bytes", mutate: func(cfg *OCRConfig) { cfg.MaxPreprocessBytes = ocr.MaxConfiguredPreprocessBytes + 1 }, field: "max_preprocess_bytes"},
+		{name: "minimum side", mutate: func(cfg *OCRConfig) { cfg.MinImageSide = 4097 }, field: "min_image_side"},
+		{name: "scale", mutate: func(cfg *OCRConfig) { cfg.MaxImageScale = 9 }, field: "max_image_scale"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewDefaultConfig()
+			tt.mutate(&cfg.OCR)
+			err := cfg.OCR.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.field)
+		})
+	}
+}
+
 func TestRemovedDocumentConfigGuidesMigration(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -2695,4 +2779,17 @@ func TestMicrosoftNamedApps(t *testing.T) {
 	require.ErrorContains(t, err, "[microsoft.apps.missing]")
 	_, err = cfg.App("empty")
 	require.ErrorContains(t, err, "[microsoft.apps.empty]")
+}
+
+func TestMailAccountSenderPolicyLoads(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(os.WriteFile(path, []byte(`[mail.accounts."owner@example.com"]
+allowed_from = ["reports@example.com"]
+`), 0600))
+	cfg, err := Load(path, "")
+	require.NoError(err)
+	assert.Equal([]string{"reports@example.com"}, cfg.Mail.Accounts["owner@example.com"].AllowedFrom)
+	assert.Empty(cfg.Mail.Accounts["other@example.com"].AllowedFrom)
 }

@@ -2426,6 +2426,29 @@ See [Text Messages](/docs/usage/text-messages/) for usage examples.
 
 ---
 
+## merge-whatsapp-history
+
+One-time backfill of WhatsApp-sourced conversations, messages, attachments, and reactions from one archive home into another. Intended for the situation where a combined archive was split into a Gmail-only home and a separate, isolated WhatsApp home (a live WhatsApp bridge must hold an exclusive lock on its archive) — history captured before the split is only visible in the old combined home.
+
+```bash
+msgvault merge-whatsapp-history --from <old-home> --into <new-home>
+msgvault merge-whatsapp-history --from <old-home> --into <new-home> --apply
+```
+
+`--from` is opened read-only and never modified. Only `whatsapp`-sourced rows in `--from` are considered; every `--from` WhatsApp source must have a matching WhatsApp source already registered in `--into` (matched by JID) — this command backfills an existing live-synced account, it never creates one. Messages are deduplicated by `(source, source_message_id)` and attachments by content hash, so re-running is safe and never creates duplicates.
+
+The default is a dry-run report; pass `--apply` to write. `--apply` requires exclusive write access to `--into` — the same lock a live WhatsApp bridge or `msgvault serve` holds for that home — and fails fast with an actionable error if either is running against it. After a successful `--apply`, the analytics cache for `--into` is rebuilt.
+
+| Flag | Required | Description |
+|---|---|---|
+| `--from` | Yes | Source archive home to read WhatsApp history from |
+| `--into` | Yes | Target archive home to backfill WhatsApp history into |
+| `--apply` | No | Write the copy (default is a dry-run report only) |
+| `--identifier` | No | Scope to one WhatsApp source identifier (JID) in `--from`, when it has more than one |
+| `--max-attachment-bytes` | No | Max size of a single attachment blob to copy (default 300MiB) |
+
+---
+
 ## import-imessage
 
 Import messages from the local iMessage database on macOS. Requires Full Disk Access in System Settings.
@@ -4054,6 +4077,12 @@ Find and merge duplicate messages within an account or collection.
 msgvault deduplicate [flags]
 ```
 
+The scan also plans recovery of missing RFC822 Message-IDs from stored MIME.
+Use `--dry-run --account <email>` to review the proposed work. Applying the
+confirmed plan fills recoverable IDs and merges any reported duplicates; it is
+not a backfill-only command. MIME without a Message-ID cannot supply one for an
+old message. This recovery does not rewrite mail on the source server.
+
 By default, each source is deduplicated independently. `--collection` is the explicit opt-in for cross-source deduplication.
 
 | Flag | Description |
@@ -4659,7 +4688,7 @@ listeners were found in this application's configured data directory.
 
 Start the Model Context Protocol server for AI assistant integration.
 
-Draft tools prepare and manage drafts through the selected daemon, using the same commands and permissions as the CLI. Msgvault never sends. A daemon with API schema 3.0.0 or newer exposes eight draft tools to the owner.
+Draft tools prepare and manage drafts through the selected daemon, using the same commands and permissions as the CLI. These managed draft tools never send mail. This fork also provides owner-only live mail tools, including `send_draft`, when provider credentials are configured; delegated agent sessions cannot access those tools. A daemon with API schema 3.0.0 or newer exposes eight draft tools to the owner.
 
 With `--agent-url` and `--agent-token-file`, `msgvault mcp` requires a daemon with API schema 3.9.0 or newer and serves scoped read tools, up to six delegated draft tools, and calendar tools over stdio. Tool selection follows the token's permissions and granted sources. The daemon checks the token's permissions and source scope on every call. Delegated sessions refuse `--http`.
 
