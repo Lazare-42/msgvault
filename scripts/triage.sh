@@ -63,7 +63,8 @@ instance for THIS run is the upstream server named \"$PROXY_SERVER\".
 Tool access (do this exactly):
 - FIRST call mcp__mcpproxy__retrieve_tools with query \"$PROXY_SERVER messages labels\"
   to load the exact msgvault tool names and their input schemas for the
-  \"$PROXY_SERVER\" server.
+  \"$PROXY_SERVER\" server. If one schema is unclear, mcp__mcpproxy__describe_tool
+  with name=\"$PROXY_SERVER:<tool>\" returns it.
 - Read operations (search_messages, get_message, list_messages, list_gmail_labels):
   call mcp__mcpproxy__call_tool_read with name=\"$PROXY_SERVER:<tool>\" and the args
   from that tool's schema.
@@ -95,7 +96,7 @@ set +e
 CLAUDE_OUT=$(claude -p \
     --model sonnet \
     --max-turns 50 \
-    --allowedTools "mcp__mcpproxy__retrieve_tools,mcp__mcpproxy__call_tool_read,mcp__mcpproxy__call_tool_write,mcp__mcpproxy__read_cache" \
+    --allowedTools "mcp__mcpproxy__retrieve_tools,mcp__mcpproxy__describe_tool,mcp__mcpproxy__call_tool_read,mcp__mcpproxy__call_tool_write,mcp__mcpproxy__read_cache" \
     --permission-mode dontAsk \
     --output-format json \
     --no-session-persistence \

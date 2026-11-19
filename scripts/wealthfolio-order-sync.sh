@@ -9,10 +9,22 @@ SYNC_DIR="$MSGVAULT_HOME/wealthfolio-orders"
 LAST_RUN_FILE="$SYNC_DIR/last_run"
 STATE_FILE="$SYNC_DIR/state.json"
 CONFIG_FILE="$SYNC_DIR/config.json"
-MCP_CONFIG="$SYNC_DIR/mcp.json"
 RULES_FILE="$SYNC_DIR/rules.md"
+# WEALTHFOLIO_DRY_RUN=1 prints the new envelopes and stops before writing the
+# outbox, delivering, or advancing state and last_run.
+DRY_RUN="${WEALTHFOLIO_DRY_RUN:-0}"
 
-for f in "$CONFIG_FILE" "$MCP_CONFIG" "$RULES_FILE"; do
+# msgvault is reached through the mcpproxy gateway in Claude Code's managed MCP
+# config (/etc/claude-code/managed-mcp.json). Claude Code rejects a per-run
+# --mcp-config whenever a managed config is present ("You cannot dynamically
+# configure MCP servers when an enterprise MCP config is present"). Map this
+# run's archive to its mcpproxy upstream server name.
+case "$MSGVAULT_HOME" in
+    *msgvault-work*) PROXY_SERVER="msgvault-work" ;;
+    *)               PROXY_SERVER="msgvault-personal" ;;
+esac
+
+for f in "$CONFIG_FILE" "$RULES_FILE"; do
     if [[ ! -f "$f" ]]; then
         echo "ERROR: required file not found: $f"
         exit 1
@@ -51,8 +63,14 @@ Extract executed trade recap emails for Wealthfolio import.
 Configuration:
 $CONFIG_JSON
 
+Tool access: msgvault is the mcpproxy upstream server named "$PROXY_SERVER".
+- First call mcp__mcpproxy__retrieve_tools with query "$PROXY_SERVER search messages"
+  to load the exact tool names and input schemas.
+- Call search_messages and get_message through mcp__mcpproxy__call_tool_read
+  with name="$PROXY_SERVER:<tool>" and the arguments from that tool's schema.
+
 Instructions:
-1. For each rule in configuration.rules, search messages using its query plus after:$AFTER_DATE.
+1. For each rule in configuration.rules, search messages using its query plus after:$AFTER_DATE. Page through all results.
 2. Read candidate messages in full with get_message.
 3. Extract only executed trades from the newest message content, per the system rules.
 4. Return strict JSON only in the exact envelope format described in the system prompt.
@@ -63,13 +81,13 @@ EOF
 echo "Wealthfolio order sync: $LAST_RUN → $NOW"
 echo "MSGVAULT_HOME: $MSGVAULT_HOME"
 echo "Outbox: $OUTBOX_DIR"
+echo "mcpproxy upstream: $PROXY_SERVER"
 
 set +e
 claude -p \
     --model sonnet \
     --max-turns 40 \
-    --mcp-config "$MCP_CONFIG" \
-    --allowedTools "mcp__msgvault__search_messages,mcp__msgvault__get_message" \
+    --allowedTools "mcp__mcpproxy__retrieve_tools,mcp__mcpproxy__describe_tool,mcp__mcpproxy__call_tool_read,mcp__mcpproxy__read_cache" \
     --permission-mode dontAsk \
     --no-session-persistence \
     --append-system-prompt-file "$RULES_FILE" \
@@ -83,7 +101,7 @@ if [[ $EXIT_CODE -ne 0 ]]; then
 fi
 
 extract_first_json() {
-    python - "$1" <<'PY'
+    python3 - "$1" <<'PY'
 import json
 import sys
 
@@ -128,6 +146,12 @@ jq \
 
 NEW_COUNT="$(jq 'length' "$TMP_FILTERED")"
 echo "New executed-order envelopes: $NEW_COUNT"
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    jq '.' "$TMP_FILTERED"
+    echo "Dry run: nothing written, delivered, or recorded."
+    exit 0
+fi
 
 sanitize_name() {
     printf '%s' "$1" \
